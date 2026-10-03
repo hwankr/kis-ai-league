@@ -1,5 +1,17 @@
-# KIS 일반 모의투자 설정. config.local.toml에 복사해 입력합니다.
+# config.local.toml에 복사해 모의투자 키를 입력합니다.
+default_account = 'paper'
+
+[accounts.paper]
+name = '일반 모의투자'
 app_key = ''
 app_secret = ''
 account = ''  # 모의 계좌 앞 8자리. 잔고 조회 시 필요합니다.
 product_code = '01'  # 계좌 뒤 2자리
+
+# 대회 계좌 발급 후 아래 블록을 추가합니다. 모의 서버만 사용합니다.
+# [accounts.competition]
+# name = 'AI 리그 대회'
+# app_key = ''
+# app_secret = ''
+# account = ''
+# product_code = '01'

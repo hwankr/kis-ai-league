@@ -1,4 +1,4 @@
-"""KIS 일반 모의투자 조회 CLI. Python 3.11+, 외부 패키지 없음."""
+"""KIS 모의투자 조회 CLI. Python 3.11+, 외부 패키지 없음."""
 
 import argparse
 from dataclasses import dataclass, field
@@ -31,21 +31,15 @@ class Settings:
     product_code: str = "01"
 
     @classmethod
-    def load(cls, path: Path):
-        try:
-            values = tomllib.loads(path.read_text(encoding="utf-8-sig"))
-        except FileNotFoundError:
-            raise KisError("config.local.toml을 만들고 모의투자 설정을 입력하세요.") from None
-        except tomllib.TOMLDecodeError:
-            raise KisError("설정 파일의 TOML 형식을 확인하세요.") from None
-        settings = cls(**{key: values.get(key, default) for key, default in (
-            ("app_key", ""), ("app_secret", ""), ("account", ""), ("product_code", "01")
-        )})
-        if not all(isinstance(value, str) for value in vars(settings).values()):
-            raise KisError("설정값은 따옴표로 감싼 문자열이어야 합니다.")
-        if not settings.app_key.strip() or not settings.app_secret.strip():
+    def load(cls, path: Path, profile_id: str | None = None):
+        catalog = load_profiles(path)
+        profile = catalog.select(profile_id)
+        profile.settings.validate_credentials()
+        return profile.settings
+
+    def validate_credentials(self):
+        if not self.app_key.strip() or not self.app_secret.strip():
             raise KisError("app_key와 app_secret에 모의투자 키를 입력하세요.")
-        return settings
 
     def validate_account(self):
         if not re.fullmatch(r"[0-9]{8}", self.account):
@@ -55,9 +49,96 @@ class Settings:
 
 
 @dataclass(repr=False)
+class AccountProfile:
+    id: str
+    name: str
+    settings: Settings
+
+    @property
+    def configured(self):
+        try:
+            self.settings.validate_credentials()
+            self.settings.validate_account()
+        except KisError:
+            return False
+        return True
+
+    def public_metadata(self):
+        return {"id": self.id, "name": self.name, "configured": self.configured}
+
+
+@dataclass(repr=False)
+class AccountProfiles:
+    default_id: str
+    profiles: dict[str, AccountProfile]
+
+    def select(self, profile_id: str | None = None):
+        selected = self.default_id if profile_id is None else profile_id
+        if selected not in self.profiles:
+            raise KisError("등록되지 않은 계좌입니다. 계좌 설정을 확인하세요.")
+        return self.profiles[selected]
+
+
+def load_profiles(path: Path):
+    try:
+        values = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        raise KisError("config.local.toml을 만들고 모의투자 설정을 입력하세요.") from None
+    except (tomllib.TOMLDecodeError, UnicodeError):
+        raise KisError("설정 파일의 TOML 형식을 확인하세요.") from None
+
+    defaults = {"app_key": "", "app_secret": "", "account": "", "product_code": "01"}
+    accounts = values.get("accounts", {})
+    if not isinstance(accounts, dict):
+        raise KisError("accounts는 계좌별 TOML 테이블이어야 합니다.")
+    accounts = dict(accounts)
+    legacy = any(key in values for key in defaults)
+    if legacy and "paper" in accounts:
+        raise KisError("기존 계좌 설정과 accounts.paper를 동시에 사용할 수 없습니다.")
+    if legacy or "accounts" not in values:
+        accounts = {"paper": {"name": "일반 모의투자", **{
+            key: values.get(key, default) for key, default in defaults.items()
+        }}, **accounts}
+    if not accounts:
+        raise KisError("계좌 설정을 하나 이상 추가하세요.")
+
+    profiles = {}
+    for profile_id, account in accounts.items():
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", profile_id):
+            raise KisError("계좌 ID는 영문 소문자로 시작하는 1~32자의 소문자·숫자·밑줄·하이픈이어야 합니다.")
+        if not isinstance(account, dict):
+            raise KisError("각 계좌 설정은 TOML 테이블이어야 합니다.")
+        name = account.get("name", "일반 모의투자" if profile_id == "paper" else profile_id)
+        if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 40
+                or any(ord(character) < 32 or ord(character) == 127 for character in name)):
+            raise KisError("계좌 이름은 줄바꿈 없는 1~40자의 문자열이어야 합니다.")
+        fields = {key: account.get(key, default) for key, default in defaults.items()}
+        if not all(isinstance(value, str) for value in fields.values()):
+            raise KisError("계좌 설정값은 따옴표로 감싼 문자열이어야 합니다.")
+        profiles[profile_id] = AccountProfile(profile_id, name.strip(), Settings(**fields))
+
+    default_id = values.get("default_account", "paper" if "paper" in profiles else next(iter(profiles)))
+    if not isinstance(default_id, str) or default_id not in profiles:
+        raise KisError("default_account에 등록된 계좌 ID를 입력하세요.")
+    return AccountProfiles(default_id, profiles)
+
+
+def _credential_identity(settings: Settings):
+    return hashlib.sha256((settings.app_key + "\0" + settings.app_secret).encode()).hexdigest()
+
+
+def client_for_profile(profile: AccountProfile, cache_dir: Path | None = None):
+    profile.settings.validate_credentials()
+    directory = ROOT / ".local" if cache_dir is None else cache_dir
+    return PaperClient(profile.settings, directory / f"token-{_credential_identity(profile.settings)}.json",
+                       legacy_cache_path=directory / "kis-token.json")
+
+
+@dataclass(repr=False)
 class PaperClient:
     settings: Settings
     cache_path: Path = ROOT / ".local" / "kis-token.json"
+    legacy_cache_path: Path | None = None
     _next_request: float = field(default=0, init=False)
 
     def _request(self, path, *, headers=None, params=None, body=None):
@@ -91,16 +172,17 @@ class PaperClient:
         return data, {key.lower(): value for key, value in response_headers.items()}
 
     def token(self):
-        identity = hashlib.sha256(
-            (self.settings.app_key + "\0" + self.settings.app_secret).encode()
-        ).hexdigest()
-        try:
-            saved = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            if (saved["identity"] == identity and saved["expires_at"] > time.time() + 60
-                    and isinstance(saved["token"], str) and saved["token"]):
-                return saved["token"]
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
+        identity = _credential_identity(self.settings)
+        for path in (self.cache_path, self.legacy_cache_path):
+            if path is None:
+                continue
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                if (saved["identity"] == identity and saved["expires_at"] > time.time() + 60
+                        and isinstance(saved["token"], str) and saved["token"]):
+                    return saved["token"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         issued_at = time.time()
         data, _ = self._request("/oauth2/tokenP", body={
             "grant_type": "client_credentials", "appkey": self.settings.app_key,
@@ -176,12 +258,14 @@ class PaperClient:
                     or not isinstance(summary[0], dict)):
                 raise KisError("잔고 응답 형식이 예상과 다릅니다.")
             holdings.extend({key: row.get(key) for key in (
-                "pdno", "prdt_name", "hldg_qty", "pchs_avg_pric", "prpr", "evlu_amt"
+                "pdno", "prdt_name", "hldg_qty", "pchs_avg_pric", "pchs_amt",
+                "prpr", "evlu_amt", "evlu_pfls_amt", "evlu_pfls_rt"
             )} for row in rows)
             if headers.get("tr_cont") not in ("M", "F"):
                 return {"environment": "paper", "holdings": holdings,
                         "summary": {key: summary[0].get(key) for key in (
-                            "dnca_tot_amt", "scts_evlu_amt", "tot_evlu_amt"
+                            "dnca_tot_amt", "scts_evlu_amt", "tot_evlu_amt",
+                            "pchs_amt_smtl_amt", "evlu_pfls_smtl_amt"
                         )}}
             cursor = (data.get("ctx_area_fk100", ""), data.get("ctx_area_nk100", ""))
             if not all(isinstance(value, str) for value in cursor):
@@ -195,7 +279,8 @@ class PaperClient:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="KIS 일반 모의투자 조회")
+    parser = argparse.ArgumentParser(description="KIS 모의투자 조회")
+    parser.add_argument("--account", help="config.local.toml에 등록한 계좌 ID")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check", help="로컬 설정 형식 확인")
     commands.add_parser("auth", help="인증 확인")
@@ -203,8 +288,9 @@ def main(argv=None):
     commands.add_parser("balance", help="잔고 조회")
     args = parser.parse_args(argv)
     try:
-        settings = Settings.load(ROOT / "config.local.toml")
-        client = PaperClient(settings)
+        profile = load_profiles(ROOT / "config.local.toml").select(args.account)
+        settings = profile.settings
+        client = client_for_profile(profile)
         if args.command == "check":
             if settings.account:
                 settings.validate_account()

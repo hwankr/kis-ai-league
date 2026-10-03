@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#ffffff">
+    <title>내 계좌 · KIS AI League</title>
+    <link rel="preload" href="/fonts/PretendardVariable.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="/dashboard.css">
+    <script src="/dashboard.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">본문으로 바로가기</a>
+    <header class="app-header">
+      <div class="header-inner">
+        <a class="brand" href="/" aria-label="KIS AI League 홈">
+          <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M5 24V14M16 24V6M27 24V11" stroke="currentColor" stroke-width="6" stroke-linecap="round"/></svg>
+          <span>KIS <span class="brand-light">AI League</span></span>
+        </a>
+        <nav class="header-nav" aria-label="메인 메뉴"><a href="#main-content" aria-current="page">내 계좌</a></nav>
+        <div class="header-meta"><span class="environment-badge">모의투자</span><span class="read-only">조회 전용</span></div>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <div class="page-heading">
+        <h1 id="page-title">내 계좌</h1>
+        <div class="refresh-controls">
+          <label class="auto-refresh-control">
+            <span>30초 자동 갱신</span>
+            <input id="auto-refresh" type="checkbox" role="switch" checked>
+          </label>
+          <button id="refresh-button" class="refresh-button" type="button">
+            <svg class="refresh-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16.4 8.2A6.5 6.5 0 1 0 16 13M16.4 3.8v4.4H12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span id="refresh-label">새로고침</span>
+          </button>
+        </div>
+      </div>
+      <div id="error-notice" class="error-notice" role="alert" hidden></div>
+      <p id="refresh-announcement" class="sr-only" role="status" aria-live="polite"></p>
+
+      <div class="dashboard-layout" id="account-summary" aria-busy="true">
+        <section class="asset-overview" aria-labelledby="asset-title">
+          <div class="account-picker">
+            <span class="account-broker">한국투자증권</span>
+            <div class="account-select-wrap">
+              <span id="account-select-label" class="sr-only">조회할 계좌</span>
+              <button id="account-select" class="account-select-trigger" type="button" role="combobox" aria-labelledby="account-select-label account-select-value" aria-haspopup="listbox" aria-expanded="false" aria-controls="account-options" disabled>
+                <span id="account-select-value">계좌 목록을 불러오는 중</span>
+                <svg class="account-select-chevron" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m6 8 4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <ul id="account-options" class="account-options" role="listbox" aria-labelledby="account-select-label" hidden></ul>
+            </div>
+          </div>
+          <h2 id="asset-title">총 평가금액</h2>
+          <p class="total-value"><span id="total-value">—</span><span class="total-currency">원</span></p>
+          <div class="pnl-summary">
+            <span class="pnl-label">보유 종목 평가손익</span>
+            <span class="pnl-amount"><span id="unrealized-pnl">—</span>원</span>
+            <span id="unrealized-return" class="return-value">—</span>
+          </div>
+        </section>
+
+        <aside class="account-details" aria-labelledby="details-title">
+          <h2 id="details-title">자산 상세</h2>
+          <dl class="balance-list">
+            <div><dt><span class="asset-dot cash-dot" aria-hidden="true"></span>예수금</dt><dd><span id="cash">—</span><span class="unit">원</span></dd></div>
+            <div><dt><span class="asset-dot stock-dot" aria-hidden="true"></span>주식 평가금액</dt><dd><span id="securities-value">—</span><span class="unit">원</span></dd></div>
+          </dl>
+        </aside>
+        <aside class="connection-panel" aria-labelledby="connection-title">
+          <div class="account-connection">
+            <h2 id="connection-title">연결 상태</h2>
+            <span id="connection-status" class="status-badge status-loading"><span class="status-dot" aria-hidden="true"></span><span id="connection-label">계좌 연결 중</span></span>
+            <dl class="connection-details">
+              <div><dt>마지막 조회</dt><dd><time id="updated-at">—</time></dd></div>
+              <div><dt>조회 범위</dt><dd>국내주식</dd></div>
+            </dl>
+          </div>
+        </aside>
+
+        <section class="holdings-panel" aria-labelledby="holdings-title">
+          <div class="panel-heading">
+            <div class="panel-title"><h2 id="holdings-title">보유 종목</h2><span id="holdings-count" class="holdings-count">—</span></div>
+            <span class="table-unit">단위: 원</span>
+          </div>
+          <div id="holdings-table-container" class="table-scroll" tabindex="0" role="region" aria-label="보유 종목 상세" hidden>
+            <table>
+              <thead><tr><th scope="col">종목</th><th scope="col">보유 수량</th><th scope="col">평균 매입가</th><th scope="col">현재가</th><th scope="col">평가금액</th><th scope="col">평가손익 / 수익률</th></tr></thead>
+              <tbody id="holdings-body"></tbody>
+            </table>
+          </div>
+          <div id="holdings-empty" class="empty-state">
+            <svg class="empty-illustration" viewBox="0 0 88 80" fill="none" aria-hidden="true"><rect x="23" y="9" width="43" height="53" rx="8" fill="#e8edf4" transform="rotate(10 23 9)"/><rect x="18" y="17" width="44" height="54" rx="8" fill="#f2f5fa"/><path d="M30 55V46M40 55V34M50 55V40" stroke="#8db9f5" stroke-width="6" stroke-linecap="round"/><path d="M29 28h12" stroke="#c4cfdd" stroke-width="3" stroke-linecap="round"/></svg>
+            <h3 id="empty-title">계좌를 불러오고 있어요</h3>
+          </div>
+        </section>
+      </div>
+      <footer class="page-footer"><span>KIS AI League</span><span id="account-label">계좌 선택</span></footer>
+    </main>
+  </body>
+</html>
