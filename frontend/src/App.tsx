@@ -3,13 +3,16 @@ import HistoryChart from './components/HistoryChart';
 import Holdings from './components/Holdings';
 import TradeHistory from './components/TradeHistory';
 import MarketQuotes from './components/MarketQuotes';
+import StockChart from './components/StockChart';
 import { number, percent, signClass, timestamp } from './format';
 import useAccountDashboard from './useAccountDashboard';
 import useMarketData from './useMarketData';
+import useStockChart from './useStockChart';
 
 export default function App() {
   const dashboard = useAccountDashboard();
   const market = useMarketData(dashboard.autoRefresh);
+  const chart = useStockChart();
   const account = dashboard.accounts.find(account => account.id === dashboard.selectedId);
   const summary = dashboard.snapshot?.summary;
   const updated = timestamp(dashboard.snapshot?.updated_at ?? null);
@@ -79,7 +82,12 @@ export default function App() {
         <Holdings holdings={dashboard.snapshot?.holdings ?? null} emptyTitle={dashboard.emptyTitle}/>
         <TradeHistory data={dashboard.trades.data} range={dashboard.trades.range} accountId={dashboard.trades.accountId}
           loading={dashboard.trades.loading} error={dashboard.trades.error} onQuery={dashboard.trades.query}/>
-        <MarketQuotes data={market.data} loading={market.loading} error={market.error}/>
+        <MarketQuotes data={market.data} loading={market.loading} error={market.error} onSelectSymbol={symbol => {
+          void chart.query(symbol, chart.interval);
+          document.getElementById('stock-chart')?.scrollIntoView({ block: 'start' });
+          document.getElementById('stock-chart-title')?.focus({ preventScroll: true });
+        }}/>
+        <StockChart chart={chart}/>
       </div>
       <footer className="page-footer"><span>KIS AI League</span><span id="account-label">{account?.name ?? '계좌 선택 필요'}</span></footer>
     </main>

@@ -7,6 +7,7 @@
 | 문서 | 내용 |
 | --- | --- |
 | [AI리그 핵심 규정](docs/competition-rules.md) | 참가 조건, 수상 요건, 거래 제한, 일정, 확인이 필요한 조항 |
+| [전략 가설·검증 초안](docs/strategy-hypothesis.md) | 세부 설계 보류 중인 참고 초안 |
 | [프로젝트 기록](docs/project-log.md) | 결정·실험·운영 결과 |
 
 시간 기준: `Asia/Seoul`. API 키·계좌번호·개인 증빙은 Git에 저장하지 않습니다.
@@ -56,6 +57,14 @@ npm run build
 [KIS 현재가 공식 예제](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/domestic_stock/inquire_price/inquire_price.py)의 모의 API `FHKST01010100`·KRX를 사용합니다. [거래량·거래대금 필드](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/domestic_stock/inquire_price/chk_inquire_price.py)는 누적값이므로 조회별로 합산하지 않습니다. 이 API에는 거래일·체결시각이 없어 로컬 조회 시각만 기록합니다. 휴장 중에도 마지막 시세가 반환될 수 있으며, 저장값은 개별 체결이나 분봉이 아닙니다.
 
 종목명은 [KIS 공식 코스피·코스닥 종목 파일](https://github.com/koreainvestment/open-trading-api/tree/main/stocks_info)을 `.local/stock-names.json`에 보관해 표시합니다. 24시간 지난 목록은 화면 조회 시 백그라운드에서 갱신하며 시세 API를 추가 호출하지 않습니다. 갱신 실패 시 이전 이름을 유지하고, 이름이 없는 종목은 코드로 표시합니다.
+
+시세 목록의 종목명을 누르거나 **종목 차트**에 6자리 코드를 입력하면 캔들·거래량을 조회합니다. 일봉·5분봉·15분봉을 선택할 수 있고, 봉을 가리키거나 터치·좌우 방향키로 시가·고가·저가·종가·거래량을 확인합니다. 최초 화면 로딩에서는 차트 API를 호출하지 않으며 차트는 수동으로 갱신합니다.
+
+일봉은 [KIS 기간별 시세](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/domestic_stock/inquire_daily_itemchartprice/inquire_daily_itemchartprice.py)의 수정주가로 최근 180일 범위 중 최대 100개를 표시합니다. 분봉은 [KIS 당일 분봉](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/domestic_stock/inquire_time_itemchartprice/inquire_time_itemchartprice.py)을 시간순으로 조회해 실제 반환된 최신 거래일의 5분·15분 OHLC와 거래량으로 집계합니다. 체결 없는 분은 추가하지 않고 15:30 종가 경매는 별도 봉으로 표시합니다. 진행 중인 봉은 표시하며, 휴장 중 이전 거래일이 반환되면 그 날짜를 유지합니다. 과거 날짜를 지정하는 분봉 조회는 아직 지원하지 않습니다.
+
+정상 일봉·원시 분봉 캐시를 `.local/chart-cache/`에 최대 32개 보관해 서버 재시작 후에도 재사용합니다. 장중에는 일봉 60초·분봉 30초 동안 재사용하고, 분봉 갱신은 기존 조회 구간과 겹칠 때까지만 받아 최근 봉을 교체합니다. 새 거래일은 다시 전체 조회합니다. 장외에 확인한 차트는 다음 평일 09시까지 재사용하되 당일 장마감 확정은 16시 이후 조회부터 적용합니다. 처음 보는 종목의 하루 분봉은 약 14회 호출이 필요하고, 이후 짧은 간격의 갱신은 대개 1회입니다.
+
+차트는 기존 60초 시세 저장과 별도로 조회하며 `market_data.account` 또는 기본 계좌의 키를 사용합니다. 같은 키의 요청 간격을 기존 조회·수집기와 공유합니다. `/api/chart?symbol=005930&interval=day`에서 주기는 `day`, `5m`, `15m`만 허용합니다. **차트 새로고침**은 `refresh=1`로 캐시 유효기간과 무관하게 재조회하되 오류 후에는 10초 대기합니다. 종목·주기 전환 시 해당 차트의 화면 캐시가 있으면 먼저 표시하며 갱신하고, 실패하면 이전 값과 오류를 유지합니다.
 
 CLI:
 

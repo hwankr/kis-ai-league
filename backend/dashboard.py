@@ -16,6 +16,7 @@ from backend.kis import (KisError, PaperClient, ROOT, Settings, client_for_profi
                          load_profiles, validate_execution_range)
 from backend.trades import ExecutionConflict, ExecutionHistory
 from backend.market import MarketService
+from backend.chart import ChartService
 
 FRONTEND = ROOT / "frontend" / "dist"
 REFRESH_SECONDS = 30
@@ -309,9 +310,11 @@ class AccountDirectory:
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port=8765, service=None, frontend_path=FRONTEND, market_service=None):
+    def __init__(self, port=8765, service=None, frontend_path=FRONTEND, market_service=None,
+                 chart_service=None):
         self.service = service if service is not None else AccountDirectory()
         self.market_service = market_service if market_service is not None else MarketService()
+        self.chart_service = chart_service if chart_service is not None else ChartService()
         self.frontend_path = frontend_path.resolve()
         super().__init__(("127.0.0.1", port), DashboardHandler)
         self.hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
@@ -352,7 +355,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         path = url.path
-        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market"):
+        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart"):
             origin = self.headers.get("Origin")
             if (self.headers.get("X-KIS-Dashboard") != "1"
                     or (origin is not None and origin not in self.server.origins)
@@ -360,6 +363,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "대시보드에서 계좌를 조회하세요."})
                 return
             params = parse_qs(url.query, keep_blank_values=True)
+            if path == "/api/chart":
+                if (set(params) - {"symbol", "interval", "refresh"}
+                        or len(params.get("symbol", [])) != 1
+                        or not re.fullmatch(r"[0-9]{6}", params["symbol"][0])
+                        or len(params.get("interval", ["day"])) != 1
+                        or params.get("interval", ["day"])[0] not in {"day", "5m", "15m"}
+                        or ("refresh" in params and params["refresh"] != ["1"])):
+                    self.json_response(400, {"status": "error", "error": "종목코드 6자리와 차트 주기를 확인하세요."})
+                    return
+                try:
+                    payload = self.server.chart_service.snapshot(
+                        params["symbol"][0], params.get("interval", ["day"])[0],
+                        **({"force": True} if "refresh" in params else {}))
+                    self.json_response(200 if payload["status"] == "ok" else 503, payload)
+                except Exception:
+                    self.json_response(503, {"status": "error", "error": "종목 차트를 불러오지 못했습니다."})
+                return
             if path == "/api/market":
                 if params:
                     self.json_response(400, {"status": "error", "error": "시세 상태 조회에는 추가 조건을 지정할 수 없습니다."})

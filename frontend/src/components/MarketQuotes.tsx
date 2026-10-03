@@ -1,11 +1,11 @@
 import { number, percent, signClass, timestamp } from '../format';
 import type { MarketData } from '../types';
 
-interface Props { data: MarketData | null; loading: boolean; error: string | null }
+interface Props { data: MarketData | null; loading: boolean; error: string | null; onSelectSymbol?: (symbol: string) => void }
 
 const labels = { running: '수집 중', stopped: '수집 중지', stale: '수집 지연', not_started: '수집 전' };
 
-export default function MarketQuotes({ data, loading, error }: Props) {
+export default function MarketQuotes({ data, loading, error, onSelectSymbol }: Props) {
   const state = data?.collector.state;
   const status = error ? '상태 확인 필요' : state ? labels[state] : loading ? '상태 조회 중' : '상태 확인 필요';
   const warning = error || data?.collector.error;
@@ -26,7 +26,8 @@ export default function MarketQuotes({ data, loading, error }: Props) {
         <tbody>{data?.quotes.map(quote => {
           const observed = timestamp(quote.observed_at);
           return <tr key={quote.symbol} data-symbol={quote.symbol}>
-            <td className="market-stock"><span className="stock-name">{quote.name || quote.symbol}</span>{quote.name ? <span className="stock-symbol">{quote.symbol}</span> : null}
+            <td className="market-stock">{onSelectSymbol ? <button type="button" className="market-stock-link stock-name" aria-label={`${quote.name || quote.symbol} 차트 보기`} onClick={() => onSelectSymbol(quote.symbol)}>{quote.name || quote.symbol}</button>
+              : <span className="stock-name">{quote.name || quote.symbol}</span>}{quote.name ? <span className="stock-symbol">{quote.symbol}</span> : null}
               {quote.error ? <span className="market-row-error" role="status">{quote.observed_at ? '갱신 실패 · 이전 시세' : '수집 실패'}<span>{quote.error}</span></span>
                 : !quote.observed_at ? <span className="stock-symbol">저장된 시세 없음</span> : null}</td>
             <td className="market-price">{number(quote.price)}<span className="market-price-unit">원</span></td>

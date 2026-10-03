@@ -55,7 +55,7 @@ h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spac
 .refresh-icon { width: 17px; height: 17px; }
 .refresh-button[aria-busy="true"] .refresh-icon { animation: spin 1.2s linear infinite; }
 .error-notice { margin: -12px 0 24px; padding: 15px 18px; border-radius: 8px; background: #fff6e7; color: #865b10; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
-.dashboard-layout { display: grid; grid-template-columns: minmax(0, 1fr) 292px; grid-template-areas: "overview details" "history connection" "holdings holdings" "trades trades" "market market"; column-gap: 44px; }
+.dashboard-layout { display: grid; grid-template-columns: minmax(0, 1fr) 292px; grid-template-areas: "overview details" "history connection" "holdings holdings" "trades trades" "market market" "chart chart"; column-gap: 44px; }
 .asset-overview { grid-area: overview; padding: 8px 0 44px; min-width: 0; }
 .account-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: -6px 0 22px; font-size: 13px; }
 .account-broker { color: var(--muted); white-space: nowrap; }
@@ -151,6 +151,49 @@ h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spac
 .market-row-error { display: block; max-width: 220px; margin-top: 7px; color: #865b10; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .market-row-error > span { display: block; font-size: 11px; }
 .market-mobile-label { display: none; }
+.market-stock-link { padding: 0; border: 0; background: none; color: var(--blue); text-align: left; text-decoration: underline; text-decoration-color: #b7d4ff; text-underline-offset: 4px; }
+.market-stock-link:hover { text-decoration-color: currentColor; }
+.stock-chart-panel { grid-area: chart; min-width: 0; margin-top: 32px; padding-top: 25px; border-top: 1px solid var(--border); scroll-margin-top: 24px; }
+.stock-chart-panel .panel-heading { margin-bottom: 18px; }
+.chart-status { color: var(--muted); font-size: 12px; }
+.chart-status-warning { color: #865b10; }
+.stock-chart-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; margin-bottom: 18px; }
+.stock-chart-query { display: flex; gap: 8px; }
+.stock-chart-query input { width: 112px; min-width: 0; min-height: 40px; padding: 8px 12px; border: 1px solid #e5e8eb; border-radius: 7px; color: var(--secondary); background: white; font-size: 14px; font-variant-numeric: tabular-nums; }
+.stock-chart-query input[aria-invalid="true"] { border-color: #c88415; }
+.chart-query-button { min-width: 58px; }
+.chart-intervals { display: inline-flex; gap: 3px; padding: 3px; border-radius: 8px; background: #f2f4f6; }
+.chart-intervals button { min-width: 48px; min-height: 34px; padding: 7px 12px; border: 0; border-radius: 6px; background: none; color: var(--secondary); font-size: 13px; }
+.chart-intervals button[aria-pressed="true"] { background: white; color: var(--blue); font-weight: 650; box-shadow: 0 1px 3px rgb(25 31 40 / 7%); }
+.chart-refresh { margin-left: auto; min-height: 40px; padding: 8px 0 8px 8px; border: 0; background: none; color: var(--blue); font-size: 12px; }
+.chart-refresh:disabled { color: var(--muted); }
+.stock-chart-identity { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-top: 24px; }
+.stock-chart-identity h3 { margin: 0; font-size: 19px; overflow-wrap: anywhere; }
+.stock-chart-identity > span { color: var(--muted); font-size: 12px; }
+.stock-chart-identity > span:last-child { margin-left: auto; }
+.stock-chart-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; margin: 12px 0 20px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.stock-chart-meta strong { font-weight: 500; color: var(--secondary); }
+.stock-chart-figure { margin: 0; }
+.stock-chart-selection { min-height: 84px; padding: 12px 14px; border-radius: 8px; background: #f9fafb; font-variant-numeric: tabular-nums; }
+.stock-chart-selected-time { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--secondary); font-size: 12px; }
+.chart-partial { padding: 2px 5px; border-radius: 4px; background: #fff3dd; color: #865b10; font-size: 11px; }
+.stock-chart-values { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 10px 0 0; }
+.stock-chart-values > div { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.stock-chart-values dt { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.stock-chart-values dd { margin: 0; font-size: 13px; font-weight: 550; overflow-wrap: anywhere; }
+.stock-chart-values dd > span { margin-left: 2px; font-size: 11px; font-weight: 400; color: var(--muted); }
+.stock-candles { display: block; width: 100%; height: 338px; margin-top: 12px; touch-action: pan-y; }
+.stock-candles:focus-visible { outline: 2px solid #3182f6; outline-offset: 2px; border-radius: 4px; }
+.stock-candle { fill: var(--secondary); stroke: var(--secondary); stroke-width: 1; }
+.candle-up { fill: var(--gain); stroke: var(--gain); }
+.candle-down { fill: var(--loss); stroke: var(--loss); }
+.stock-candle rect { stroke: none; }
+.stock-volume-bar { opacity: .45; }
+.candle-partial { opacity: .6; }
+.stock-chart-crosshair { stroke: #8b95a1; stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
+.stock-chart-selected-point { fill: #fff; stroke: #333d4b; stroke-width: 1.5; pointer-events: none; }
+.stock-chart-source { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; margin: 12px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.stock-chart-empty { display: flex; align-items: center; justify-content: center; min-height: 160px; margin: 0; color: var(--muted); font-size: 13px; text-align: center; line-height: 1.6; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
 .panel-title { display: flex; align-items: baseline; gap: 8px; }
 .panel-title h2 { margin: 0; font-size: 21px; line-height: 1.5; font-weight: 650; letter-spacing: -.6px; }
@@ -186,7 +229,7 @@ tbody tr:hover { background: #f9fafb; }
   .balance-list dd { font-size: 20px; }
 }
 @media (max-width: 800px) {
-  .dashboard-layout { grid-template-columns: minmax(0, 1fr); grid-template-areas: "overview" "details" "history" "holdings" "trades" "market" "connection"; }
+  .dashboard-layout { grid-template-columns: minmax(0, 1fr); grid-template-areas: "overview" "details" "history" "holdings" "trades" "market" "chart" "connection"; }
   .asset-overview { padding-bottom: 30px; }
   .account-details { padding: 24px; margin-bottom: 34px; border-radius: 4px; }
   .balance-list { flex-direction: row; gap: 48px; margin: 20px 0 0; }
@@ -278,5 +321,17 @@ tbody tr:hover { background: #f9fafb; }
   .trade-filters input { width: 100%; padding: 8px 5px; font-size: 12px; }
   .trade-query-button { min-width: 54px; min-height: 40px; padding: 10px; }
   .trade-status { font-size: 11px; }
+  .stock-chart-controls { gap: 10px 12px; }
+  .stock-chart-query { width: 100%; }
+  .stock-chart-query input { flex: 1; width: 0; }
+  .chart-refresh { padding-left: 0; }
+  .stock-chart-identity { gap: 6px; }
+  .stock-chart-identity > span:last-child { width: 100%; margin: 4px 0 0; }
+  .stock-chart-meta { margin-bottom: 14px; font-size: 11px; }
+  .stock-chart-selection { padding: 12px; }
+  .stock-chart-values { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 12px; }
+  .stock-chart-values > div { flex-wrap: wrap; gap: 3px 5px; }
+  .stock-chart-values > div:last-child { grid-column: 1 / -1; }
+  .stock-chart-values dd { font-size: 12px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

@@ -371,6 +371,37 @@ class PaperClient:
                 "volume": _quote_number(output.get("acml_vol"), integer=True),
                 "cumulative_turnover": _quote_number(output.get("acml_tr_pbmn"))}
 
+    def chart_daily(self, symbol, start_date, end_date):
+        """최대 100개의 수정 일봉 원본. 날짜·가격 검증은 차트 서비스가 담당한다."""
+        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
+            raise KisError("종목코드는 숫자 6자리로 입력하세요.")
+        data, _ = self._get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                            "FHKST03010100", {
+                                "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol,
+                                "FID_INPUT_DATE_1": start_date.strftime("%Y%m%d"),
+                                "FID_INPUT_DATE_2": end_date.strftime("%Y%m%d"),
+                                "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0",
+                            })
+        return data
+
+    def chart_minutes(self, symbol, hour):
+        """당일 분봉 최대 30행. hour 이전 방향으로 차트 서비스가 페이지를 조회한다."""
+        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
+            raise KisError("종목코드는 숫자 6자리로 입력하세요.")
+        if not isinstance(hour, str) or not re.fullmatch(r"[0-9]{6}", hour):
+            raise KisError("분봉 조회 시각이 올바르지 않습니다.")
+        try:
+            datetime.strptime(hour, "%H%M%S")
+        except ValueError:
+            raise KisError("분봉 조회 시각이 올바르지 않습니다.") from None
+        data, _ = self._get("/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                            "FHKST03010200", {
+                                "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol,
+                                "FID_INPUT_HOUR_1": hour, "FID_PW_DATA_INCU_YN": "Y",
+                                "FID_ETC_CLS_CODE": "",
+                            })
+        return data
+
     def balance(self):
         self.settings.validate_account()
         params = {

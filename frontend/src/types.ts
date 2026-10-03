@@ -90,3 +90,28 @@ export interface MarketData {
   symbols: string[];
   quotes: MarketQuote[];
 }
+
+export type ChartInterval = 'day' | '5m' | '15m';
+export interface ChartRequest { symbol: string; interval: ChartInterval }
+export interface StockBar {
+  time: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+  partial: boolean;
+}
+export interface StockChartData extends ChartRequest {
+  status: 'ok' | 'error';
+  name?: string;
+  market: 'KRX';
+  environment: 'paper';
+  source: 'KIS';
+  adjusted: boolean;
+  updated_at: string | null;
+  as_of: string | null;
+  stale: boolean;
+  error: string | null;
+  bars: StockBar[];
+}
