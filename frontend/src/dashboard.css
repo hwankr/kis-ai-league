@@ -55,7 +55,7 @@ h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spac
 .refresh-icon { width: 17px; height: 17px; }
 .refresh-button[aria-busy="true"] .refresh-icon { animation: spin 1.2s linear infinite; }
 .error-notice { margin: -12px 0 24px; padding: 15px 18px; border-radius: 8px; background: #fff6e7; color: #865b10; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
-.dashboard-layout { display: grid; grid-template-columns: minmax(0, 1fr) 292px; grid-template-areas: "overview details" "holdings connection"; column-gap: 44px; }
+.dashboard-layout { display: grid; grid-template-columns: minmax(0, 1fr) 292px; grid-template-areas: "overview details" "history connection" "holdings holdings" "trades trades" "market market"; column-gap: 44px; }
 .asset-overview { grid-area: overview; padding: 8px 0 44px; min-width: 0; }
 .account-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: -6px 0 22px; font-size: 13px; }
 .account-broker { color: var(--muted); white-space: nowrap; }
@@ -68,6 +68,7 @@ h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spac
 .account-select-chevron { flex: 0 0 16px; width: 16px; height: 16px; color: var(--secondary); transition: transform .15s; }
 .account-select-trigger[aria-expanded="true"] .account-select-chevron { transform: rotate(180deg); }
 .account-options { position: absolute; top: calc(100% + 6px); left: 0; z-index: 5; width: max(100%, 228px); max-width: min(360px, calc(100vw - 40px)); max-height: 280px; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 5px; border: 1px solid #e5e8eb; border-radius: 10px; background: #fff; box-shadow: 0 5px 20px rgb(25 31 40 / 9%); list-style: none; }
+.account-options-fit { width: 100%; }
 .account-option { position: relative; display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 10px 31px 10px 10px; border-radius: 6px; color: #333d4b; font-size: 13px; line-height: 1.5; cursor: pointer; }
 .account-option-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .account-option-meta { flex-shrink: 0; color: #8b95a1; font-size: 11px; font-weight: 400; }
@@ -111,7 +112,45 @@ h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spac
 .connection-details > div { margin-top: 13px; }
 .connection-details dt { color: var(--muted); }
 .connection-details dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; }
-.holdings-panel { grid-area: holdings; min-width: 0; padding-top: 25px; border-top: 1px solid var(--border); }
+.asset-history { grid-area: history; min-width: 0; padding-top: 25px; border-top: 1px solid var(--border); }
+.asset-history .panel-heading { margin-bottom: 12px; }
+.history-count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.history-figure { margin: 0; }
+.history-chart { display: block; width: 100%; height: 220px; overflow: visible; }
+.history-grid { stroke: var(--border); stroke-width: 1; }
+.history-axis { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.history-line { fill: none; stroke: #3182f6; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.history-point { fill: #3182f6; stroke: white; stroke-width: 1; }
+.history-point:hover { r: 4; stroke-width: 2; }
+.history-latest { min-height: 18px; margin-top: 6px; color: var(--secondary); text-align: right; font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.history-empty { display: flex; align-items: center; justify-content: center; min-height: 220px; margin: 0; color: var(--muted); font-size: 14px; }
+.history-error { margin: 0 0 12px; color: #865b10; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.holdings-panel { grid-area: holdings; min-width: 0; margin-top: 32px; padding-top: 25px; border-top: 1px solid var(--border); }
+.trades-panel { grid-area: trades; min-width: 0; margin-top: 32px; padding-top: 25px; border-top: 1px solid var(--border); }
+.trade-filters { display: flex; align-items: flex-end; gap: 12px; }
+.trade-filters label { display: flex; flex-direction: column; gap: 8px; min-width: 0; color: var(--muted); font-size: 12px; }
+.trade-filters input { min-width: 0; min-height: 40px; padding: 8px 10px; border: 1px solid #e5e8eb; border-radius: 7px; background: white; color: var(--secondary); font-size: 13px; }
+.trade-query-button { min-width: 64px; }
+.trade-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; min-height: 16px; margin: 14px 0 12px; font-size: 12px; color: var(--muted); }
+.trade-status time { margin-left: auto; font-variant-numeric: tabular-nums; }
+.trades-empty { min-height: 120px; margin: 0; display: flex; justify-content: center; align-items: center; color: var(--muted); font-size: 14px; }
+.trades-table { min-width: 570px; }
+.trades-table th:nth-child(2), .trade-stock { text-align: left; }
+.trade-date { color: var(--secondary); font-size: 13px; }
+.trade-side { font-weight: 600; }
+.trade-price-label, .trade-price-unit { display: none; }
+.market-panel { grid-area: market; min-width: 0; margin-top: 32px; padding-top: 25px; border-top: 1px solid var(--border); }
+.market-panel .panel-heading { margin-bottom: 12px; }
+.market-meta { display: flex; gap: 14px; margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+.market-empty { min-height: 100px; display: flex; align-items: center; justify-content: center; margin: 0; color: var(--muted); font-size: 14px; }
+.market-table { min-width: 740px; }
+.market-stock { white-space: normal; }
+.market-price { font-weight: 600; }
+.market-price-unit { margin-left: 2px; font-size: 12px; font-weight: 400; }
+.market-time, .market-count { color: var(--secondary); font-size: 12px; }
+.market-row-error { display: block; max-width: 220px; margin-top: 7px; color: #865b10; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.market-row-error > span { display: block; font-size: 11px; }
+.market-mobile-label { display: none; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
 .panel-title { display: flex; align-items: baseline; gap: 8px; }
 .panel-title h2 { margin: 0; font-size: 21px; line-height: 1.5; font-weight: 650; letter-spacing: -.6px; }
@@ -147,14 +186,14 @@ tbody tr:hover { background: #f9fafb; }
   .balance-list dd { font-size: 20px; }
 }
 @media (max-width: 800px) {
-  .dashboard-layout { grid-template-columns: minmax(0, 1fr); grid-template-areas: "overview" "details" "holdings" "connection"; }
+  .dashboard-layout { grid-template-columns: minmax(0, 1fr); grid-template-areas: "overview" "details" "history" "holdings" "trades" "market" "connection"; }
   .asset-overview { padding-bottom: 30px; }
   .account-details { padding: 24px; margin-bottom: 34px; border-radius: 4px; }
   .balance-list { flex-direction: row; gap: 48px; margin: 20px 0 0; }
   .connection-panel { margin-top: 28px; padding: 24px; border-radius: 4px; }
   .account-connection { border-top: 0; padding-top: 0; }
   .connection-details { display: flex; gap: 40px; margin-top: 10px; }
-  .holdings-panel { border-top: 0; padding-top: 0; }
+  .asset-history { border-top: 0; padding-top: 0; }
   table { display: block; min-width: 0; }
   thead { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   tbody { display: block; }
@@ -176,6 +215,24 @@ tbody tr:hover { background: #f9fafb; }
   .holding-average::before { content: "평균 "; color: var(--muted); }
   .holding-price { grid-area: price; margin-top: 6px; font-size: 12px; color: var(--secondary); }
   .holding-price::before { content: "현재 "; color: var(--muted); }
+  .trades-table { min-width: 0; }
+  .trades-table tr { grid-template-areas: "date date" "stock side" "stock quantity" "price price"; }
+  .trades-table .trade-date { grid-area: date; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+  .trade-stock { grid-area: stock; }
+  .trade-side { grid-area: side; }
+  .trade-quantity { grid-area: quantity; color: var(--secondary); }
+  .trade-price { grid-area: price; margin-top: 6px; font-size: 13px; }
+  .trade-price-label, .trade-price-unit { display: inline; }
+  .trade-price-label { color: var(--muted); }
+  .market-table { min-width: 0; }
+  .market-table tr { grid-template-areas: "stock price" "stock change" "volume count" "time time"; }
+  .market-table .market-stock { grid-area: stock; }
+  .market-price { grid-area: price; font-size: 16px; }
+  .market-change { grid-area: change; font-size: 13px; }
+  .market-volume { grid-area: volume; margin-top: 8px; text-align: left; font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
+  .market-count { grid-area: count; margin-top: 8px; }
+  .market-time { grid-area: time; text-align: left; white-space: normal; line-height: 1.6; }
+  .market-mobile-label { display: inline; color: var(--muted); }
 }
 @media (max-width: 520px) {
   .header-inner { height: 60px; padding: 0 20px; }
@@ -216,5 +273,10 @@ tbody tr:hover { background: #f9fafb; }
   .empty-state h3 { font-size: 16px; }
   .page-footer { margin-top: 30px; }
   .error-notice { font-size: 13px; }
+  .trade-filters { gap: 8px; }
+  .trade-filters label { flex: 1; }
+  .trade-filters input { width: 100%; padding: 8px 5px; font-size: 12px; }
+  .trade-query-button { min-width: 54px; min-height: 40px; padding: 10px; }
+  .trade-status { font-size: 11px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

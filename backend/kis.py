@@ -1,26 +1,126 @@
 """KIS 모의투자 조회 CLI. Python 3.11+, 외부 패키지 없음."""
 
 import argparse
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 import tomllib
+from typing import Callable, ContextManager
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from backend.request_gate import file_lock, request_spacing
+
 ROOT = Path(__file__).resolve().parents[1]
 PAPER_URL = "https://openapivts.koreainvestment.com:29443"
+KST = timezone(timedelta(hours=9))
+EXECUTION_MAX_DAYS = 90
+TOKEN_LOCK = threading.Lock()
 
 
 class KisError(Exception):
     """비밀값을 포함하지 않는 사용자용 오류."""
+
+
+def _execution_today():
+    return datetime.now(KST).date()
+
+
+def validate_execution_range(start_date, end_date):
+    """조회 부담을 제한하는 앱 정책: 양 끝을 포함해 최대 90일."""
+    try:
+        if not all(isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value)
+                   for value in (start_date, end_date)):
+            raise ValueError
+        start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    except ValueError:
+        raise KisError("거래 조회 날짜는 YYYY-MM-DD 형식으로 입력하세요.") from None
+    if start > end:
+        raise KisError("거래 조회 시작일은 종료일보다 늦을 수 없습니다.")
+    if end > _execution_today():
+        raise KisError("거래 내역은 오늘까지 조회할 수 있습니다.")
+    if (end - start).days >= EXECUTION_MAX_DAYS:
+        raise KisError("거래 내역은 한 번에 최대 90일간 조회할 수 있습니다.")
+    return start, end
+
+
+def _execution_number(value):
+    if (not isinstance(value, str) or len(value) > 40
+            or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value.strip())):
+        raise KisError("체결 응답에 올바른 수량·금액이 없습니다.")
+    try:
+        number = Decimal(value.strip())
+    except InvalidOperation:
+        raise KisError("체결 응답에 올바른 수량·금액이 없습니다.") from None
+    return format(number, "f").rstrip("0").rstrip(".") if "." in str(number) else str(number)
+
+
+def _quote_number(value, *, signed=False, integer=False, positive=False):
+    pattern = (r"[+-]?" if signed else "") + (r"[0-9]+" if integer else r"[0-9]+(?:\.[0-9]+)?")
+    if not isinstance(value, str) or len(value) > 40 or not re.fullmatch(pattern, value.strip()):
+        raise KisError("시세 응답에 올바른 가격·거래량이 없습니다.")
+    number = Decimal(value.strip())
+    if positive and number <= 0:
+        raise KisError("시세 응답에 유효한 현재가가 없습니다.")
+    normalized = format(number, "f")
+    return normalized.rstrip("0").rstrip(".") if "." in normalized else normalized
+
+
+def _execution_row(row, start, end):
+    if not isinstance(row, dict):
+        raise KisError("체결 응답 형식이 예상과 다릅니다.")
+    quantity = _execution_number(row.get("tot_ccld_qty"))
+    if Decimal(quantity) == 0:
+        return None
+    order_date = row.get("ord_dt")
+    try:
+        if not isinstance(order_date, str) or not re.fullmatch(r"[0-9]{8}", order_date):
+            raise ValueError
+        order_date = datetime.strptime(order_date, "%Y%m%d").date()
+    except ValueError:
+        raise KisError("체결 응답의 주문일자가 올바르지 않습니다.") from None
+    if not start <= order_date <= end:
+        raise KisError("체결 응답에 조회 기간 밖의 주문이 포함되어 있습니다.")
+    order_id, branch_id, symbol = (row.get(key) for key in ("odno", "ord_gno_brno", "pdno"))
+    if (not isinstance(order_id, str) or not re.fullmatch(r"[0-9]{1,20}", order_id)
+            or not isinstance(branch_id, str) or not re.fullmatch(r"[0-9]{1,10}", branch_id)
+            or not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]{6,12}", symbol)):
+        raise KisError("체결 응답의 주문 식별값이 올바르지 않습니다.")
+    side_code = row.get("sll_buy_dvsn_cd")
+    side = {"01": "sell", "02": "buy"}.get(side_code) if isinstance(side_code, str) else None
+    if side is None:
+        raise KisError("체결 응답의 매수·매도 구분이 올바르지 않습니다.")
+    name = row.get("prdt_name")
+    if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 100
+            or any(ord(character) < 32 or ord(character) == 127 for character in name)):
+        raise KisError("체결 응답의 종목명이 올바르지 않습니다.")
+    price, amount = _execution_number(row.get("avg_prvs")), _execution_number(row.get("tot_ccld_amt"))
+    if Decimal(price) <= 0 or Decimal(amount) <= 0:
+        raise KisError("체결 응답에 유효한 체결 금액이 없습니다.")
+    order_time = row.get("ord_tmd")
+    if order_time in (None, ""):
+        order_time = None
+    else:
+        try:
+            if not isinstance(order_time, str) or not re.fullmatch(r"[0-9]{6}", order_time):
+                raise ValueError
+            order_time = datetime.strptime(order_time, "%H%M%S").strftime("%H:%M:%S")
+        except ValueError:
+            raise KisError("체결 응답의 주문시각이 올바르지 않습니다.") from None
+    # 일별주문체결 응답은 개별 체결 틱이 아닌 주문별 누적 수량·평균가다.
+    return {"order_date": order_date.isoformat(), "order_id": order_id, "branch_id": branch_id,
+            "symbol": symbol, "name": name.strip(), "side": side, "quantity": quantity,
+            "price": price, "amount": amount, "order_time": order_time}
 
 
 @dataclass(repr=False)
@@ -139,12 +239,26 @@ class PaperClient:
     settings: Settings
     cache_path: Path = ROOT / ".local" / "kis-token.json"
     legacy_cache_path: Path | None = None
-    _next_request: float = field(default=0, init=False)
+    request_guard: Callable[[], ContextManager] | None = None
+
+    def _gate_path(self, purpose):
+        return self.cache_path.parent / f"{purpose}-{_credential_identity(self.settings)}.lock"
 
     def _request(self, path, *, headers=None, params=None, body=None):
+        # 계좌 간 제한을 공유하되, 연속조회의 페이지 사이에는 잔고 조회가 진행된다.
+        with self.request_guard() if self.request_guard is not None else nullcontext():
+            return self._perform_request(path, headers=headers, params=params, body=body)
+
+    def _perform_request(self, path, *, headers=None, params=None, body=None):
+        # 대시보드와 독립 수집기가 같은 키를 사용해도 요청 간격을 공유한다.
+        try:
+            with request_spacing(self._gate_path("request")):
+                return self._http_request(path, headers=headers, params=params, body=body)
+        except (OSError, TimeoutError):
+            raise KisError("로컬 API 요청 잠금에 접근하지 못했습니다. 잠시 후 다시 조회하세요.") from None
+
+    def _http_request(self, path, *, headers=None, params=None, body=None):
         # 모의 서버로만 연결하며, 서버 응답 본문이나 인증 헤더를 오류에 출력하지 않는다.
-        time.sleep(max(0, self._next_request - time.monotonic()))
-        self._next_request = time.monotonic() + 1
         url = PAPER_URL + path
         if params:
             url += "?" + urlencode(params)
@@ -172,6 +286,16 @@ class PaperClient:
         return data, {key.lower(): value for key, value in response_headers.items()}
 
     def token(self):
+        # 잔고·체결 클라이언트가 동시에 시작해도 캐시 확인부터 발급·저장까지
+        # 직렬화해 동일 키로 토큰을 연달아 발급하지 않는다.
+        with TOKEN_LOCK:
+            try:
+                with file_lock(self._gate_path("token")):
+                    return self._cached_or_issue_token()
+            except (OSError, TimeoutError):
+                raise KisError("로컬 인증 캐시·잠금에 접근하지 못했습니다. 잠시 후 다시 조회하세요.") from None
+
+    def _cached_or_issue_token(self):
         identity = _credential_identity(self.settings)
         for path in (self.cache_path, self.legacy_cache_path):
             if path is None:
@@ -228,17 +352,24 @@ class PaperClient:
         return data, headers
 
     def quote(self, symbol):
-        if not re.fullmatch(r"[0-9]{6}", symbol):
+        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
             raise KisError("종목코드는 숫자 6자리로 입력하세요.")
         data, _ = self._get("/uapi/domestic-stock/v1/quotations/inquire-price",
                             "FHKST01010100", {
                                 "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol,
                             })
         output = data.get("output")
-        if not isinstance(output, dict) or not output.get("stck_prpr"):
+        if not isinstance(output, dict) or not output:
             raise KisError("현재가 응답이 없습니다. 종목과 서비스 지원 여부를 확인하세요.")
+        if "stck_shrn_iscd" in output and output["stck_shrn_iscd"] != symbol:
+            raise KisError("시세 응답의 종목코드가 요청과 다릅니다.")
+        # 현재가 API의 누적 거래량·거래대금이다. 조회 시각은 수집기가 별도로
+        # 기록하며, 응답에 없는 거래일·체결시각·종목명을 추정하지 않는다.
         return {"environment": "paper", "symbol": symbol, "market": "KRX",
-                "price": output["stck_prpr"], "change_percent": output.get("prdy_ctrt")}
+                "price": _quote_number(output.get("stck_prpr"), positive=True),
+                "change_percent": _quote_number(output.get("prdy_ctrt"), signed=True),
+                "volume": _quote_number(output.get("acml_vol"), integer=True),
+                "cumulative_turnover": _quote_number(output.get("acml_tr_pbmn"))}
 
     def balance(self):
         self.settings.validate_account()
@@ -276,6 +407,67 @@ class PaperClient:
             seen.add(cursor)
             params.update(CTX_AREA_FK100=cursor[0], CTX_AREA_NK100=cursor[1])
         raise KisError("잔고 연속조회 한도를 초과했습니다.")
+
+    def executions(self, start_date, end_date):
+        """전 페이지를 검증한 주문별 누적 체결. 오류 시 부분 결과를 반환하지 않는다."""
+        self.settings.validate_account()
+        start, end = validate_execution_range(start_date, end_date)
+        today = _execution_today()
+        # 공식 legacy 예제의 월 단위 경계: 4월 25일이면 1월 1일부터 최근 TR.
+        month_index = today.year * 12 + today.month - 1 - 3
+        cutoff = date(month_index // 12, month_index % 12 + 1, 1)
+        periods = []
+        if start < cutoff:
+            periods.append((start, min(end, cutoff - timedelta(days=1)), "VTSC9215R"))
+        if end >= cutoff:
+            periods.append((max(start, cutoff), end, "VTTC0081R"))
+        executions = {}
+        for period_start, period_end, tr_id in periods:
+            params = {
+                "CANO": self.settings.account, "ACNT_PRDT_CD": self.settings.product_code,
+                "INQR_STRT_DT": period_start.strftime("%Y%m%d"),
+                "INQR_END_DT": period_end.strftime("%Y%m%d"),
+                "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "PDNO": "",
+                # 전체 주문에서 실제 체결량을 검사해 미완료 부분체결도 포함한다.
+                "CCLD_DVSN": "00", "ORD_GNO_BRNO": "", "ODNO": "",
+                "INQR_DVSN_1": "", "INQR_DVSN_3": "00", "EXCG_ID_DVSN_CD": "ALL",
+                "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+            }
+            seen = set()
+            for page in range(1000):
+                data, headers = self._get("/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                                          tr_id, params, "N" if page else "")
+                rows = data.get("output1")
+                if not isinstance(rows, list) or not isinstance(data.get("output2"), dict):
+                    raise KisError("체결 응답 형식이 예상과 다릅니다.")
+                for raw in rows:
+                    row = _execution_row(raw, period_start, period_end)
+                    if row is None:
+                        continue
+                    key = (row["order_date"], row["branch_id"], row["order_id"])
+                    previous = executions.get(key)
+                    if previous is not None:
+                        if (any(previous[field] != row[field] for field in ("symbol", "side"))
+                                or Decimal(row["quantity"]) < Decimal(previous["quantity"])):
+                            raise KisError("중복 주문의 체결 응답이 일치하지 않습니다. 다시 조회하세요.")
+                    executions[key] = row
+                continuation = headers.get("tr_cont", "").strip()
+                if continuation in ("", "D", "E"):
+                    break
+                if continuation not in ("M", "F"):
+                    raise KisError("체결 연속조회 상태를 확인할 수 없습니다.")
+                cursor = (data.get("ctx_area_fk100"), data.get("ctx_area_nk100"))
+                if not all(isinstance(value, str) for value in cursor):
+                    raise KisError("체결 연속조회 키가 올바르지 않습니다.")
+                cursor = tuple(value.strip() for value in cursor)
+                if not any(cursor) or cursor in seen:
+                    raise KisError("체결 연속조회가 진행되지 않습니다. 부분 결과를 반환하지 않습니다.")
+                seen.add(cursor)
+                params.update(CTX_AREA_FK100=cursor[0], CTX_AREA_NK100=cursor[1])
+            else:
+                raise KisError("체결 연속조회 한도를 초과했습니다. 조회 기간을 줄이세요.")
+        return {"environment": "paper", "executions": sorted(executions.values(), key=lambda row: (
+            row["order_date"], row["order_time"] or "", row["branch_id"], row["order_id"]), reverse=True)}
 
 
 def main(argv=None):

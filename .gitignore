@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 config.local.toml
 .local/
+node_modules/
+frontend/dist/
+coverage/
+*.tsbuildinfo
 .env
 .env.*
 !.env.example

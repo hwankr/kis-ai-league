@@ -215,7 +215,8 @@ class KisTests(unittest.TestCase):
         def open_request(request, timeout):
             captured.append(request)
             return Response(json.dumps({"rt_cd": "0", "output": {
-                "stck_prpr": "75000", "prdy_ctrt": "1.5", "private": "hidden"
+                "stck_prpr": "75000", "prdy_ctrt": "1.5", "acml_vol": "1234",
+                "acml_tr_pbmn": "92550000", "private": "hidden"
             }}).encode())
 
         with patch.object(self.client, "token", return_value="test-token"), \

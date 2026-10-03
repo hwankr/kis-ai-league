@@ -1,6 +1,11 @@
 # config.local.toml에 복사해 모의투자 키를 입력합니다.
 default_account = 'paper'
 
+[market_data]
+symbols = ['005930']
+interval_seconds = 60  # 한 회차를 마친 뒤 다음 조회까지 대기하는 초 (10~3600)
+# account = 'paper'  # 생략하면 default_account의 키 사용
+
 [accounts.paper]
 name = '일반 모의투자'
 app_key = ''

@@ -2,14 +2,17 @@ import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from http.client import HTTPConnection
 from pathlib import Path
+import sqlite3
 import tempfile
 from unittest.mock import Mock
 
 from backend.dashboard import (AccountDirectory, AccountService, DashboardServer,
                                UnknownAccount, normalize_balance)
-from backend.kis import KisError
+from backend.history import AccountHistory, series_for_profile
+from backend.kis import KisError, load_profiles
 
 
 def sample_balance():
@@ -122,6 +125,7 @@ class ServerTests(unittest.TestCase):
 
     def test_rebinding_and_private_file_requests_are_blocked(self):
         for path in ("/config.local.toml", "/.local/kis-token.json",
+                     "/.local/account-history.sqlite3", "/.local/account-history.sqlite3-journal",
                      "/../config.local.toml", "/backend/kis.py"):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path)[0], 404)
@@ -162,7 +166,9 @@ class DirectoryTests(unittest.TestCase):
         contest_balance["summary"]["tot_evlu_amt"] = "100000000"
         self.clients["competition"].balance.return_value = contest_balance
         self.factory = Mock(side_effect=lambda profile: self.clients[profile.id])
-        self.service = AccountDirectory(self.path, self.factory, self.clock, sleep=Mock())
+        self.history_path = Path(self.directory.name) / "private" / "history.sqlite3"
+        self.service = AccountDirectory(self.path, self.factory, self.clock, sleep=Mock(),
+                                        history_path=self.history_path)
 
     def test_account_list_contains_only_public_metadata(self):
         listing = self.service.list_accounts()
@@ -234,6 +240,178 @@ class DirectoryTests(unittest.TestCase):
             client.balance.assert_called_once()
         with self.assertRaises(UnknownAccount):
             self.service.snapshot("../missing")
+
+    def test_history_records_only_fresh_successes_including_unchanged_balances(self):
+        first = self.service.snapshot("paper")
+        self.assertEqual(first["history"]["total_count"], 1)
+        self.assertEqual(first["history"]["points"], [{
+            "observed_at": first["updated_at"], "total_value": "697000", "cash": "500000",
+        }])
+        self.assertEqual(self.service.snapshot("paper")["history"], first["history"])
+        self.clock.return_value = 20
+        self.clients["paper"].balance.side_effect = KisError("조회 실패")
+        self.assertEqual(self.service.snapshot("paper")["history"], first["history"])
+        self.assertEqual(self.service.snapshot("paper")["history"], first["history"])
+        self.clients["paper"].balance.side_effect = None
+        self.clock.return_value = 31
+        recovered = self.service.snapshot("paper")
+        self.assertEqual(recovered["history"]["total_count"], 2)
+        self.assertEqual([point["total_value"] for point in recovered["history"]["points"]],
+                         ["697000", "697000"])
+        self.assertRegex(first["updated_at"], r"\.\d{6}\+00:00$")
+        with closing(sqlite3.connect(self.history_path)) as connection:
+            snapshot = json.loads(connection.execute(
+                "SELECT snapshot_json FROM observations ORDER BY id LIMIT 1").fetchone()[0])
+        self.assertEqual(snapshot, normalize_balance(sample_balance()))
+
+    def test_parallel_requests_save_one_observation_per_actual_query(self):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(self.service.snapshot, ["paper", "competition"] * 4))
+        self.assertTrue(all(result["history"]["total_count"] == 1 for result in results))
+        for client in self.clients.values():
+            client.balance.assert_called_once()
+        self.assertEqual(self.service.snapshot("paper")["history"]["points"][0]["total_value"],
+                         "697000")
+        self.assertEqual(self.service.snapshot("competition")["history"]["points"][0]["total_value"],
+                         "100000000")
+
+    def test_history_survives_restart_without_restoring_old_balance_as_fresh(self):
+        first = self.service.snapshot("paper")
+        self.clients["paper"].balance.side_effect = KisError("재시작 후 조회 실패")
+        restarted = AccountDirectory(self.path, self.factory, self.clock, sleep=Mock(),
+                                     history_path=self.history_path)
+        result = restarted.snapshot("paper")
+        self.assertEqual(result["history"], first["history"])
+        self.assertEqual(result["summary"], {})
+        self.assertIsNone(result["updated_at"])
+        self.assertFalse(result["stale"])
+        self.clients["paper"].balance.side_effect = None
+        self.clock.return_value = 21
+        self.assertEqual(restarted.snapshot("paper")["history"]["total_count"], 2)
+
+    def test_each_identity_change_starts_separate_history_and_rename_keeps_it(self):
+        first = self.service.snapshot("competition")
+        renamed = self.competition.replace("대회 모의투자", "새 대회 이름")
+        self.path.write_text(self.legacy + renamed, encoding="utf-8")
+        result = self.service.snapshot("competition")
+        self.assertEqual(result["account"]["name"], "새 대회 이름")
+        self.assertEqual(result["history"], first["history"])
+        self.clients["competition"].balance.side_effect = KisError("변경 계좌 조회 실패")
+        for before, after in (("contest-key", "new-key"), ("contest-secret", "new-secret"),
+                              ("87654321", "11112222"), ("product_code = '01'", "product_code = '02'")):
+            with self.subTest(field=before):
+                self.path.write_text(self.legacy + renamed.replace(before, after), encoding="utf-8")
+                result = self.service.snapshot("competition")
+                self.assertEqual(result["history"], {"points": [], "total_count": 0, "error": None})
+                self.assertEqual(result["summary"], {})
+        self.path.write_text(self.legacy + renamed, encoding="utf-8")
+        self.assertEqual(self.service.snapshot("competition")["history"], first["history"])
+
+    def test_same_credentials_under_different_profiles_still_have_separate_history(self):
+        self.service.snapshot("paper")
+        same_identity = self.competition.replace("contest-key", "paper-key").replace(
+            "contest-secret", "paper-secret").replace("87654321", "01234567")
+        self.path.write_text(self.legacy + same_identity, encoding="utf-8")
+        contest = self.service.snapshot("competition")
+        self.assertEqual(contest["history"]["total_count"], 1)
+        self.assertEqual(contest["history"]["points"][0]["total_value"], "100000000")
+
+    def test_initial_error_and_incomplete_profiles_do_not_create_observations(self):
+        self.clients["paper"].balance.side_effect = KisError("첫 조회 실패")
+        result = self.service.snapshot("paper")
+        self.assertEqual(result["history"], {"points": [], "total_count": 0, "error": None})
+        store = Mock()
+        self.path.write_text(self.legacy + self.competition.replace("contest-secret", ""),
+                             encoding="utf-8")
+        service = AccountDirectory(self.path, self.factory, self.clock, sleep=Mock(), history_store=store)
+        self.assertEqual(service.snapshot("competition")["history"], result["history"])
+        store.read.assert_not_called()
+        store.record.assert_not_called()
+        self.clients["competition"].balance.assert_not_called()
+
+    def test_history_write_failure_keeps_fresh_balance_and_safe_separate_error(self):
+        store = Mock(wraps=AccountHistory(self.history_path))
+        service = AccountDirectory(self.path, self.factory, self.clock, sleep=Mock(), history_store=store)
+        first = service.snapshot("paper")
+        self.clock.return_value = 20
+        store.record.side_effect = OSError("private-key-account-and-path")
+        result = service.snapshot("paper")
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNone(result["error"])
+        self.assertFalse(result["stale"])
+        self.assertEqual(result["summary"], first["summary"])
+        self.assertEqual(result["history"]["points"], first["history"]["points"])
+        self.assertIsNotNone(result["history"]["error"])
+        self.assertNotIn("private-key", json.dumps(result))
+        self.assertEqual(service.snapshot("paper")["history"], result["history"])
+        self.assertEqual(store.record.call_count, 2)
+        store.record.side_effect = None
+        self.clock.return_value = 30
+        recovered = service.snapshot("paper")
+        self.assertIsNone(recovered["history"]["error"])
+        self.assertEqual(recovered["history"]["total_count"], 2)
+
+    def test_corrupt_database_does_not_fail_or_leak_through_account_response(self):
+        self.history_path.parent.mkdir()
+        self.history_path.write_text("invalid-sqlite-private-value", encoding="utf-8")
+        result = self.service.snapshot("paper")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["summary"]["total_value"], "697000")
+        self.assertIsNotNone(result["history"]["error"])
+        self.assertNotIn("invalid-sqlite", json.dumps(result))
+
+    def test_config_change_during_query_cannot_return_previous_series(self):
+        started, release = threading.Event(), threading.Event()
+        original = load_profiles(self.path).select("paper")
+        old_series = series_for_profile(original)
+        new_client = Mock()
+        new_balance = sample_balance()
+        new_balance["summary"]["tot_evlu_amt"] = "900000"
+        new_client.balance.return_value = new_balance
+        def old_balance():
+            started.set()
+            if not release.wait(3):
+                raise RuntimeError("test query timeout")
+            return sample_balance()
+        self.clients["paper"].balance.side_effect = old_balance
+        self.factory.side_effect = lambda profile: (new_client if profile.settings.app_key == "new-key"
+                                                   else self.clients[profile.id])
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(self.service.snapshot, "paper")
+            try:
+                self.assertTrue(started.wait(3))
+                self.path.write_text(self.legacy.replace("paper-key", "new-key") + self.competition,
+                                     encoding="utf-8")
+            finally:
+                release.set()
+            result = pending.result(timeout=5)
+        self.assertEqual(result["summary"]["total_value"], "900000")
+        self.assertEqual(result["history"]["total_count"], 1)
+        self.assertEqual(result["history"]["points"][0]["total_value"], "900000")
+        self.assertEqual(AccountHistory(self.history_path).read(old_series)["points"][0]["total_value"],
+                         "697000")
+
+    def test_default_account_change_during_query_returns_new_default_series(self):
+        def change_default():
+            self.path.write_text("default_account = 'competition'\n" + self.legacy + self.competition,
+                                 encoding="utf-8")
+            return sample_balance()
+        self.clients["paper"].balance.side_effect = change_default
+        result = self.service.snapshot()
+        self.assertEqual(result["account"]["id"], "competition")
+        self.assertEqual(result["summary"]["total_value"], "100000000")
+        self.assertEqual(result["history"]["total_count"], 1)
+
+    def test_profile_becoming_incomplete_during_query_returns_empty_history(self):
+        def incomplete():
+            self.path.write_text(self.legacy.replace("paper-secret", "") + self.competition,
+                                 encoding="utf-8")
+            return sample_balance()
+        self.clients["paper"].balance.side_effect = incomplete
+        result = self.service.snapshot("paper")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["summary"], {})
+        self.assertEqual(result["history"], {"points": [], "total_count": 0, "error": None})
 
     def test_http_errors_do_not_fall_back_to_another_account(self):
         server = DashboardServer(0, self.service)
