@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react';
 import { number, quantity, timestamp } from '../format';
 import { todayInSeoul, tradeRangeError } from '../useTradeHistory';
 import type { TradeHistory as TradeData, TradeRange } from '../types';
+import DatePicker from './DatePicker';
 
 interface Props {
   data: TradeData | null;
@@ -15,6 +16,8 @@ interface Props {
 export default function TradeHistory({ data, range, accountId, loading, error, onQuery }: Props) {
   const [draft, setDraft] = useState(range);
   const [validation, setValidation] = useState<string | null>(null);
+  const today = todayInSeoul();
+  const recentRange = (days: number): TradeRange => ({ start: new Date(Date.parse(today) - (days - 1) * 86_400_000).toISOString().slice(0, 10), end: today });
   const updated = timestamp(data?.updated_at ?? null);
   const hasTrades = Boolean(data?.trades.length);
   const hasResult = data?.status === 'ok' || Boolean(data?.updated_at) || hasTrades;
@@ -28,14 +31,19 @@ export default function TradeHistory({ data, range, accountId, loading, error, o
   return <section id="trade-history" className="trades-panel" aria-labelledby="trades-title" aria-busy={loading}
     data-account-id={accountId ?? ''} data-start-date={range.start} data-end-date={range.end} data-row-count={data?.trades.length ?? 0}>
     <div className="panel-heading">
-      <div className="panel-title"><h2 id="trades-title">거래 내역</h2><span id="trades-count" className="holdings-count">{hasResult ? data?.total_count : '—'}</span></div>
+      <div className="panel-title"><h2 id="trades-title">체결 내역</h2><span id="trades-count" className="holdings-count">{hasResult ? data?.total_count : '—'}</span></div>
       <span className="table-unit">주문별 체결 · 원</span>
     </div>
-    <form className="trade-filters" onSubmit={submit}>
-      <label htmlFor="trade-start">시작일<input id="trade-start" type="date" required value={draft.start} max={todayInSeoul()}
-        onChange={event => { setDraft(previous => ({ ...previous, start: event.target.value })); setValidation(null); }}/></label>
-      <label htmlFor="trade-end">종료일<input id="trade-end" type="date" required value={draft.end} max={todayInSeoul()}
-        onChange={event => { setDraft(previous => ({ ...previous, end: event.target.value })); setValidation(null); }}/></label>
+    <form className="trade-filters trade-date-filters" onSubmit={submit} noValidate>
+      <DatePicker id="trade-start" label="시작일" value={draft.start} max={today} invalid={Boolean(validation)} describedBy={validation ? 'trades-error' : undefined}
+        onChange={start => { setDraft(previous => ({ ...previous, start })); setValidation(null); }}/>
+      <DatePicker id="trade-end" label="종료일" value={draft.end} max={today} invalid={Boolean(validation)} describedBy={validation ? 'trades-error' : undefined}
+        onChange={end => { setDraft(previous => ({ ...previous, end })); setValidation(null); }}/>
+      <div className="trade-range-presets" role="group" aria-label="조회 기간 빠른 선택">{[7, 30, 90].map(days => {
+        const recent = recentRange(days);
+        return <button type="button" key={days} aria-pressed={draft.start === recent.start && draft.end === recent.end}
+          onClick={() => { setDraft(recent); setValidation(null); }}>최근 {days}일</button>;
+      })}</div>
       <button className="refresh-button trade-query-button" type="submit" disabled={!accountId}>조회</button>
     </form>
     <div className="trade-status" role="status" aria-live="polite">

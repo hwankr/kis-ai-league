@@ -24,8 +24,8 @@ MAX_MINUTE_PAGES = 16
 
 
 def validate_chart_request(symbol, interval):
-    if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
-        raise KisError("종목코드는 숫자 6자리로 입력하세요.")
+    if not isinstance(symbol, str) or not re.fullmatch(r"[0-9A-Z]{6}", symbol):
+        raise KisError("종목코드는 영문 대문자·숫자 6자리로 입력하세요.")
     if not isinstance(interval, str) or interval not in INTERVALS:
         raise KisError("차트 주기는 day·5m·15m 중에서 선택하세요.")
 

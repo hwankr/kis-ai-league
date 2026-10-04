@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "variant": "liquid_top20",
+  "maximum_shortlist": 20,
+  "average_turnover_20d_krw": 10000000000,
+  "minimum_raw_price_krw": 1000,
+  "decision": "최종기간 추세 조건 미통과. 거래 상태·자료·유동성을 확인한 거래대금 상위 20종목을 운영 기본 관찰 목록으로 사용하며, 수익 개선이 입증된 목록을 뜻하지 않는다.",
+  "evidence_path": "docs/candidate-selection.md"
+}

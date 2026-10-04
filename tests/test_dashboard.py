@@ -130,7 +130,7 @@ class ServerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path)[0], 404)
         self.assertEqual(self.request("/", {"Host": "other.invalid"})[0], 403)
-        self.assertEqual(self.request("/api/account", method="POST")[0], 501)
+        self.assertEqual(self.request("/api/account", method="POST")[0], 403)
 
     def test_account_list_and_selection_require_same_origin_and_keep_requested_id(self):
         headers = {"X-KIS-Dashboard": "1"}

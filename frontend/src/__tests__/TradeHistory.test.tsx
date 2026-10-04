@@ -1,9 +1,9 @@
 import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../App';
-import { defaultTradeRange, tradeRangeError } from '../useTradeHistory';
+import { defaultTradeRange, todayInSeoul, tradeRangeError } from '../useTradeHistory';
 import { catalog, deferred, element, marketData, response, snapshot, trade, tradeHistory } from './fixtures';
 
 function mockApi(trades: (url: string) => Response | Promise<Response>, accounts = () => response(catalog),
@@ -35,6 +35,7 @@ function queryRange(start: string, end: string) {
 }
 
 describe('trade history', () => {
+  beforeEach(() => { window.history.replaceState(null, '', '/#/trades'); });
   it('uses 30 inclusive Seoul dates and validates 90 days and real dates', () => {
     expect(defaultTradeRange(new Date('2026-10-02T15:00:00Z'))).toEqual({ start: '2026-09-04', end: '2026-10-03' });
     expect(tradeRangeError({ start: '2026-02-30', end: '2026-03-01' })).toContain('날짜');
@@ -209,6 +210,40 @@ describe('trade history', () => {
     const count = fetchMock.mock.calls.length;
     queryRange('2025-01-01', '2025-04-01');
     expect(screen.getByText('조회 기간은 최대 90일입니다.')).toBeTruthy();
+    expect(fetchMock.mock.calls.length).toBe(count);
+  });
+
+  it('sets inclusive quick ranges without querying until submitted', async () => {
+    const fetchMock = mockApi(url => response(tradeHistory(url)));
+    render(<App />);
+    await ready();
+    const count = fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/trades?')).length;
+    const today = todayInSeoul();
+    for (const days of [7, 30, 90]) {
+      const button = screen.getByRole('button', { name: `최근 ${days}일` });
+      await userEvent.click(button);
+      expect((screen.getByLabelText('시작일') as HTMLInputElement).value)
+        .toBe(new Date(Date.parse(today) - (days - 1) * 86_400_000).toISOString().slice(0, 10));
+      expect((screen.getByLabelText('종료일') as HTMLInputElement).value).toBe(today);
+      expect(button.getAttribute('aria-pressed')).toBe('true');
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/trades?'))).toHaveLength(count);
+    }
+    await userEvent.click(screen.getByRole('button', { name: '조회' }));
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/trades?'))).toHaveLength(count + 1));
+    expect(screen.queryByText('조회 기간은 최대 90일입니다.')).toBeNull();
+  });
+
+  it('keeps direct-entry date errors local for invalid, reversed and future dates', async () => {
+    const fetchMock = mockApi(url => response(tradeHistory(url)));
+    render(<App />);
+    await ready();
+    const count = fetchMock.mock.calls.length;
+    queryRange('2026-02-30', '2026-03-01');
+    expect(screen.getByText('조회할 날짜를 입력해 주세요.')).toBeTruthy();
+    queryRange('2025-01-02', '2025-01-01');
+    expect(screen.getByText('시작일은 종료일 이전이어야 합니다.')).toBeTruthy();
+    queryRange(todayInSeoul(), new Date(Date.parse(todayInSeoul()) + 86_400_000).toISOString().slice(0, 10));
+    expect(screen.getByText('오늘까지 조회할 수 있습니다.')).toBeTruthy();
     expect(fetchMock.mock.calls.length).toBe(count);
   });
 

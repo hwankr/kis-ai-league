@@ -8,6 +8,9 @@ import { catalog, deferred, element, history, marketData, response, snapshot, tr
 function mockFetch(account: (url: string) => Response | Promise<Response>, accounts = () => response(catalog)) {
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
     const url = String(input);
+    if (url === '/api/candidates') return Promise.resolve(response({ status: 'idle', error: null, updated_at: null,
+      as_of: null, stale: false, progress: { completed: 0, total: 0 }, rows: [],
+      universe: { status: 'unverified', as_of: null, checked_at: null, source_url: null, count: 0, error: null } }));
     return Promise.resolve(url === '/api/market' ? response(marketData()) : url === '/api/accounts' ? accounts() : url.startsWith('/api/trades?') ? response(tradeHistory(url)) : account(url));
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -95,7 +98,7 @@ describe('account dashboard', () => {
     const fetchMock = mockFetch(() => response(snapshot()));
     render(<App />);
     await waitFor(() => expect(element('error-notice').textContent).toContain(message));
-    expect(fetchMock.mock.calls.map(([url]) => url).filter(url => url !== '/api/market')).toEqual(['/api/accounts']);
+    expect(fetchMock.mock.calls.map(([url]) => url).filter(url => url !== '/api/market' && url !== '/api/candidates')).toEqual(['/api/accounts']);
     expect(element('total-value').textContent).toBe('—');
     expect(element('asset-history').dataset.pointCount).toBe('0');
   });
@@ -109,7 +112,7 @@ describe('account dashboard', () => {
     await waitFor(() => expect(element('refresh-button').getAttribute('aria-busy')).toBe('false'));
     expect(element('account-select-value').textContent).toBe(label);
     expect((element('account-select') as HTMLButtonElement).disabled).toBe(true);
-    expect(fetchMock.mock.calls.map(([url]) => url).filter(url => url !== '/api/market')).toEqual(['/api/accounts']);
+    expect(fetchMock.mock.calls.map(([url]) => url).filter(url => url !== '/api/market' && url !== '/api/candidates')).toEqual(['/api/accounts']);
     expect(element('total-value').textContent).toBe('—');
     expect(element('asset-history').dataset.pointCount).toBe('0');
   });

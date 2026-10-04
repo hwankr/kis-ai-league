@@ -3,6 +3,8 @@ import { afterEach, beforeEach, vi } from 'vitest';
 
 beforeEach(() => {
   localStorage.clear();
+  window.history.replaceState(null, '', '/');
+  vi.spyOn(window, 'scrollTo').mockImplementation(() => {});
   Object.defineProperty(document, 'hidden', { configurable: true, value: false });
   Object.defineProperty(Element.prototype, 'scrollIntoView', {
     configurable: true, value: vi.fn(),

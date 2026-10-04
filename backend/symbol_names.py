@@ -53,7 +53,7 @@ def _parse_master(payload, board, row_size):
             raise ValueError("종목 마스터 형식 변경")
         symbol = row[:9].decode("ascii").strip()
         name = row[21:61].decode("cp949").strip()
-        if re.fullmatch(r"[0-9]{6}", symbol):
+        if re.fullmatch(r"[0-9A-Z]{6}", symbol):
             if not _valid_name(name) or symbol in names:
                 raise ValueError("종목 마스터 이름 오류")
             names[symbol] = name
@@ -82,7 +82,7 @@ class SymbolNames:
             cached = json.loads(raw)
             names, updated = cached["names"], cached["updated_at"]
             if (not isinstance(names, dict) or not names
-                    or any(not re.fullmatch(r"[0-9]{6}", code) or not _valid_name(name)
+                    or any(not re.fullmatch(r"[0-9A-Z]{6}", code) or not _valid_name(name)
                            for code, name in names.items())
                     or type(updated) not in (int, float) or not math.isfinite(updated)):
                 return

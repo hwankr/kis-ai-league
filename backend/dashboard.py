@@ -17,6 +17,7 @@ from backend.kis import (KisError, PaperClient, ROOT, Settings, client_for_profi
 from backend.trades import ExecutionConflict, ExecutionHistory
 from backend.market import MarketService
 from backend.chart import ChartService
+from backend.candidates import CandidateService
 
 FRONTEND = ROOT / "frontend" / "dist"
 REFRESH_SECONDS = 30
@@ -311,10 +312,11 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, port=8765, service=None, frontend_path=FRONTEND, market_service=None,
-                 chart_service=None):
+                 chart_service=None, candidate_service=None):
         self.service = service if service is not None else AccountDirectory()
         self.market_service = market_service if market_service is not None else MarketService()
         self.chart_service = chart_service if chart_service is not None else ChartService()
+        self.candidate_service = candidate_service if candidate_service is not None else CandidateService()
         self.frontend_path = frontend_path.resolve()
         super().__init__(("127.0.0.1", port), DashboardHandler)
         self.hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
@@ -355,7 +357,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         path = url.path
-        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart"):
+        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates"):
             origin = self.headers.get("Origin")
             if (self.headers.get("X-KIS-Dashboard") != "1"
                     or (origin is not None and origin not in self.server.origins)
@@ -363,10 +365,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "대시보드에서 계좌를 조회하세요."})
                 return
             params = parse_qs(url.query, keep_blank_values=True)
+            if path == "/api/candidates":
+                if params:
+                    self.json_response(400, {"error": "후보 비교 상태 조회에는 추가 조건을 지정할 수 없습니다."})
+                    return
+                try:
+                    self.json_response(200, self.server.candidate_service.snapshot())
+                except Exception:
+                    self.json_response(503, {"error": "후보 비교 상태를 읽지 못했습니다."})
+                return
             if path == "/api/chart":
                 if (set(params) - {"symbol", "interval", "refresh"}
                         or len(params.get("symbol", [])) != 1
-                        or not re.fullmatch(r"[0-9]{6}", params["symbol"][0])
+                        or not re.fullmatch(r"[0-9A-Z]{6}", params["symbol"][0])
                         or len(params.get("interval", ["day"])) != 1
                         or params.get("interval", ["day"])[0] not in {"day", "5m", "15m"}
                         or ("refresh" in params and params["refresh"] != ["1"])):
@@ -462,6 +473,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.json_response(503, {"error": "대시보드 화면 파일을 읽을 수 없습니다."})
             return
         self.send_content(200, body, content_type)
+
+    def do_POST(self):
+        if (self.headers.get("Host") not in self.server.hosts
+                or self.headers.get("X-KIS-Dashboard") != "1"
+                or self.headers.get("Sec-Fetch-Site") == "cross-site"
+                or self.headers.get("Origin") is not None and self.headers.get("Origin") not in self.server.origins):
+            self.json_response(403, {"error": "대시보드에서 조회를 실행하세요."})
+            return
+        if self.path != "/api/candidates":
+            self.json_response(404, {"error": "페이지를 찾을 수 없습니다."})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if (not 1 <= length <= 64 or self.headers.get("Transfer-Encoding")
+                    or self.headers.get_content_type() != "application/json"):
+                raise ValueError
+            self.connection.settimeout(5)
+            if json.loads(self.rfile.read(length)) != {}:
+                raise ValueError
+        except (ValueError, OSError):
+            self.json_response(400, {"error": "후보 비교 요청이 올바르지 않습니다."})
+            return
+        try:
+            payload = self.server.candidate_service.start()
+            self.json_response(202 if payload["status"] == "running" else 200, payload)
+        except Exception:
+            self.json_response(503, {"error": "후보 비교를 시작하지 못했습니다."})
 
 
 def main(argv=None):

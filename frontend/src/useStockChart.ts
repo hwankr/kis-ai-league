@@ -58,8 +58,9 @@ export default function useStockChart() {
 
   const query = useCallback(async (symbol: string, requestedInterval: ChartInterval, options: { refresh?: boolean } = {}) => {
     const current = session.current;
-    if (!current.mounted || !/^\d{6}$/.test(symbol)) return;
-    const next = { symbol, interval: requestedInterval };
+    const normalizedSymbol = symbol.trim().toUpperCase();
+    if (!current.mounted || !/^[0-9A-Z]{6}$/.test(normalizedSymbol)) return;
+    const next = { symbol: normalizedSymbol, interval: requestedInterval };
     const generation = ++current.generation;
     current.controller?.abort();
     window.clearTimeout(current.timeout);

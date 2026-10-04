@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "locked_before_outcome_analysis": true,
+  "created_at": "2026-10-04",
+  "question": "추세 관찰 후보를 좁히는 조건이 동일 유동성 종목군보다 이후 1·5·20거래일 성과를 개선하는가",
+  "scope": "종목 선별 진단. 주문·포지션·장중 진입·계좌 수익률 검증은 포함하지 않는다.",
+  "universe": "2026-09-21 KRX 고정 351종목. 과거 당시 구성종목·소속시장·거래제한을 복원하지 못하므로 과거 선택·생존편향이 있다. 현재 소속시장을 과거에도 적용하여 이전상장 종목은 당시 비교지수가 다를 수 있다.",
+  "history": {
+    "start": "2024-01-01",
+    "end": "2026-10-02",
+    "source": "KIS paper KRX adjusted daily OHLCV and original turnover"
+  },
+  "periods": {
+    "development": [
+      "2025-02-03",
+      "2025-12-31"
+    ],
+    "validation": [
+      "2026-01-01",
+      "2026-06-30"
+    ],
+    "holdout": [
+      "2026-07-01",
+      "2026-10-02"
+    ]
+  },
+  "timing": "D 종가까지로 선별, D+1 시가 진입, D+h 종가 청산(h=1,5,20). 청산이 다음 기간에 걸치는 신호는 해당 기간 평가에서 제거한다.",
+  "costs": {
+    "buy_fee_rate": 0.000140527,
+    "sell_fee_rate": 0.000140527,
+    "sell_tax_rate": 0.002,
+    "slippage_each_side": [
+      0.0,
+      0.001,
+      0.002
+    ],
+    "primary_slippage_each_side": 0.001,
+    "note": "대회 비용과 가정한 가격 불리함을 전 기간에 적용한 시나리오이며 역사적 실제 체결비용이 아니다. 배당·기업행사 현금흐름은 포함하지 않는다."
+  },
+  "base": {
+    "average_turnover_20d_krw": 10000000000,
+    "minimum_history_sessions": 61,
+    "recent_zero_volume_sessions": 0,
+    "note": "100억원은 1억원 계좌 전액도 일평균 거래대금의 1% 이하가 되도록 정한 운영 기준. 체결 가능성 보장은 아니며 수익률 최적화로 선정하지 않는다. 가격 1000원·상태 제한은 현재 원주가/상태로만 적용하고 과거 수정주가에 소급하지 않는다.",
+    "recent_volume_window_sessions": 20
+  },
+  "maximum_shortlist": 20,
+  "definitions": {
+    "relative_return": "동일 거래일 종목 가격수익률 - 소속시장 KOSPI/KOSDAQ 가격수익률(%p)",
+    "trend": "D 종가 > SMA20(D) > SMA60(D), SMA20(D) > SMA20(D-5)",
+    "volume_ratio": "D 거래대금 / D 제외 직전20거래일 평균 거래대금",
+    "extension_atr": "(D 종가 - SMA20(D)) / D 포함 최근14거래일 TrueRange 단순평균. TR=max(H-L,abs(H-prevC),abs(L-prevC))",
+    "risk_adjusted_rs60": "60일 지수대비 수익률 / (종목 일별수익률60개 표준편차 * sqrt(60)); 표준편차 ddof=1, 0·결측 분모는 순위 미확정",
+    "tie_break": "종목코드 오름차순",
+    "predicate_order": "모든 조건을 먼저 적용한 뒤 순위를 계산하고 최대20개를 남긴다. 먼저20개를 고른 뒤 추가 조건으로 줄이지 않는다.",
+    "minimum_history": "지수 거래일 달력상 연속 유효 OHLC. 기본61일, 장기RS는 각148·253일",
+    "market_evaluation": "전시장 선별 결과의 해당시장 부분집합과 같은시장의 기본군을 비교. 시장별로 다시20개를 고르지 않음"
+  },
+  "variants": [
+    {
+      "id": "liquid_all",
+      "role": "baseline",
+      "rule": "유동성 기본 종목군 전체 동일비중",
+      "additional_filter_count": 0
+    },
+    {
+      "id": "liquid_top20",
+      "rule": "20일 평균거래대금 상위20개",
+      "additional_filter_count": 0
+    },
+    {
+      "id": "rs20_top20",
+      "rule": "20일 지수대비수익률 양수, 해당값 상위20개",
+      "additional_filter_count": 1
+    },
+    {
+      "id": "rs60_top20",
+      "rule": "60일 지수대비수익률 양수, 해당값 상위20개",
+      "additional_filter_count": 1
+    },
+    {
+      "id": "rs6m_skip1m_top20",
+      "rule": "D-21 / D-147 6개월 가격수익률 지수대비 양수, 해당값 상위20개",
+      "minimum_history_sessions": 148,
+      "additional_filter_count": 1
+    },
+    {
+      "id": "rs12to7m_top20",
+      "rule": "D-126 / D-252 과거6개월 가격수익률 지수대비 양수, 해당값 상위20개",
+      "minimum_history_sessions": 253,
+      "additional_filter_count": 1
+    },
+    {
+      "id": "trend_rs60",
+      "rule": "trend + 60일 지수대비수익률 양수, 해당값 상위20개",
+      "additional_filter_count": 4
+    },
+    {
+      "id": "trend_rs20_60",
+      "rule": "trend_rs60 + 20일 지수대비수익률 양수",
+      "additional_filter_count": 5
+    },
+    {
+      "id": "trend_volume",
+      "rule": "trend_rs60 + volume_ratio >= 1.5",
+      "additional_filter_count": 5
+    },
+    {
+      "id": "trend_extension",
+      "rule": "trend_rs60 + extension_atr <= 2",
+      "additional_filter_count": 5
+    },
+    {
+      "id": "trend_market",
+      "rule": "trend_rs60 + 소속지수 종가 > 소속지수SMA60",
+      "additional_filter_count": 5
+    },
+    {
+      "id": "trend_risk_adjusted",
+      "rule": "trend + 60일 지수대비수익률 양수, risk_adjusted_rs60 상위20개",
+      "additional_filter_count": 4
+    }
+  ],
+  "evaluation": {
+    "primary_horizon_sessions": 5,
+    "secondary_horizon_sessions": [
+      1,
+      20
+    ],
+    "unit": "신호일별 동일비중 후보 코호트. 겹치는 보유기간을 독립 거래나 누적 계좌수익으로 합산하지 않는다.",
+    "paired_baseline": "각 변형의 필요한 과거길이를 만족하는 동일 날짜·같은 유동성 기본종목군. 시장별 결과도 별도로 표시.",
+    "missing_outcomes": "상장전/결측/거래0으로 진입·청산 불명인 신호를 0수익으로 채우지 않는다. 별도 미확정 건수와 비율을 보존하며 비교 기준도 같은 관측가능 종목으로 맞춘다.",
+    "metrics": [
+      "신호일수",
+      "후보수",
+      "빈후보일비율",
+      "결과누락률",
+      "비용후평균·중앙값",
+      "기준군대비일별차이",
+      "양수비율",
+      "하위5%",
+      "시장별·분기별차이"
+    ],
+    "uncertainty": {
+      "method": "paired moving-block bootstrap of signal-day cohort differences",
+      "block_sessions": 20,
+      "replicates": 2000,
+      "seed": 20261004,
+      "confidence": 0.95,
+      "insufficient_sample": "달력상 신호일수 또는 유효 짝비교 관측수가 블록 길이 이하이면 CI를 제공하지 않는다."
+    },
+    "sensitivity": {
+      "liquidity_krw": [
+        5000000000,
+        10000000000,
+        20000000000
+      ],
+      "shortlist": [
+        10,
+        20,
+        30
+      ],
+      "purpose": "채택 후보의 개발/검증기간 안정성만 점검. 최종기간에서 재선택하지 않음."
+    },
+    "selection": "개발·검증기간 모두 5일 평균차이 양수인 변형 중 검증기간 차이가 큰 하나를 고정. 동률0.05%p이내는 조건수가 적은 것 우선. 최종기간은 고정 선택을 한 번 확인하고 변경하지 않는다. 모든 변형 수와 결과를 공개한다. 기본군 liquid_all은 선택에서 제외. 동률 범위는 최고 검증차이에서0.05%p 이내이며 추가필터수가 같으면 plan의 변형 순서를 따른다.",
+    "adoption_gate": {
+      "fixed_at_utc": "2026-10-04T12:43:31Z",
+      "scope": "성과 계산 전에 확정한 채택 문턱. 봉인한 한 변형만 평가하며 최종기간에서 재선택하지 않는다.",
+      "period": "holdout",
+      "horizon_sessions": 5,
+      "slippage_each_side": {"primary": 0.001, "high": 0.002},
+      "minimum_exclusive": 0,
+      "checks": [
+        {"id": "all_primary_difference", "market": "ALL", "slippage": "primary", "metric": "mean_paired_difference"},
+        {"id": "all_primary_ci_lower", "market": "ALL", "slippage": "primary", "metric": "paired_difference_ci95", "component": "lower"},
+        {"id": "kospi_primary_difference", "market": "KOSPI", "slippage": "primary", "metric": "mean_paired_difference"},
+        {"id": "kosdaq_primary_difference", "market": "KOSDAQ", "slippage": "primary", "metric": "mean_paired_difference"},
+        {"id": "all_primary_net_return", "market": "ALL", "slippage": "primary", "metric": "mean_net_return"},
+        {"id": "all_high_net_return", "market": "ALL", "slippage": "high", "metric": "mean_net_return"}
+      ],
+      "missing_values": "필요한 값·CI가 없거나 유효하지 않으면 미통과. 모든 검사값이 0을 엄격히 초과해야 채택한다.",
+      "pass_label": "고정 종목군 진단 통과",
+      "fallback_variant": "liquid_top20",
+      "fallback_note": "미통과·선택 없음이면 유동성·거래상태·자료 완결성 운영 필터와 거래대금 상위20개를 기본 관찰 목록으로 사용한다. 기본 목록의 수익 개선이 검증됐다는 뜻은 아니다.",
+      "claim_limit": "통과해도 고정 종목군의 선택·생존편향이 남으며 전체시장 또는 실전 수익 입증으로 확대하지 않는다."
+    },
+    "claim_gate": "최종기간과 양시장 방향·불확실성·비용 민감도가 일관되지 않으면 수익 개선을 입증했다고 쓰지 않는다. 고정 종목군 편향 때문에 어떠한 결과도 당시 전체시장 백테스트 또는 실전 수익 보장으로 부르지 않는다. 미입증 추가 조건은 필수 선별 기준으로 승격하지 않는다."
+  }
+}

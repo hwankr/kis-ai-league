@@ -26,6 +26,29 @@ async function query() {
 }
 
 describe('stock chart', () => {
+  it('accepts a lowercase alphanumeric stock code and queries its uppercase identity', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(chartData({ symbol: '0126Z0', name: '삼성에피스홀딩스' })));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<View/>);
+    const input = screen.getByLabelText('차트 종목코드');
+    expect(input.getAttribute('inputmode')).toBe('text');
+    fireEvent.change(input, { target: { value: '0126z0' } });
+    await query();
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/chart?symbol=0126Z0&interval=day');
+    expect((input as HTMLInputElement).value).toBe('0126Z0');
+    expect(screen.getByRole('slider', { name: '삼성에피스홀딩스 일봉 차트' })).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('normalizes symbols passed directly to the chart hook', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(chartData({ symbol: '0126Z0' })));
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() => useStockChart());
+    await act(async () => { await result.current.query(' 0126z0 ', 'day'); });
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/chart?symbol=0126Z0&interval=day');
+    expect(result.current.data?.symbol).toBe('0126Z0');
+  });
+
   it('does not request or poll until explicitly queried, including when interval changes', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn();
@@ -256,12 +279,12 @@ describe('stock chart', () => {
     expect(screen.getByRole('alert')).toBeTruthy();
   });
 
-  it('validates the code locally and aborts outstanding work on unmount', async () => {
+  it.each(['123', '012_Z0', '0126가0'])('validates invalid code %s locally and aborts outstanding work on unmount', async symbol => {
     const pending = deferred<Response>();
     const fetchMock = vi.fn().mockReturnValue(pending.promise);
     vi.stubGlobal('fetch', fetchMock);
     const view = render(<View/>);
-    fireEvent.change(screen.getByLabelText('차트 종목코드'), { target: { value: '123' } });
+    fireEvent.change(screen.getByLabelText('차트 종목코드'), { target: { value: symbol } });
     await query();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(screen.getByLabelText('차트 종목코드').getAttribute('aria-invalid')).toBe('true');
@@ -272,7 +295,8 @@ describe('stock chart', () => {
     await act(async () => pending.resolve(response(chartData())));
   });
 
-  it('queries and focuses a quote selection independently of account and market refresh', async () => {
+  it('routes a quote selection to the chart and focuses the page with one chart request', async () => {
+    window.history.replaceState(null, '', '/#/chart');
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
       return Promise.resolve(response(url.startsWith('/api/chart?') ? chartData()
@@ -283,11 +307,11 @@ describe('stock chart', () => {
     render(<App/>);
     const quoteButton = await screen.findByRole('button', { name: '삼성전자 차트 보기' });
     expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith('/api/chart'))).toBe(false);
-    const count = fetchMock.mock.calls.length;
     await userEvent.click(quoteButton);
     await waitFor(() => expect(within(element('stock-chart')).getByRole('slider')).toBeTruthy());
-    expect(fetchMock.mock.calls.slice(count).map(([url]) => url)).toEqual(['/api/chart?symbol=005930&interval=day']);
-    expect(document.activeElement).toBe(element('stock-chart-title'));
-    expect(element('stock-chart').scrollIntoView).toHaveBeenCalled();
+    expect(window.location.hash).toBe('#/chart?symbol=005930&interval=day');
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/chart?')).map(([url]) => url))
+      .toEqual(['/api/chart?symbol=005930&interval=day']);
+    await waitFor(() => expect(document.activeElement).toBe(element('page-title')));
   });
 });

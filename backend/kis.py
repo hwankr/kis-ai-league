@@ -352,8 +352,8 @@ class PaperClient:
         return data, headers
 
     def quote(self, symbol):
-        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
-            raise KisError("종목코드는 숫자 6자리로 입력하세요.")
+        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9A-Z]{6}", symbol):
+            raise KisError("종목코드는 영문 대문자·숫자 6자리로 입력하세요.")
         data, _ = self._get("/uapi/domestic-stock/v1/quotations/inquire-price",
                             "FHKST01010100", {
                                 "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol,
@@ -373,8 +373,8 @@ class PaperClient:
 
     def chart_daily(self, symbol, start_date, end_date):
         """최대 100개의 수정 일봉 원본. 날짜·가격 검증은 차트 서비스가 담당한다."""
-        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
-            raise KisError("종목코드는 숫자 6자리로 입력하세요.")
+        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9A-Z]{6}", symbol):
+            raise KisError("종목코드는 영문 대문자·숫자 6자리로 입력하세요.")
         data, _ = self._get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
                             "FHKST03010100", {
                                 "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol,
@@ -384,10 +384,73 @@ class PaperClient:
                             })
         return data
 
+    def stock_status(self, symbol):
+        """모의 현재가·제한 상태. 미반환/미정의는 unknown이며 상태 종합코드는 추정하지 않는다.
+
+        공식 필드: examples_llm/domestic_stock/inquire_price/chk_inquire_price.py
+        (https://github.com/koreainvestment/open-trading-api).
+        """
+        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9A-Z]{6}", symbol):
+            raise KisError("종목코드는 영문 대문자·숫자 6자리로 입력하세요.")
+        data, _ = self._get("/uapi/domestic-stock/v1/quotations/inquire-price",
+                            "FHKST01010100", {
+                                "FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol,
+                            })
+        output = data.get("output")
+        if not isinstance(output, dict) or not output:
+            raise KisError("현재가 상태 응답이 없습니다.")
+        if "stck_shrn_iscd" in output and output["stck_shrn_iscd"] != symbol:
+            raise KisError("시세 응답의 종목코드가 요청과 다릅니다.")
+        result = {"symbol": symbol, "current_price": None, "unknown_fields": []}
+        if "stck_shrn_iscd" not in output:
+            result["unknown_fields"].append("symbol")
+        try:
+            result["current_price"] = _quote_number(output.get("stck_prpr"), integer=True, positive=True)
+        except KisError:
+            result["unknown_fields"].append("current_price")
+        for field, original in (("temp_halted", "temp_stop_yn"), ("managed", "mang_issu_cls_code"),
+                                ("liquidation", "sltr_yn"), ("investment_caution", "invt_caful_yn"),
+                                ("short_overheated", "short_over_yn")):
+            value = output.get(original)
+            result[field] = True if value == "Y" else False if value == "N" else None
+            if result[field] is None:
+                result["unknown_fields"].append(field)
+        warning = output.get("mrkt_warn_cls_code")
+        result["warning_code"] = warning if warning in ("00", "01", "02", "03") else None
+        if result["warning_code"] is None:
+            result["unknown_fields"].append("warning_code")
+        result["status"] = "unknown" if result["unknown_fields"] else "ok"
+        return result
+
+    def index_daily(self, start: str, end: str, symbol: str = "0001") -> list[dict]:
+        """KOSPI·KOSDAQ 일별 지수 원본. 가격·거래일 정합성은 비교 서비스가 검증한다."""
+        if symbol not in ("0001", "1001"):
+            raise KisError("비교 지수는 코스피(0001) 또는 코스닥(1001)만 지원합니다.")
+        try:
+            if not all(isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value)
+                       for value in (start, end)):
+                raise ValueError
+            start_date, end_date = date.fromisoformat(start), date.fromisoformat(end)
+        except ValueError:
+            raise KisError("지수 조회 날짜는 YYYY-MM-DD 형식으로 입력하세요.") from None
+        if start_date > end_date:
+            raise KisError("지수 조회 시작일은 종료일보다 늦을 수 없습니다.")
+        data, _ = self._get("/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice",
+                            "FHKUP03500100", {
+                                "FID_COND_MRKT_DIV_CODE": "U", "FID_INPUT_ISCD": symbol,
+                                "FID_INPUT_DATE_1": start_date.strftime("%Y%m%d"),
+                                "FID_INPUT_DATE_2": end_date.strftime("%Y%m%d"),
+                                "FID_PERIOD_DIV_CODE": "D",
+                            })
+        rows = data.get("output2")
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise KisError("지수 일봉 응답 형식이 예상과 다릅니다.")
+        return rows
+
     def chart_minutes(self, symbol, hour):
         """당일 분봉 최대 30행. hour 이전 방향으로 차트 서비스가 페이지를 조회한다."""
-        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol):
-            raise KisError("종목코드는 숫자 6자리로 입력하세요.")
+        if not isinstance(symbol, str) or not re.fullmatch(r"[0-9A-Z]{6}", symbol):
+            raise KisError("종목코드는 영문 대문자·숫자 6자리로 입력하세요.")
         if not isinstance(hour, str) or not re.fullmatch(r"[0-9]{6}", hour):
             raise KisError("분봉 조회 시각이 올바르지 않습니다.")
         try:

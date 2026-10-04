@@ -47,13 +47,21 @@ class ChartHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.charts.snapshot.assert_called_once_with("005930", "15m", force=True)
 
+    def test_alphanumeric_symbol_is_forwarded_without_modification(self):
+        self.charts.snapshot.return_value["symbol"] = "0126Z0"
+        status, _, result = self.get("/api/chart?symbol=0126Z0")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["symbol"], "0126Z0")
+        self.charts.snapshot.assert_called_once_with("0126Z0", "day")
+
     def test_invalid_parameters_never_reach_chart_service(self):
         for query in ("", "symbol=", "symbol=12345", "symbol=005930&symbol=000660",
                       "symbol=005930&interval=1m", "symbol=005930&interval=",
                       "symbol=005930&interval=day&interval=5m",
                       "symbol=005930&account=paper", "symbol=005930&date=20261002",
                       "symbol=005930&refresh=", "symbol=005930&refresh=0",
-                      "symbol=005930&refresh=true", "symbol=005930&refresh=1&refresh=1"):
+                      "symbol=005930&refresh=true", "symbol=005930&refresh=1&refresh=1",
+                      "symbol=0126z0", "symbol=0126_Z", "symbol=%200126Z0", "symbol=0126Z00"):
             with self.subTest(query=query):
                 self.assertEqual(self.get("/api/chart?" + query)[0], 400)
         self.charts.snapshot.assert_not_called()

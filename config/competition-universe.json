@@ -1,0 +1,1787 @@
+{
+  "status": "verified",
+  "as_of": "2026-09-21",
+  "checked_at": "2026-10-04T20:45:34+09:00",
+  "source_url": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC02010301",
+  "source_kind": "official_index_constituents",
+  "count": 351,
+  "rows": [
+    {
+      "symbol": "005930",
+      "name": "삼성전자",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000660",
+      "name": "SK하이닉스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "402340",
+      "name": "SK스퀘어",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "009150",
+      "name": "삼성전기",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "373220",
+      "name": "LG에너지솔루션",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "005380",
+      "name": "현대차",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "207940",
+      "name": "삼성바이오로직스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "105560",
+      "name": "KB금융",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "028260",
+      "name": "삼성물산",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "032830",
+      "name": "삼성생명",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "012450",
+      "name": "한화에어로스페이스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "034020",
+      "name": "두산에너빌리티",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "055550",
+      "name": "신한지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "329180",
+      "name": "HD현대중공업",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000270",
+      "name": "기아",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "006400",
+      "name": "삼성SDI",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "068270",
+      "name": "셀트리온",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "034730",
+      "name": "SK",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "086790",
+      "name": "하나금융지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "012330",
+      "name": "현대모비스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "066570",
+      "name": "LG전자",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "010120",
+      "name": "LS ELECTRIC",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "035420",
+      "name": "NAVER",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000810",
+      "name": "삼성화재",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "298040",
+      "name": "효성중공업",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "316140",
+      "name": "우리금융지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "267260",
+      "name": "HD현대일렉트릭",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "005490",
+      "name": "POSCO홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "042660",
+      "name": "한화오션",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "009540",
+      "name": "HD한국조선해양",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "010130",
+      "name": "고려아연",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "096770",
+      "name": "SK이노베이션",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000150",
+      "name": "두산",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "042700",
+      "name": "한미반도체",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "138040",
+      "name": "메리츠금융지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "015760",
+      "name": "한국전력",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "011200",
+      "name": "HMM",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "017670",
+      "name": "SK텔레콤",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "051910",
+      "name": "LG화학",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "033780",
+      "name": "KT&G",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "010140",
+      "name": "삼성중공업",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "006800",
+      "name": "미래에셋증권",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "018260",
+      "name": "삼성에스디에스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "010950",
+      "name": "S-Oil",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "003550",
+      "name": "LG",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "267250",
+      "name": "HD현대",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "024110",
+      "name": "기업은행",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "079550",
+      "name": "LIG디펜스앤에어로스페이스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "003670",
+      "name": "포스코퓨처엠",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "086280",
+      "name": "현대글로비스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "272210",
+      "name": "한화시스템",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "035720",
+      "name": "카카오",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000720",
+      "name": "현대건설",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "278470",
+      "name": "에이피알",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "030200",
+      "name": "KT",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "064350",
+      "name": "현대로템",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "047810",
+      "name": "한국항공우주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "011070",
+      "name": "LG이노텍",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "005830",
+      "name": "DB손해보험",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "003490",
+      "name": "대한항공",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "078930",
+      "name": "GS",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "047050",
+      "name": "포스코인터내셔널",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "071050",
+      "name": "한국금융지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "028050",
+      "name": "삼성E&A",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "006260",
+      "name": "LS",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "443060",
+      "name": "HD현대마린솔루션",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "307950",
+      "name": "현대오토에버",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "005940",
+      "name": "NH투자증권",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "003230",
+      "name": "삼양식품",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "323410",
+      "name": "카카오뱅크",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "259960",
+      "name": "크래프톤",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "180640",
+      "name": "한진칼",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "090430",
+      "name": "아모레퍼시픽",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "007660",
+      "name": "이수페타시스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "016360",
+      "name": "삼성증권",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "0126Z0",
+      "name": "삼성에피스홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "161390",
+      "name": "한국타이어앤테크놀로지",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "047040",
+      "name": "대우건설",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "039490",
+      "name": "키움증권",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "064400",
+      "name": "LG씨엔에스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "021240",
+      "name": "코웨이",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000880",
+      "name": "한화",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "352820",
+      "name": "하이브",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "062040",
+      "name": "산일전기",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "009830",
+      "name": "한화솔루션",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "267270",
+      "name": "HD건설기계",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "128940",
+      "name": "한미약품",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "175330",
+      "name": "JB금융지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "326030",
+      "name": "SK바이오팜",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "032640",
+      "name": "LG유플러스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "001440",
+      "name": "대한전선",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000990",
+      "name": "DB하이텍",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "241560",
+      "name": "두산밥캣",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000100",
+      "name": "유한양행",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "377300",
+      "name": "카카오페이",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "052690",
+      "name": "한전기술",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "088350",
+      "name": "한화생명",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "029780",
+      "name": "삼성카드",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "004020",
+      "name": "현대제철",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "138930",
+      "name": "BNK금융지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "036570",
+      "name": "NC",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "051900",
+      "name": "LG생활건강",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "066970",
+      "name": "엘앤에프",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "082740",
+      "name": "한화엔진",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "034220",
+      "name": "LG디스플레이",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "454910",
+      "name": "두산로보틱스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "001450",
+      "name": "현대해상",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "011790",
+      "name": "SKC",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "271560",
+      "name": "오리온",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "001040",
+      "name": "CJ",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "010060",
+      "name": "OCI홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "002380",
+      "name": "KCC",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "036460",
+      "name": "한국가스공사",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "111770",
+      "name": "영원무역",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "161890",
+      "name": "한국콜마",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "192820",
+      "name": "코스맥스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "375500",
+      "name": "DL이앤씨",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "004170",
+      "name": "신세계",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "035250",
+      "name": "강원랜드",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "011780",
+      "name": "금호석유화학",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "012750",
+      "name": "에스원",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "018880",
+      "name": "한온시스템",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "022100",
+      "name": "포스코DX",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "023530",
+      "name": "롯데쇼핑",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "028670",
+      "name": "팬오션",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "008930",
+      "name": "한미사이언스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "097950",
+      "name": "CJ제일제당",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "139130",
+      "name": "iM금융지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "251270",
+      "name": "넷마블",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "302440",
+      "name": "SK바이오사이언스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "383220",
+      "name": "F&F",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "026960",
+      "name": "동서",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "004990",
+      "name": "롯데지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "007340",
+      "name": "DN오토모티브",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "009420",
+      "name": "한올바이오파마",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "011170",
+      "name": "롯데케미칼",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "017800",
+      "name": "현대엘리베이터",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "450080",
+      "name": "에코프로머티",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000240",
+      "name": "한국앤컴퍼니",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "002790",
+      "name": "아모레퍼시픽홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "004370",
+      "name": "농심",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "005850",
+      "name": "에스엘",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "007070",
+      "name": "GS리테일",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "009970",
+      "name": "영원무역홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "014680",
+      "name": "한솔케미칼",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "030000",
+      "name": "제일기획",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "051600",
+      "name": "한전KPS",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "069960",
+      "name": "현대백화점",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "073240",
+      "name": "금호타이어",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "081660",
+      "name": "미스토홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "103140",
+      "name": "풍산",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "112610",
+      "name": "씨에스윈드",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "139480",
+      "name": "이마트",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "204320",
+      "name": "HL만도",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "282330",
+      "name": "BGF리테일",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "457190",
+      "name": "이수스페셜티케미컬",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "483650",
+      "name": "달바글로벌",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "120110",
+      "name": "코오롱인더",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "008770",
+      "name": "호텔신라",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "006280",
+      "name": "녹십자",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "006040",
+      "name": "동원산업",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "011210",
+      "name": "현대위아",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000120",
+      "name": "CJ대한통운",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "298020",
+      "name": "효성티앤씨",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "001430",
+      "name": "세아베스틸지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "093370",
+      "name": "후성",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "071970",
+      "name": "HD현대마린엔진",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "001800",
+      "name": "오리온홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "007310",
+      "name": "오뚜기",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "005300",
+      "name": "롯데칠성",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "004000",
+      "name": "롯데정밀화학",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "003240",
+      "name": "태광산업",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "003090",
+      "name": "대웅",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000670",
+      "name": "영풍",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000210",
+      "name": "DL",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "000080",
+      "name": "하이트진로",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "009240",
+      "name": "한샘",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "361610",
+      "name": "SK아이이테크놀로지",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "300720",
+      "name": "한일시멘트",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "285130",
+      "name": "SK케미칼",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "280360",
+      "name": "롯데웰푸드",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "192080",
+      "name": "더블유게임즈",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "185750",
+      "name": "종근당",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "071320",
+      "name": "지역난방공사",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "069620",
+      "name": "대웅제약",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "034230",
+      "name": "파라다이스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "017960",
+      "name": "한국카본",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "003030",
+      "name": "세아제강지주",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "002840",
+      "name": "미원상사",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "002030",
+      "name": "아세아",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "268280",
+      "name": "미원에스씨",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "298050",
+      "name": "HS효성첨단소재",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "069260",
+      "name": "TKG휴켐스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "008730",
+      "name": "율촌화학",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "0220W0",
+      "name": "한화머시너리앤서비스홀딩스",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "137310",
+      "name": "에스디바이오센서",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "014820",
+      "name": "동원시스템즈",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "005420",
+      "name": "코스모화학",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "456040",
+      "name": "OCI",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "006650",
+      "name": "대한유화",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "001680",
+      "name": "대상",
+      "board": "KOSPI"
+    },
+    {
+      "symbol": "196170",
+      "name": "알테오젠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "086520",
+      "name": "에코프로",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "247540",
+      "name": "에코프로비엠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "036930",
+      "name": "주성엔지니어링",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "277810",
+      "name": "레인보우로보틱스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "240810",
+      "name": "원익IPS",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "039030",
+      "name": "이오테크닉스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "058470",
+      "name": "리노공업",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "222800",
+      "name": "심텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "403870",
+      "name": "HPSP",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "108490",
+      "name": "로보티즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "028300",
+      "name": "HLB",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "095340",
+      "name": "ISC",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "319660",
+      "name": "피에스케이",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "000250",
+      "name": "삼천당제약",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "087010",
+      "name": "펩트론",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "031980",
+      "name": "피에스케이홀딩스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "214450",
+      "name": "파마리서치",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "084370",
+      "name": "유진테크",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "141080",
+      "name": "리가켐바이오",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "298380",
+      "name": "에이비엘바이오",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "064760",
+      "name": "티씨케이",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "067310",
+      "name": "하나마이크론",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "131290",
+      "name": "티에스이",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "095610",
+      "name": "테스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "310210",
+      "name": "보로노이",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "257720",
+      "name": "실리콘투",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "357780",
+      "name": "솔브레인",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "080220",
+      "name": "제주반도체",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "145020",
+      "name": "휴젤",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "319400",
+      "name": "현대무벡스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "226950",
+      "name": "올릭스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "032820",
+      "name": "우리기술",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "058610",
+      "name": "에스피지",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "263750",
+      "name": "펄어비스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "214370",
+      "name": "케어젠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "005290",
+      "name": "동진쎄미켐",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "178320",
+      "name": "서진시스템",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "030530",
+      "name": "원익홀딩스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "347850",
+      "name": "디앤디파마텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "043260",
+      "name": "성호전자",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "214150",
+      "name": "클래시스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "098460",
+      "name": "고영",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "083650",
+      "name": "비에이치아이",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "041510",
+      "name": "에스엠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "237690",
+      "name": "에스티팜",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "131970",
+      "name": "두산테스나",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "089030",
+      "name": "테크윙",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "068760",
+      "name": "셀트리온제약",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "437730",
+      "name": "삼현",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "140860",
+      "name": "파크시스템스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "036540",
+      "name": "SFA반도체",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "060370",
+      "name": "LS마린솔루션",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "007390",
+      "name": "네이처셀",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "183300",
+      "name": "코미코",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "218410",
+      "name": "RFHIC",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "096530",
+      "name": "씨젠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "204270",
+      "name": "제이앤티씨",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "089970",
+      "name": "브이엠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "078600",
+      "name": "대주전자재료",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "0009K0",
+      "name": "에임드바이오",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "420770",
+      "name": "기가비스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "039200",
+      "name": "오스코텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "323280",
+      "name": "태성",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "241710",
+      "name": "코스메카코리아",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "035900",
+      "name": "JYP Ent.",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "082920",
+      "name": "비츠로셀",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "290650",
+      "name": "엘앤씨바이오",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "003380",
+      "name": "하림지주",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "232140",
+      "name": "와이씨",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "166090",
+      "name": "하나머티리얼즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "195940",
+      "name": "HK이노엔",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "056190",
+      "name": "SFA",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "101490",
+      "name": "에스앤에스텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "293490",
+      "name": "카카오게임즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "417200",
+      "name": "LS머트리얼즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "100790",
+      "name": "미래에셋벤처투자",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "014620",
+      "name": "성광벤드",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "035760",
+      "name": "CJ ENM",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "445680",
+      "name": "큐리옥스바이오시스템즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "065350",
+      "name": "신성델타테크",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "032500",
+      "name": "케이엠더블유",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "036830",
+      "name": "솔브레인홀딩스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "388720",
+      "name": "유일로보틱스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "122870",
+      "name": "와이지엔터테인먼트",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "099320",
+      "name": "쎄트렉아이",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "328130",
+      "name": "루닛",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "090710",
+      "name": "휴림로봇",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "032190",
+      "name": "다우데이타",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "033100",
+      "name": "제룡전기",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "053800",
+      "name": "안랩",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "161580",
+      "name": "필옵틱스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "085660",
+      "name": "차바이오텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "090360",
+      "name": "로보스타",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "074600",
+      "name": "원익QnC",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "038500",
+      "name": "삼표시멘트",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "189300",
+      "name": "인텔리안테크",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "466100",
+      "name": "클로봇",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "251970",
+      "name": "펌텍코리아",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "295310",
+      "name": "에이치브이엠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "213420",
+      "name": "덕산네오룩스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "006730",
+      "name": "서부T&D",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "124500",
+      "name": "아이티센글로벌",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "281740",
+      "name": "레이크머티리얼즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "171090",
+      "name": "선익시스템",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "225570",
+      "name": "넥슨게임즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "137400",
+      "name": "피엔티",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "048410",
+      "name": "현대바이오",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "121600",
+      "name": "나노신소재",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "036810",
+      "name": "에프에스티",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "253450",
+      "name": "스튜디오드래곤",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "222080",
+      "name": "SFA넥셀",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "475830",
+      "name": "오름테라퓨틱",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "358570",
+      "name": "지아이이노베이션",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "253590",
+      "name": "네오셈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "050890",
+      "name": "쏠리드",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "060250",
+      "name": "NHN KCP",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "052400",
+      "name": "코나아이",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "009520",
+      "name": "포스코엠텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "025980",
+      "name": "아난티",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "399720",
+      "name": "가온칩스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "211050",
+      "name": "인카금융서비스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "112040",
+      "name": "위메이드",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "033500",
+      "name": "동성화인텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "214430",
+      "name": "아이쓰리시스템",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "082270",
+      "name": "젬백스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "056080",
+      "name": "유진로봇",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "015750",
+      "name": "성우하이텍",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "125490",
+      "name": "한라캐스트",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "041190",
+      "name": "우리기술투자",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "067160",
+      "name": "SOOP",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "348370",
+      "name": "엔켐",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "278280",
+      "name": "천보",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "101730",
+      "name": "위메이드맥스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "018290",
+      "name": "브이티",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "030520",
+      "name": "한컴",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "376300",
+      "name": "디어유",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "272290",
+      "name": "이녹스첨단소재",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "078340",
+      "name": "컴투스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "042000",
+      "name": "카페24",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "215200",
+      "name": "메가스터디교육",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "095660",
+      "name": "네오위즈",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "025320",
+      "name": "시노펙스",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "348210",
+      "name": "넥스틴",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "069080",
+      "name": "웹젠",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "025900",
+      "name": "동화기업",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "060280",
+      "name": "큐렉소",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "036620",
+      "name": "감성코퍼레이션",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "352480",
+      "name": "씨앤씨인터내셔널",
+      "board": "KOSDAQ"
+    },
+    {
+      "symbol": "194480",
+      "name": "데브시스터즈",
+      "board": "KOSDAQ"
+    }
+  ],
+  "error": null,
+  "provenance": "2026-09-21 KRX 구성종목 기준 대상 종목군. 당일 거래 제한 여부는 별도입니다.",
+  "sources": [
+    {
+      "board": "KOSPI",
+      "index_name": "코스피 200",
+      "as_of": "2026-09-21",
+      "filename": "data_4334_20261004.csv",
+      "row_count": 201,
+      "sha256": "f15b11ae16bdbc97dfef8f204fb790150fbaf104326bc22e491549565db65610",
+      "source_url": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC02010301"
+    },
+    {
+      "board": "KOSDAQ",
+      "index_name": "코스닥 150",
+      "as_of": "2026-09-21",
+      "filename": "data_4442_20261004.csv",
+      "row_count": 150,
+      "sha256": "6c1d12e6854a57df8d2a3c01168d01c9e3d323f3d631d340e20622ddea723120",
+      "source_url": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC02010301"
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../App';
 import { catalog, deferred, element, marketData, quote, response, snapshot, tradeHistory } from './fixtures';
 
@@ -27,11 +27,13 @@ async function ready() {
 }
 
 async function refresh() {
-  await userEvent.click(screen.getByRole('button', { name: '새로고침' }));
+  await userEvent.click(screen.getByRole('button', { name: window.location.hash.startsWith('#/chart') ? '시세 새로고침' : '새로고침' }));
   await ready();
 }
 
 describe('market collection', () => {
+  beforeEach(() => window.history.replaceState(null, '', '/#/chart'));
+
   it('loads saved quotes independently with values, query time and record count', async () => {
     const fetchMock = mockApi();
     render(<App />);
@@ -49,13 +51,13 @@ describe('market collection', () => {
     expect(fetchMock.mock.calls.every(([url]) => !String(url).includes('/quote'))).toBe(true);
   });
 
-  it('shows loading while allowing balances and refresh controls to settle', async () => {
+  it('shows chart refresh as busy while account balances settle independently', async () => {
     const pending = deferred<Response>();
     mockApi(() => pending.promise);
     render(<App />);
     expect(screen.getByText('시세 수집 상태를 불러오는 중')).toBeTruthy();
     await waitFor(() => expect(element('connection-label').textContent).toBe('계좌 연결됨'));
-    expect((element('refresh-button') as HTMLButtonElement).disabled).toBe(false);
+    expect((element('refresh-button') as HTMLButtonElement).disabled).toBe(true);
     await act(async () => pending.resolve(response(savedMarket())));
     await ready();
     expect(element('market-quotes').dataset.rowCount).toBe('1');
@@ -141,14 +143,20 @@ describe('market collection', () => {
     const fetchMock = mockApi(undefined, () => ++catalogs === 2 ? response({ error: '계좌 목록 오류' }, 500) : response(catalog));
     render(<App />);
     await ready();
+    await userEvent.click(screen.getByRole('link', { name: '내 계좌' }));
+    await ready();
     await userEvent.click(screen.getByRole('combobox'));
     await userEvent.click(screen.getByRole('option', { name: '대회 계좌' }));
     await ready();
-    expect(element('market-quotes').dataset.rowCount).toBe('1');
     expect(fetchMock.mock.calls.filter(([url]) => url === '/api/market')).toHaveLength(1);
     await refresh();
     expect(element('error-notice').textContent).toContain('계좌 목록 오류');
+    expect(fetchMock.mock.calls.filter(([url]) => url === '/api/market')).toHaveLength(1);
+    await userEvent.click(screen.getByRole('link', { name: '시세·차트' }));
+    await ready();
     expect(element('market-quotes').dataset.rowCount).toBe('1');
+    expect(within(element('market-quotes')).getByRole('cell', { name: /61,200/ })).toBeTruthy();
+    expect(fetchMock.mock.calls.filter(([url]) => url === '/api/market')).toHaveLength(1);
   });
 
   it('loads quotes even when the initial account catalog is unavailable', async () => {

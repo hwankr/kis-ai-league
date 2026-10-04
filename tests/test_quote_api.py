@@ -94,11 +94,18 @@ class QuoteApiTests(unittest.TestCase):
                 self.quote(output)
 
     def test_invalid_symbol_fails_without_auth_or_network(self):
-        for symbol in (None, 5930, "5930", " 005930", "005930&x=1", "００５９３０"):
+        for symbol in (None, 5930, "5930", " 005930", "005930&x=1", "００５９３０", "0126z0", "0126_Z"):
             with self.subTest(symbol=symbol), patch.object(self.client, "_get") as get:
                 with self.assertRaises(KisError):
                     self.client.quote(symbol)
                 get.assert_not_called()
+
+    def test_alphanumeric_symbol_reaches_quote_api_unchanged(self):
+        output = {**self.output, "stck_shrn_iscd": "0126Z0"}
+        with patch.object(self.client, "_get", return_value=({"output": output}, {})) as get:
+            result = self.client.quote("0126Z0")
+        self.assertEqual(result["symbol"], "0126Z0")
+        self.assertEqual(get.call_args.args[2]["FID_INPUT_ISCD"], "0126Z0")
 
     def test_network_gate_is_inside_existing_guard_and_released_on_error(self):
         events = []

@@ -21,6 +21,7 @@
 }
 
 * { box-sizing: border-box; }
+html { scrollbar-gutter: stable; }
 body { margin: 0; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
@@ -30,19 +31,26 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 [hidden] { display: none !important; }
 .skip-link { position: fixed; top: -80px; left: 16px; z-index: 10; padding: 12px 18px; border-radius: 8px; background: var(--blue); color: white; font-size: 14px; text-decoration: none; }
 .skip-link:focus { top: 10px; }
-.app-header { border-bottom: 1px solid var(--border); background: #fff; }
+.app-header { position: sticky; top: 0; z-index: 6; border-bottom: 1px solid var(--border); background: #fff; }
 .header-inner { display: flex; align-items: center; height: 68px; max-width: 1440px; padding: 0 48px; margin: 0 auto; }
 .brand { display: inline-flex; align-items: center; gap: 9px; font-size: 19px; font-weight: 750; letter-spacing: -.65px; text-decoration: none; white-space: nowrap; }
 .brand-mark { width: 25px; height: 27px; color: #3182f6; }
 .brand-light { font-weight: 650; }
-.header-nav { display: flex; align-self: stretch; margin-left: 54px; }
-.header-nav a { display: flex; align-items: center; position: relative; padding: 0 4px; font-size: 15px; font-weight: 650; text-decoration: none; }
-.header-nav a::after { position: absolute; content: ""; right: 0; bottom: 0; left: 0; height: 2px; background: #191f28; }
+.header-nav { display: flex; align-self: stretch; gap: 24px; margin-left: 40px; }
+.header-nav a { display: flex; align-items: center; position: relative; padding: 0 4px; color: var(--secondary); font-size: 15px; font-weight: 650; text-decoration: none; white-space: nowrap; }
+.header-nav a[aria-current="page"] { color: #191f28; }
+.header-nav a[aria-current="page"]::after { position: absolute; content: ""; right: 0; bottom: 0; left: 0; height: 2px; background: currentColor; }
 .header-meta { display: flex; align-items: center; gap: 12px; margin-left: auto; font-size: 12px; color: var(--muted); }
 .environment-badge { padding: 6px 9px; border-radius: 6px; color: #4e5968; background: #f2f4f6; font-size: 12px; font-weight: 600; }
 main { max-width: 1280px; margin: 0 auto; padding: 48px 40px 24px; }
+.app-page { min-width: 0; }
+.page-content { display: block; min-width: 0; }
+.page-content > :is(.trades-panel, .candidate-panel, .stock-chart-panel, .market-panel):first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.page-account-picker { margin: 0 0 24px; }
+.page-account-picker .account-picker { margin: 0; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 36px; }
 h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spacing: -.8px; }
+#page-title:focus, #main-content:focus { outline: none; }
 .refresh-controls { display: flex; align-items: center; gap: 20px; }
 .auto-refresh-control { display: inline-flex; align-items: center; gap: 10px; color: var(--secondary); font-size: 13px; cursor: pointer; white-space: nowrap; }
 .auto-refresh-control input { appearance: none; width: 34px; height: 20px; position: relative; border: 0; border-radius: 12px; background: #b0b8c1; margin: 0; cursor: pointer; transition: background .15s; }
@@ -55,7 +63,7 @@ h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spac
 .refresh-icon { width: 17px; height: 17px; }
 .refresh-button[aria-busy="true"] .refresh-icon { animation: spin 1.2s linear infinite; }
 .error-notice { margin: -12px 0 24px; padding: 15px 18px; border-radius: 8px; background: #fff6e7; color: #865b10; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
-.dashboard-layout { display: grid; grid-template-columns: minmax(0, 1fr) 292px; grid-template-areas: "overview details" "history connection" "holdings holdings" "trades trades" "market market" "chart chart"; column-gap: 44px; }
+.dashboard-layout { display: grid; grid-template-columns: minmax(0, 1fr) 292px; grid-template-areas: "overview details" "history connection" "holdings holdings"; column-gap: 44px; }
 .asset-overview { grid-area: overview; padding: 8px 0 44px; min-width: 0; }
 .account-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: -6px 0 22px; font-size: 13px; }
 .account-broker { color: var(--muted); white-space: nowrap; }
@@ -153,6 +161,45 @@ h1 { margin: 0; font-size: 28px; line-height: 1.4; font-weight: 700; letter-spac
 .market-mobile-label { display: none; }
 .market-stock-link { padding: 0; border: 0; background: none; color: var(--blue); text-align: left; text-decoration: underline; text-decoration-color: #b7d4ff; text-underline-offset: 4px; }
 .market-stock-link:hover { text-decoration-color: currentColor; }
+.candidate-panel { grid-area: candidates; min-width: 0; margin-top: 32px; padding-top: 25px; border-top: 1px solid var(--border); }
+.candidate-heading { flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
+.candidate-meta, .candidate-universe, .candidate-counts { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.candidate-state { color: var(--blue); }
+.candidate-stale { color: #865b10; }
+.candidate-universe { font-size: 11px; }
+.candidate-universe a { text-underline-offset: 3px; }
+.candidate-counts { margin-top: 18px; color: var(--secondary); }
+.candidate-warning { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; }
+.candidate-warning .history-error { margin: 0; }
+.candidate-retry { padding: 3px 0; border: 0; background: none; color: var(--blue); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
+.candidate-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 10px 12px; margin: 16px 0 8px; }
+.candidate-filters label { display: flex; flex-direction: column; gap: 7px; min-width: 0; color: var(--muted); font-size: 12px; }
+.candidate-search { flex: 1; max-width: 260px; min-width: 160px !important; }
+.candidate-filters input, .candidate-filters select { min-width: 0; min-height: 40px; padding: 8px 10px; border: 1px solid #e5e8eb; border-radius: 7px; background: white; color: var(--secondary); font-size: 13px; }
+.candidate-sort-direction, .candidate-pagination button { min-height: 40px; padding: 8px 12px; border: 0; border-radius: 7px; background: #f2f4f6; color: var(--secondary); font-size: 12px; }
+.candidate-panel button:disabled { cursor: default; opacity: .5; }
+.candidate-table { min-width: 1050px; }
+.candidate-table th { padding: 12px 8px; }
+.candidate-table th button { padding: 3px 0; border: 0; background: none; color: inherit; font: inherit; text-align: right; }
+.candidate-table th button > span { display: block; margin-top: 4px; }
+.candidate-table td { padding: 16px 8px; font-size: 13px; }
+.candidate-table .candidate-stock { min-width: 155px; max-width: 220px; padding-left: 0; white-space: normal; }
+.candidate-table .stock-name { font-size: 13px; }
+.candidate-date { color: var(--muted); font-size: 11px !important; }
+.candidate-row-error { display: block; margin-top: 7px; color: #865b10; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.candidate-screening { margin: 14px 0 18px; padding: 12px 0; border-block: 1px solid var(--border); }
+.candidate-screening .candidate-counts { margin: 0 0 8px; }
+.candidate-screening strong { color: var(--primary); font-weight: 600; }
+.candidate-screening details { color: var(--secondary); font-size: 12px; line-height: 1.7; }
+.candidate-screening summary { width: fit-content; cursor: pointer; }
+.candidate-screening ul { margin: 8px 0; padding-left: 18px; }
+.candidate-screening details p { color: var(--muted); margin-bottom: 0; }
+.candidate-selection { display: block; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.candidate-selection-selected { color: #2469cc; }
+.candidate-selection-unverified { color: #865b10; }
+.candidate-mobile-label { display: none; }
+.candidate-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 16px; color: var(--muted); font-size: 12px; }
+.candidate-pagination nav { display: flex; gap: 8px; }
 .stock-chart-panel { grid-area: chart; min-width: 0; margin-top: 32px; padding-top: 25px; border-top: 1px solid var(--border); scroll-margin-top: 24px; }
 .stock-chart-panel .panel-heading { margin-bottom: 18px; }
 .chart-status { color: var(--muted); font-size: 12px; }
@@ -229,7 +276,10 @@ tbody tr:hover { background: #f9fafb; }
   .balance-list dd { font-size: 20px; }
 }
 @media (max-width: 800px) {
-  .dashboard-layout { grid-template-columns: minmax(0, 1fr); grid-template-areas: "overview" "details" "history" "holdings" "trades" "market" "chart" "connection"; }
+  .header-inner { height: auto; min-height: 104px; flex-wrap: wrap; column-gap: 16px; }
+  .brand { min-height: 60px; }
+  .header-nav { order: 1; flex-basis: 100%; height: 44px; margin-left: 0; }
+  .dashboard-layout { grid-template-columns: minmax(0, 1fr); grid-template-areas: "overview" "details" "history" "holdings" "connection"; }
   .asset-overview { padding-bottom: 30px; }
   .account-details { padding: 24px; margin-bottom: 34px; border-radius: 4px; }
   .balance-list { flex-direction: row; gap: 48px; margin: 20px 0 0; }
@@ -276,12 +326,22 @@ tbody tr:hover { background: #f9fafb; }
   .market-count { grid-area: count; margin-top: 8px; }
   .market-time { grid-area: time; text-align: left; white-space: normal; line-height: 1.6; }
   .market-mobile-label { display: inline; color: var(--muted); }
+  .candidate-table { min-width: 0; }
+  .candidate-table tbody tr { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-areas: none; gap: 12px 20px; padding: 20px 0; }
+  .candidate-table .candidate-stock { grid-area: auto; grid-column: 1 / -1; min-width: 0; max-width: none; padding: 0 0 2px; }
+  .candidate-table .stock-name { max-width: none; font-size: 15px; }
+  .candidate-table .candidate-metric, .candidate-table .candidate-date { display: flex; flex-direction: column; align-items: start; gap: 5px; padding: 0; white-space: normal; overflow-wrap: anywhere; text-align: left; font-size: 13px; }
+  .candidate-mobile-label { display: block; color: var(--muted); font-size: 11px; line-height: 1.5; }
+  .candidate-inline-unit { display: inline; margin-left: 2px; }
+  .candidate-row-error { max-width: none; }
 }
 @media (max-width: 520px) {
-  .header-inner { height: 60px; padding: 0 20px; }
+  .header-inner { padding: 0 20px; }
   .brand { gap: 7px; font-size: 17px; }
   .brand-mark { width: 22px; height: 24px; }
-  .header-nav, .read-only { display: none; }
+  .header-nav { justify-content: space-between; gap: 8px; }
+  .header-nav a { padding: 0; font-size: 13px; }
+  .read-only { display: none; }
   .environment-badge { font-size: 11px; padding: 5px 8px; }
   main { padding: 28px 20px 20px; }
   .page-heading { align-items: start; flex-direction: column; gap: 20px; margin-bottom: 28px; }
@@ -321,6 +381,12 @@ tbody tr:hover { background: #f9fafb; }
   .trade-filters input { width: 100%; padding: 8px 5px; font-size: 12px; }
   .trade-query-button { min-width: 54px; min-height: 40px; padding: 10px; }
   .trade-status { font-size: 11px; }
+  .candidate-heading .refresh-button { min-width: 90px; }
+  .candidate-filters { gap: 10px; }
+  .candidate-filters .candidate-search { flex-basis: 100%; max-width: none; }
+  .candidate-filters label:not(.candidate-search) { flex: 1 1 100px; }
+  .candidate-sort-direction { width: 100%; }
+  .candidate-table tbody tr { column-gap: 14px; }
   .stock-chart-controls { gap: 10px 12px; }
   .stock-chart-query { width: 100%; }
   .stock-chart-query input { flex: 1; width: 0; }

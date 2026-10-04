@@ -113,8 +113,9 @@ export default function StockChart({ chart }: { chart: ReturnType<typeof useStoc
     if (request) { setSymbol(request.symbol); setInputError(null); }
   }, [request?.symbol]);
   const submit = (nextInterval = interval) => {
-    const value = symbol.trim();
-    if (!/^\d{6}$/.test(value)) { setInputError('종목코드 6자리를 입력해 주세요.'); return; }
+    const value = symbol.trim().toUpperCase();
+    if (!/^[0-9A-Z]{6}$/.test(value)) { setInputError('영문·숫자 6자리 종목코드를 입력해 주세요.'); return; }
+    setSymbol(value);
     setInputError(null);
     void query(value, nextInterval);
   };
@@ -133,7 +134,7 @@ export default function StockChart({ chart }: { chart: ReturnType<typeof useStoc
     <div className="stock-chart-controls">
       <form className="stock-chart-query" onSubmit={event => { event.preventDefault(); submit(); }}>
         <label className="sr-only" htmlFor="chart-symbol">차트 종목코드</label>
-        <input id="chart-symbol" value={symbol} inputMode="numeric" maxLength={6} autoComplete="off" spellCheck={false}
+        <input id="chart-symbol" value={symbol} inputMode="text" maxLength={6} autoComplete="off" autoCapitalize="characters" spellCheck={false}
           aria-invalid={Boolean(inputError)} aria-describedby={inputError ? 'chart-input-error' : undefined}
           onChange={event => { setSymbol(event.target.value); setInputError(null); }} />
         <button type="submit" className="refresh-button chart-query-button" aria-label="종목 차트 조회">조회</button>

@@ -157,12 +157,30 @@ class ChartParserTests(unittest.TestCase):
 
     def test_all_invalid_input_fails_before_network(self):
         for symbol, interval in (("5930", "day"), ("００５９３０", "day"), ("005930", "1m"),
-                                 ("005930&x=1", "day"), (None, "day"), ("005930", [])):
+                                 ("005930&x=1", "day"), (None, "day"), ("005930", []),
+                                 ("0126z0", "day"), ("0126_Z", "day"), (126, "day"),
+                                 ("0126Z0 ", "day")):
             with self.subTest(symbol=symbol, interval=interval), self.assertRaises(KisError):
                 validate_chart_request(symbol, interval)
 
 
 class ChartClientTests(unittest.TestCase):
+    def test_alphanumeric_symbol_is_preserved_for_daily_and_minute_requests(self):
+        client = PaperClient(Settings("test-key", "test-secret"))
+        validate_chart_request("0126Z0", "day")
+        with patch.object(client, "_get", return_value=({}, {})) as get:
+            client.chart_daily("0126Z0", date(2026, 9, 1), date(2026, 10, 2))
+            self.assertEqual(get.call_args.args[2]["FID_INPUT_ISCD"], "0126Z0")
+            client.chart_minutes("0126Z0", "113000")
+            self.assertEqual(get.call_args.args[2]["FID_INPUT_ISCD"], "0126Z0")
+        for symbol in (126, None, "0126z0", "0126_Z", " 0126Z0", "0126Z0&x=1", "０１２６Ｚ０"):
+            with self.subTest(symbol=symbol), patch.object(client, "_get") as get:
+                with self.assertRaises(KisError):
+                    client.chart_daily(symbol, date(2026, 9, 1), date(2026, 10, 2))
+                with self.assertRaises(KisError):
+                    client.chart_minutes(symbol, "113000")
+                get.assert_not_called()
+
     def test_official_read_only_endpoints_and_adjusted_daily_flag(self):
         client = PaperClient(Settings("test-key", "test-secret"))
         with patch.object(client, "_get", return_value=(response(row()), {})) as get:
@@ -210,6 +228,25 @@ class ChartServiceTests(unittest.TestCase):
         self.client.chart_daily.assert_called_once()
         self.clock[0] = 60
         self.service.snapshot("005930")
+        self.assertEqual(self.client.chart_daily.call_count, 2)
+
+    def test_alphanumeric_symbol_cache_is_preserved_across_restart_and_separate_from_numeric_symbol(self):
+        def daily(symbol, start, end):
+            return {"output1": {"stck_shrn_iscd": symbol},
+                    "output2": [row(stck_clpr="107" if symbol == "0126Z0" else "105")]}
+
+        self.client.chart_daily.side_effect = daily
+        first = self.service.snapshot("0126Z0")
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(first["symbol"], "0126Z0")
+        self.assertEqual(first["bars"][0]["close"], "107")
+        self.assertEqual(self.service.snapshot("005930")["bars"][0]["close"], "105")
+        self.assertEqual(self.client.chart_daily.call_count, 2)
+        restarted = ChartService(self.config, self.factory, lambda: self.clock[0],
+                                 lambda: datetime(2026, 10, 2, 12, tzinfo=KST), self.names)
+        self.assertEqual(restarted.snapshot("0126Z0")["bars"], first["bars"])
+        self.assertEqual(restarted.snapshot("0126Z0")["symbol"], "0126Z0")
+        self.assertEqual(restarted.snapshot("005930")["bars"][0]["close"], "105")
         self.assertEqual(self.client.chart_daily.call_count, 2)
 
     def test_intraday_has_separate_cache_and_thirty_second_ttl(self):

@@ -49,6 +49,46 @@ class SymbolNamesTests(unittest.TestCase):
         self.assertEqual(saved["names"]["005930"], "삼성전자")
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
+    def test_alphanumeric_master_name_is_saved_and_restored_without_network(self):
+        def fetcher(url):
+            if "kospi_" in url:
+                return master("kospi", "0126Z0", "삼성에피스홀딩스")
+            return fetch_master(url)
+
+        cache = self.cache(fetcher=fetcher)
+        self.assertTrue(cache.refresh())
+        expected = {"0126Z0": "삼성에피스홀딩스", "035900": "JYP Ent."}
+        self.assertEqual(cache.lookup(expected), expected)
+        saved = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["names"], expected)
+        offline = Mock(side_effect=AssertionError("unexpected network"))
+        restored = self.cache(fetcher=offline)
+        self.assertEqual(restored.lookup(["0126Z0", "035900", "0126z0"]), expected)
+        offline.assert_not_called()
+
+    def test_invalid_master_code_does_not_replace_existing_names(self):
+        cache = self.cache(fetcher=fetch_master)
+        self.assertTrue(cache.refresh())
+        saved = self.path.read_bytes()
+        for symbol in ("0126z0", "0126_Z", "0126Z00"):
+            cache._fetcher = lambda url, symbol=symbol: master("kospi", symbol, "잘못된 코드")
+            with self.subTest(symbol=symbol):
+                self.assertFalse(cache.refresh())
+                self.assertEqual(cache.lookup(["005930", symbol]), {"005930": "삼성전자"})
+                self.assertEqual(self.path.read_bytes(), saved)
+
+    def test_invalid_alphanumeric_code_in_saved_cache_is_not_restored(self):
+        for symbol in ("0126z0", "0126_Z", "0126Z00"):
+            self.path.write_text(json.dumps({"updated_at": self.now,
+                                             "names": {"005930": "삼성전자", symbol: "잘못된 코드"}}),
+                                 encoding="utf-8")
+            offline = Mock(side_effect=OSError("offline"))
+            restored = self.cache(fetcher=offline)
+            with self.subTest(symbol=symbol):
+                self.assertFalse(restored.refresh())
+                self.assertEqual(restored.lookup(["005930", symbol]), {})
+                offline.assert_called_once()
+
     def test_fresh_cache_and_unknown_symbols_do_not_fetch(self):
         self.path.write_text(json.dumps({"updated_at": self.now, "names": {"005930": "삼성전자"}}), encoding="utf-8")
         fetcher = Mock(side_effect=AssertionError("unexpected network"))
