@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
+from pathlib import Path
 import re
+import socket
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -311,16 +314,117 @@ class AccountDirectory:
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        return super().server_bind()
+
     def __init__(self, port=8765, service=None, frontend_path=FRONTEND, market_service=None,
-                 chart_service=None, candidate_service=None):
-        self.service = service if service is not None else AccountDirectory()
-        self.market_service = market_service if market_service is not None else MarketService()
-        self.chart_service = chart_service if chart_service is not None else ChartService()
-        self.candidate_service = candidate_service if candidate_service is not None else CandidateService()
-        self.frontend_path = frontend_path.resolve()
+                 chart_service=None, candidate_service=None, research_service=None, experiment_service=None):
+        self.experiment_owner = None
+        self.autonomous_monitor = None
+        self.shutdown_requested = False
+        self.last_loop_at = datetime.now(timezone.utc).isoformat()
         super().__init__(("127.0.0.1", port), DashboardHandler)
         self.hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
         self.origins = {"http://" + host for host in self.hosts}
+        try:
+            self._initialize(service, frontend_path, market_service, chart_service,
+                             candidate_service, research_service, experiment_service)
+        except BaseException:
+            self.server_close()
+            raise
+
+    def _initialize(self, service, frontend_path, market_service, chart_service,
+                    candidate_service, research_service, experiment_service):
+        self.service = service if service is not None else AccountDirectory()
+        self.market_service = market_service if market_service is not None else MarketService()
+        self.chart_service = chart_service if chart_service is not None else ChartService()
+        self.automatic_research = service is None and candidate_service is None
+        if self.automatic_research and experiment_service is None:
+            from backend.request_gate import file_lock
+            owner = file_lock(ROOT / ".local" / "experiments" / "dashboard.lock", blocking=False)
+            owner.__enter__()
+            self.experiment_owner = owner
+        if research_service is None and self.automatic_research:
+            from backend.forward_observer import ForwardObserver
+            research_service = ForwardObserver()
+        self.research_service = research_service
+        self.experiment_service = experiment_service
+        if self.experiment_service is None and self.automatic_research:
+            from backend.experiments import ExperimentService
+            self.experiment_service = ExperimentService()
+        observer = self.research_service
+        if self.experiment_service is not None and candidate_service is None:
+            from backend.experiments import ExperimentObserver
+            observer = ExperimentObserver(self.research_service, self.experiment_service)
+        self.candidate_service = (candidate_service if candidate_service is not None
+                                  else CandidateService(observer=observer))
+        if self.experiment_service is not None:
+            self.experiment_service.candidate_service = self.candidate_service
+        self.frontend_path = frontend_path.resolve()
+        if self.automatic_research and self.experiment_service is not None:
+            from backend.autonomy import AutonomousMonitor
+            self.autonomous_monitor = AutonomousMonitor(self.experiment_service, self.service, self.candidate_service)
+
+    def server_close(self):
+        super().server_close()
+        owner = getattr(self, "experiment_owner", None)
+        service_stopped = True
+        if owner is not None:
+            service = getattr(self, "experiment_service", None)
+            service_stopped = service is None or service.close()
+        monitor = getattr(self, "autonomous_monitor", None)
+        monitor_stopped = monitor is None or monitor.close()
+        if owner is not None and service_stopped and monitor_stopped:
+            self.experiment_owner = None
+            owner.__exit__(None, None, None)
+
+    def service_actions(self):
+        self.last_loop_at = datetime.now(timezone.utc).isoformat()
+        stop_file = os.environ.get("KIS_SUPERVISOR_STOP_FILE")
+        instance = os.environ.get("KIS_SUPERVISOR_INSTANCE")
+        if stop_file and instance and not self.shutdown_requested:
+            try:
+                request = json.loads(Path(stop_file).read_text(encoding="utf-8"))
+                if request == {"instance": instance, "child_pid": os.getpid()}:
+                    self.shutdown_requested = True
+                    threading.Thread(target=self.shutdown, daemon=True).start()
+            except (OSError, ValueError):
+                pass
+        if self.shutdown_requested:
+            return
+        if self.automatic_research and self.research_service is not None:
+            self.research_service.tick(self.candidate_service)
+        if self.automatic_research and self.experiment_service is not None:
+            self.experiment_service.tick()
+        if self.autonomous_monitor is not None:
+            self.autonomous_monitor.tick()
+
+    def experiment_snapshot(self, payload=None):
+        payload = self.experiment_service.snapshot() if payload is None else payload
+        if self.autonomous_monitor is not None:
+            payload = {**payload, "autonomy": self.autonomous_monitor.snapshot()}
+        return payload
+
+    def health(self):
+        service = self.experiment_service
+        worker = getattr(service, "worker", None)
+        started = getattr(service, "worker_started_at", None)
+        stalled = bool(self.autonomous_monitor and self.autonomous_monitor.stalled())
+        if isinstance(started, (int, float)) and worker is not None and worker.is_alive() and time.monotonic() - started > 900:
+            stalled = True
+        autonomy = None
+        if self.autonomous_monitor is not None:
+            snapshot = self.autonomous_monitor.snapshot()
+            # Health must stay bounded as order issues and daily reports accumulate.
+            autonomy = {key: snapshot.get(key) for key in (
+                "status", "last_heartbeat_at", "last_cycle_at", "last_account_at", "last_monitor_at")}
+            autonomy["open_issue_count"] = sum(item.get("state") == "open" for item in snapshot.get("issues", []))
+        return {"status": "stalled" if stalled else "ok", "pid": os.getpid(),
+                "instance": os.environ.get("KIS_SUPERVISOR_INSTANCE"), "updated_at": self.last_loop_at,
+                "autonomy": autonomy}
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -357,7 +461,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         path = url.path
-        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates"):
+        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates", "/api/research", "/api/experiments", "/api/health"):
             origin = self.headers.get("Origin")
             if (self.headers.get("X-KIS-Dashboard") != "1"
                     or (origin is not None and origin not in self.server.origins)
@@ -365,6 +469,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "대시보드에서 계좌를 조회하세요."})
                 return
             params = parse_qs(url.query, keep_blank_values=True)
+            if path == "/api/health":
+                if params:
+                    self.json_response(400, {"error": "상태 조회 조건이 올바르지 않습니다."})
+                else:
+                    self.json_response(200, self.server.health())
+                return
+            if path == "/api/experiments":
+                if params:
+                    self.json_response(400, {"error": "실험실 조회에는 추가 조건을 지정할 수 없습니다."})
+                elif self.server.experiment_service is None:
+                    self.json_response(503, {"error": "실험실이 시작되지 않았습니다."})
+                else:
+                    try:
+                        self.json_response(200, self.server.experiment_snapshot())
+                    except Exception:
+                        self.json_response(503, {"error": "실험 기록을 읽지 못했습니다."})
+                return
+            if path == "/api/research":
+                if params:
+                    self.json_response(400, {"error": "연구 관찰 조회에는 추가 조건을 지정할 수 없습니다."})
+                    return
+                try:
+                    if self.server.research_service is None:
+                        self.json_response(503, {"status": "error", "error": "연구 관찰이 시작되지 않았습니다.", "order_enabled": False})
+                    else:
+                        self.json_response(200, self.server.research_service.snapshot())
+                except Exception:
+                    self.json_response(503, {"status": "error", "error": "연구 관찰 기록을 읽지 못했습니다.", "order_enabled": False})
+                return
             if path == "/api/candidates":
                 if params:
                     self.json_response(400, {"error": "후보 비교 상태 조회에는 추가 조건을 지정할 수 없습니다."})
@@ -480,6 +613,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 or self.headers.get("Sec-Fetch-Site") == "cross-site"
                 or self.headers.get("Origin") is not None and self.headers.get("Origin") not in self.server.origins):
             self.json_response(403, {"error": "대시보드에서 조회를 실행하세요."})
+            return
+        if self.path == "/api/experiments":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if (not 1 <= length <= 8192 or self.headers.get("Transfer-Encoding")
+                        or self.headers.get_content_type() != "application/json"):
+                    raise ValueError
+                self.connection.settimeout(5)
+                body = json.loads(self.rfile.read(length))
+                if self.server.experiment_service is None:
+                    self.json_response(503, {"error": "실험실이 시작되지 않았습니다."})
+                    return
+                if isinstance(body, dict) and body.get("action") == "answer" and self.server.autonomous_monitor is not None:
+                    self.server.autonomous_monitor.answer(body)
+                    payload = self.server.experiment_snapshot()
+                else:
+                    payload = self.server.experiment_snapshot(self.server.experiment_service.command(body))
+            except (ValueError, OSError):
+                self.json_response(400, {"error": "실험 요청 형식이 올바르지 않거나 다른 작업이 진행 중입니다."})
+            except KisError as error:
+                self.json_response(400, {"error": str(error)})
+            except Exception:
+                self.json_response(503, {"error": "실험 요청 결과를 확인할 수 없습니다. 상태를 다시 조회하세요."})
+            else:
+                self.json_response(202 if payload.get("busy") else 200, payload)
             return
         if self.path != "/api/candidates":
             self.json_response(404, {"error": "페이지를 찾을 수 없습니다."})

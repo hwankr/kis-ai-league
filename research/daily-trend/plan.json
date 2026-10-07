@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "created_at_kst": "2026-10-04",
+  "scope": "배분 없는 일봉 신호·청산 연구. 실제 주문/계좌 성과 아님.",
+  "status": "exploratory_reused_history",
+  "data": "../.local/research/candidate-screen-2026-10-04",
+  "periods": {
+    "development": [
+      "2025-02-03",
+      "2025-12-31"
+    ],
+    "validation": [
+      "2026-01-01",
+      "2026-06-30"
+    ],
+    "reused_audit": [
+      "2026-07-01",
+      "2026-10-02"
+    ]
+  },
+  "warning": "전 기간은 기존 후보 연구에서 사용한 자료. 이번 비교안·평가식은 신규 성과 계산 전에 고정하지만 미사용 평가를 주장하지 않음.",
+  "universe": "2026-09-21 고정 351종목 내 D까지 연속61일 유효OHLC·최근20일 거래량양수·평균원거래대금100억원이상 상위20개. 과거 상태·원주가 제한 재현 불가.",
+  "entry": {
+    "lookback": 20,
+    "condition": "D 종가 > D 제외 직전20일 고가최대",
+    "timing": "D 마감완료 후 신호, D+1 시가",
+    "shortlist_first": true,
+    "position_size": null,
+    "maximum_positions": null
+  },
+  "rules": [
+    {
+      "id": "time5",
+      "exit": "time",
+      "max_hold": 5
+    },
+    {
+      "id": "time10",
+      "exit": "time",
+      "max_hold": 10
+    },
+    {
+      "id": "draft5",
+      "exit": "draft",
+      "max_hold": 5
+    },
+    {
+      "id": "failed5",
+      "exit": "failed_breakout",
+      "max_hold": 5
+    },
+    {
+      "id": "failed10",
+      "exit": "failed_breakout",
+      "max_hold": 10
+    },
+    {
+      "id": "atr5",
+      "exit": "atr_trail",
+      "max_hold": 5
+    },
+    {
+      "id": "atr10",
+      "exit": "atr_trail",
+      "max_hold": 10
+    }
+  ],
+  "definitions": {
+    "draft": "종가<=진입가격*0.97 또는 SMA10 이하",
+    "failed_breakout": "종가<=신호일 고정 돌파기준",
+    "atr_trail": "ATR14 단순평균을 신호시점에 고정. 최초 진입가격-2ATR, 이후 이전 종가최고-2ATR로 상향. 당일고가 미사용. 종가<=전일까지스톱이면 다음시가.",
+    "maturity": "진입일1일째, max_hold일 종가후 익일시가 청산",
+    "unknown": "결측은 정지로 간주하지 않음. 미확정/미청산0수익금지, 원표본에 보존.",
+    "nonoverlap": "규칙별 같은종목보유중 신규진입억제. 청산일 장마감 신호는 다음날 진입허용. 자금제약 미적용."
+  },
+  "costs": {
+    "buy_fee": 0.000140527,
+    "sell_fee": 0.000140527,
+    "sell_tax": 0.002,
+    "slippage": [
+      0.001,
+      0.002
+    ]
+  },
+  "diagnostics": {
+    "horizons": [
+      1,
+      3,
+      5,
+      10,
+      20
+    ],
+    "entry_sensitivity_lookbacks": [
+      10,
+      20,
+      60
+    ],
+    "sensitivity_period": "development",
+    "sensitivity_selection": false,
+    "segments": [
+      "market_above_sma60",
+      "volume_ratio_ge_1_5",
+      "extension_atr_le_2",
+      "next_open_gap_atr_le_0_5"
+    ],
+    "segment_selection": false,
+    "tail": "최악·하위5%·중앙MAE/MFE·종가역행·시가갭",
+    "limit": "조건/문턱은 비교용 가정. 부문 결과를 보고 새 필터를 소급 적용하지 않음."
+  },
+  "comparison": {
+    "entry": "같은신호일 관찰목록의 동일 max_hold 고정보유 대비",
+    "exit": "같은신호/종목의 동일 max_hold 고정보유 대비",
+    "pairing": "비교에 필요한 두 결과가 기간내 완결된 stock-date 공통집합. 누락/경계/미체결 각각 보고.",
+    "cohorts": "모든이벤트중첩과 종목별중복제거 거래를 별도. 날짜동일가중 평균은 계좌수익아님."
+  },
+  "uncertainty": {
+    "block_sessions": 20,
+    "replicates": 10000,
+    "seed": 20261004,
+    "confidence": 0.95,
+    "selection_confidence": 0.9928571428571429,
+    "small_sample_days": 20
+  },
+  "selection": {
+    "periods": [
+      "development",
+      "validation"
+    ],
+    "minimum_events": 60,
+    "minimum_signal_days": 30,
+    "gate": "두기간·두비용 날짜평균순수익 및 유동성대조군 대비차이>0; 검증기본비용 Bonferroni7비교 보정구간하단>0; 두시장 기본비용차이>0, 각10일이상; 데이터미확정없음; 종목중복제거 손익>0",
+    "rank": "검증불리비용 날짜평균순수익 최대, 0.05%p 이내면 rules 앞선순",
+    "on_failure": "selected_rule=null. 이득 없는 복잡화도 채택하지 않음. 같은자료에서 대안을 재선택하지 않음."
+  },
+  "audit": "개발/검증후 선택정보 해시저장. reused_audit는 봉인후 읽어 동일7안 투명보고하되 결과로 재선택금지. 미래규칙/데이터별 기록은 별도.",
+  "sources": [
+    "https://www.kentdaniel.net/papers/published/jfe_16.pdf",
+    "https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf",
+    "https://pages.stern.nyu.edu/~afrazzin/pdf/Trading%20Cost%20of%20Asset%20Pricing%20Anomalies%20-%20Frazzini,%20Israel%20and%20Moskowitz.pdf",
+    "https://global.krx.co.kr/contents/GLB/06/0602/0602020202/GLB0602020202T6.jsp"
+  ]
+}

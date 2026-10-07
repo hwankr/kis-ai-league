@@ -5,6 +5,7 @@ import App from '../App';
 import type { CandidateComparisonData, CandidateRow } from '../candidates';
 import type { ChartInterval, StockChartData } from '../types';
 import { catalog, element, marketData, response, snapshot, tradeHistory } from './fixtures';
+import { experiments } from './experiment-fixtures';
 
 function candidates(): CandidateComparisonData {
   const common = { status: 'ok' as const, error: null, as_of: '2026-10-02', close: '1000',
@@ -42,6 +43,7 @@ function installFetch() {
     if (url.startsWith('/api/account?')) return Promise.resolve(response(snapshot(new URL(url, 'http://localhost').searchParams.get('account')!)));
     if (url.startsWith('/api/trades?')) return Promise.resolve(response(tradeHistory(url)));
     if (url === '/api/market') return Promise.resolve(response(marketData()));
+    if (url === '/api/experiments') return Promise.resolve(response(experiments()));
     if (url === '/api/candidates' && options?.method !== 'POST') return Promise.resolve(response(comparison));
     if (url.startsWith('/api/chart?')) return Promise.resolve(response(chartData(url)));
     throw new Error(`Unexpected navigation request: ${url}`);
@@ -78,7 +80,7 @@ async function chartReady(symbol: string, interval: ChartInterval) {
 }
 
 describe('page navigation', () => {
-  it('exposes four menu destinations and only the active page content', async () => {
+  it('exposes five menu destinations and only the active page content', async () => {
     installFetch();
     window.history.replaceState(null, '', '#/account');
     render(<App/>);
@@ -86,8 +88,9 @@ describe('page navigation', () => {
     const destinations = [
       ['내 계좌', 'account', '총 평가금액'], ['거래 내역', 'trades', '체결 내역'],
       ['후보 탐색', 'candidates', '후보 종목 비교'], ['시세·차트', 'chart', '종목 차트'],
+      ['실험실', 'experiments', '모의 운용'],
     ] as const;
-    expect(menu().getAllByRole('link')).toHaveLength(4);
+    expect(menu().getAllByRole('link')).toHaveLength(5);
     for (const [label, route, heading] of destinations) {
       await userEvent.click(menu().getByRole('link', { name: label }));
       await waitFor(() => expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(label));

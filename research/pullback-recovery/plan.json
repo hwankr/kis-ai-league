@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "rule_id": "pullback-recovery-v1",
+  "specified_at": "2026-10-04T15:21:01+00:00",
+  "scope": "One new entry hypothesis; allocation-free research, no orders. All existing history is reused exploration.",
+  "hypothesis": "Temporary selling pressure within an established uptrend may reverse; require recovery above prior high. Price alone does not identify news-driven selling.",
+  "rule_source": "backend/research_rules.py: RULE_SPEC and evaluate_pullback",
+  "entry": "D close: C[D-3]>SMA20[D-3]>SMA60[D-3]; C[D-1]<C[D-2]<C[D-3]; C[D]>H[D-1]; C[D]>SMA60[D]. Enter next session open.",
+  "exit": {"id": "time5", "exit": "time", "max_hold": 5},
+  "shortlist": "Existing liquid_top20, reconstructed with D-available data. 63 consecutive valid sessions needed for this hypothesis; historical current-status restrictions cannot be reconstructed.",
+  "control": "Same signal date and market, same liquid shortlist and trend conditions C[D-3]>SMA20[D-3]>SMA60[D-3], C[D]>SMA60[D], irrespective of pullback/recovery. Includes signal stocks. Same next-open entry, five holding sessions, costs and eligibility.",
+  "periods": {"development": ["2025-02-03", "2025-12-31"], "validation": ["2026-01-01", "2026-06-30"], "reused_audit": ["2026-07-01", "2026-10-02"]},
+  "costs": {"buy_fee": 0.000140527, "sell_fee": 0.000140527, "sell_tax": 0.002, "slippage": [0.001, 0.002]},
+  "aggregation": "Compute signal and control mean within date-market; combine market edges weighted by observed signal counts, then equal-weight dates. Also report each market, trade means, nonoverlap and missing/uncertain counts. Never account returns.",
+  "boundaries": "Exclude events whose scheduled entry+5-session exit exceeds a period. Do not turn incomplete/missing returns into zero. Same date-market comparison uses only observed outcomes with denominators and exclusions preserved.",
+  "fill_uncertainty": "Zero-volume/single-price next-day bars are retrospective fill_unverifiable, not proof of a known pre-open cancellation. Show separately; no automatic adoption when execution evidence is missing.",
+  "nonoverlap_unknown": "If entry or holding state is data_unknown or fill_unverifiable, block later same-symbol entries for that period in the nonoverlap diagnostic; preserve every original signal event.",
+  "uncertainty": {"block_sessions": 20, "replicates": 10000, "seed": 20261005, "confidence": 0.95, "small_sample_days": 30, "method": "Moving calendar-session blocks, preserving no-signal sessions; finite date edges only in each resample."},
+  "research_gate": {"minimum_events": 60, "minimum_signal_days": 30, "minimum_market_days": 10, "criteria": "Both development and validation: net and market-matched edge >0 at both costs; both markets basic-cost edge>0 and >=10 signal days; nonoverlap mean>0; no mature unknown data; validation basic-cost CI lower>0. This is a research-candidate gate only, not adoption.", "on_failure": "unadopted; no parameter/market retuning on these results; retain frozen hypothesis for explicitly labelled observation"},
+  "forward": {"diagnostic_review_date_kst": "2026-10-09", "review_date_kst": "2026-11-20", "minimum_events": 60, "minimum_signal_days": 30, "criteria": "At the fixed final checkpoint only: both-cost prospective net and matched edge>0; basic-cost CI lower>0; >=60 closed events over >=30 signal days; each market>=10 signal days and positive edge; nonoverlap net>0; unresolved data/execution issues reviewed. Insufficient evidence stays unadopted. No automatic order enablement.", "schedule_limit": "Competition runs 2026-10-12 through 2026-11-20. Pre-competition Oct9 review is diagnostics only; enough prospective evidence is not promised by the start or end. Do not keep extending the sample until a pass.", "clock": "Only sessions completed after frozen_at with signal sealed before the next session opening qualify. Old bars are bootstrap; delayed creation is late. Never rewrite sealed signals."},
+  "allocation": null,
+  "maximum_positions": null,
+  "order_enabled": false,
+  "sources": [
+    "https://www.adamhgrimes.com/fundamental-trading-patterns/",
+    "https://academicweb.nd.edu/~zda/Reversal.pdf",
+    "https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf"
+  ],
+  "source_limits": "Grimes provides structural inspiration; SMA lengths, two-day pullback, close confirmation and five-day hold are our unvalidated operational definition. US monthly reversal research does not establish Korean daily profitability. Existing fixed-universe, revision and survival limitations remain. One current hypothesis does not erase previous multiple trials."
+}

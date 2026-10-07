@@ -1,0 +1,6 @@
+# Isolated offline research environment; not a dashboard/backend dependency.
+numpy==2.3.5
+pandas==3.0.1
+matplotlib==3.11.2
+# AGPL-3.0; optional independent offline verifier only.
+backtesting==0.6.6

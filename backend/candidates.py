@@ -11,7 +11,7 @@ import tempfile
 import threading
 
 from backend.chart import _date, _ohlcv, _rows
-from backend.candidate_features import candidate_features
+from backend.candidate_features import InsufficientFeatureHistory, candidate_features
 from backend.candidate_history import HistoryCache
 from backend.kis import KST, KisError, ROOT, _quote_number, client_for_profile, load_profiles
 from backend.market import load_market_settings
@@ -163,7 +163,7 @@ def _valid_screening(screening, rows):
 
 class CandidateService:
     def __init__(self, config_path=ROOT / "config.local.toml", *, universe_loader=load_universe,
-                 client_factory=client_for_profile, directory=None, now=None, selector=None):
+                 client_factory=client_for_profile, directory=None, now=None, selector=None, observer=None):
         self.config_path = Path(config_path)
         self.directory = Path(directory) if directory is not None else self.config_path.parent / ".local" / "candidates"
         self.universe_loader = universe_loader
@@ -173,6 +173,8 @@ class CandidateService:
             from backend.candidate_selection import CandidateSelector
             selector = CandidateSelector(now=self.now)
         self.selector = selector
+        self.observer = observer
+        self.source_metadata = {}
         self.history = HistoryCache(self.directory / "history")
         self.lock = threading.RLock()
         self.worker = None
@@ -308,13 +310,18 @@ class CandidateService:
             age = (self.now() - datetime.fromisoformat(saved["observed_at"])).total_seconds()
             if (saved["version"] == 1 and saved["end"] == end.isoformat()
                     and age >= 0 and (ttl_seconds is None or age < ttl_seconds)):
+                self.source_metadata[key] = {"observed_at": saved["observed_at"],
+                                             "raw_sha256": hashlib.sha256(json.dumps(saved["data"], sort_keys=True).encode()).hexdigest()}
                 return validate(saved["data"])
         except Exception:
             pass
         data = fetch()
         parsed = validate(data)
+        observed_at = self.now().astimezone(timezone.utc).isoformat()
         _write_json(path, {"version": 1, "end": end.isoformat(), "source": "KIS paper KRX",
-                           "observed_at": self.now().astimezone(timezone.utc).isoformat(), "data": data})
+                           "observed_at": observed_at, "data": data})
+        self.source_metadata[key] = {"observed_at": observed_at,
+                                     "raw_sha256": hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()}
         return parsed
 
     def _run(self, universe):
@@ -331,10 +338,14 @@ class CandidateService:
     def _fail(self, message):
         with self.lock:
             self.state.update(status="error", error=message, stale=bool(self.state["rows"]))
+        if self.observer is not None:
+            self.observer.fail(message)
 
     def _collect(self, universe):
         policy = self._policy()
         selecting = policy[0] is not None
+        observing = self.observer is not None
+        self.source_metadata = {}
         settings = load_market_settings(self.config_path)
         profile = load_profiles(self.config_path).select(settings.account)
         profile.settings.validate_credentials()
@@ -356,11 +367,13 @@ class CandidateService:
             raise KisError("코스피·코스닥 비교 기간의 거래일이 일치하지 않습니다.")
         history_start = as_of - timedelta(days=600)
         feature_indices, feature_windows, feature_errors, features = {}, {}, {}, {}
-        if selecting:
+        observation_histories, observation_errors, known_ineligible = {}, {}, {}
+        if selecting or observing:
+            sessions = max(policy[1] or 21, self.observer.minimum_sessions if observing else 21)
             for board, series in indices.items():
                 code = BENCHMARKS[board]
                 try:
-                    expanded = self.history.extend("index", code, series, policy[1],
+                    expanded = self.history.extend("index", code, series, sessions,
                         lambda cursor, code=code: index_series(
                             client.index_daily(history_start.isoformat(), cursor.isoformat(), code),
                             history_start, cursor, minimum=0))
@@ -376,38 +389,55 @@ class CandidateService:
         rows = []
         for stock in universe["rows"]:
             symbol, board = stock["symbol"], stock["board"]
+            parsed = None
             row = {**stock, "status": "ok", "error": None, "as_of": as_of.isoformat(),
                    **dict.fromkeys(METRICS)}
             try:
-                def validate_stock(data):
-                    parsed = stock_series(data, symbol, start, as_of)
-                    return parsed, calculate_metrics(parsed, indices[board], windows[board])
-
-                parsed, metrics = self._cached("stock-" + symbol, as_of,
+                parsed = self._cached("stock-" + symbol, as_of,
                     lambda: client.chart_daily(symbol, start, as_of),
-                    validate_stock)
-                row.update(metrics)
+                    lambda data: stock_series(data, symbol, start, as_of))
+                row.update(calculate_metrics(parsed, indices[board], windows[board]))
             except InsufficientHistory as error:
                 row.update(status="excluded", error=str(error))
             except KisError as error:
                 row.update(status="error", error=str(error))
             except Exception:
                 row.update(status="error", error="종목 일봉 조회·저장에 실패했습니다.")
-            if selecting:
+            if selecting or observing:
                 if row["status"] != "ok":
                     features[symbol] = {"error": row["error"]}
-                elif board in feature_errors:
+                if board in feature_errors:
                     features[symbol] = {"error": feature_errors[board]}
-                else:
+                    observation_errors[symbol] = feature_errors[board]
+                elif parsed:
                     try:
                         expanded = self.history.extend("stock", symbol, parsed, feature_windows[board],
                             lambda cursor: stock_series(client.chart_daily(symbol, history_start, cursor),
                                                         symbol, history_start, cursor))
-                        features[symbol] = candidate_features(expanded, feature_indices[board], feature_windows[board])
+                        if observing:
+                            observation_histories[symbol] = expanded
+                        calendar = feature_windows[board]
+                        if expanded and len(expanded) < 61 and sorted(expanded) == calendar[-len(expanded):]:
+                            known_ineligible[symbol] = {"eligible": False, "reason": "insufficient_contiguous_history",
+                                                        "available_sessions": len(expanded), "required_sessions": 61}
+                        elif (len(calendar) >= 61 and all(day in expanded for day in calendar[-61:])
+                              and any(expanded[day]["volume"] == 0 for day in calendar[-20:])):
+                            known_ineligible[symbol] = {"eligible": False, "reason": "zero_volume_in_recent_20_sessions"}
+                        if selecting and row["status"] == "ok":
+                            features[symbol] = candidate_features(expanded, feature_indices[board], feature_windows[board])
+                    except InsufficientFeatureHistory as error:
+                        features[symbol] = {"error": str(error)}
+                        calendar = feature_windows[board]
+                        if symbol not in known_ineligible:
+                            observation_errors[symbol] = str(error)
                     except KisError as error:
                         features[symbol] = {"error": str(error)}
+                        observation_errors[symbol] = str(error)
                     except Exception:
                         features[symbol] = {"error": "선별용 종목 과거 이력·지표를 계산하지 못했습니다."}
+                        observation_errors[symbol] = features[symbol]["error"]
+                else:
+                    observation_errors[symbol] = row["error"] or "일봉 입력 없음"
             rows.append(row)
             with self.lock:
                 self.state["progress"] = {"completed": len(rows), "total": len(universe["rows"])}
@@ -433,3 +463,11 @@ class CandidateService:
         _write_json(self.directory / "latest.json", {"version": 1, "identity": identity, "state": result})
         with self.lock:
             self.identity, self.state = identity, result
+        if observing:
+            try:
+                self.observer.observe(universe=universe, result=deepcopy(result), histories=observation_histories,
+                                      calendars=feature_windows, indices=feature_indices,
+                                      errors=observation_errors, sources=deepcopy(self.source_metadata),
+                                      known_ineligible=known_ineligible)
+            except Exception:
+                self.observer.fail("완료 일봉의 연구 관찰 기록을 저장하지 못했습니다. 다음 수집 때 다시 확인합니다.")

@@ -5,6 +5,7 @@ export const pages = [
   { id: 'account', label: '내 계좌' },
   { id: 'trades', label: '거래 내역' },
   { id: 'candidates', label: '후보 탐색' },
+  { id: 'experiments', label: '실험실' },
   { id: 'chart', label: '시세·차트' },
 ] as const;
 export type PageId = typeof pages[number]['id'];

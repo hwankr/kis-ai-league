@@ -6,6 +6,8 @@ import TradeHistory from './components/TradeHistory';
 import MarketQuotes from './components/MarketQuotes';
 import StockChart from './components/StockChart';
 import CandidateComparison from './components/CandidateComparison';
+import ResearchObservation from './components/ResearchObservation';
+import ExperimentLab from './components/ExperimentLab';
 import { number, percent, signClass, timestamp } from './format';
 import useAccountDashboard from './useAccountDashboard';
 import useMarketData from './useMarketData';
@@ -81,15 +83,15 @@ export default function App() {
         <nav className="header-nav" aria-label="메인 메뉴">{pages.map(page => <a key={page.id}
           href={page.id === 'chart' && chart.request ? chartHref(chart.request) : `#/${page.id}`}
           aria-current={route.page === page.id ? 'page' : undefined}>{page.label}</a>)}</nav>
-        <div className="header-meta"><span className="environment-badge">모의투자</span><span className="read-only">조회 전용</span></div>
+        <div className="header-meta"><span className="environment-badge">모의투자</span></div>
       </div>
     </header>
 
     <main id="main-content" ref={content} tabIndex={-1}>
       <div className="page-heading">
         <h1 id="page-title" tabIndex={-1}>{route.title}</h1>
-        <div className="refresh-controls" inert={route.page === 'candidates'} aria-hidden={route.page === 'candidates'}
-          style={{ visibility: route.page === 'candidates' ? 'hidden' : undefined }}>
+        <div className="refresh-controls" hidden={route.page === 'experiments'} inert={route.page === 'candidates' || route.page === 'experiments'} aria-hidden={route.page === 'candidates' || route.page === 'experiments'}
+          style={{ visibility: route.page === 'candidates' || route.page === 'experiments' ? 'hidden' : undefined }}>
           <label className="auto-refresh-control">
             <span>30초 자동 갱신</span>
             <input id="auto-refresh" type="checkbox" role="switch" checked={dashboard.autoRefresh} onChange={event => dashboard.setAutoRefresh(event.target.checked)}/>
@@ -147,6 +149,7 @@ export default function App() {
           loading={dashboard.trades.loading} error={dashboard.trades.error} onQuery={dashboard.trades.query}/>
       </div>
       <div className="app-page page-content" hidden={route.page !== 'candidates'}>
+        {route.page === 'candidates' ? <ResearchObservation onSelectSymbol={symbol => { void queryChart(symbol, 'day'); }}/> : null}
         <CandidateComparison data={candidates.data} loading={candidates.loading} error={candidates.error}
           onStart={() => { void candidates.start(); }} onRefresh={() => { void candidates.refresh(); }} onSelectSymbol={selectSymbol}/>
       </div>
@@ -154,6 +157,9 @@ export default function App() {
         {route.invalidChart ? <p role="alert" className="history-error">차트 주소의 종목코드 또는 주기가 올바르지 않습니다.</p> : null}
         <StockChart chart={{ ...chart, query: queryChart }}/>
         <MarketQuotes data={market.data} loading={market.loading} error={market.error} onSelectSymbol={selectSymbol}/>
+      </div>
+      <div className="app-page page-content" hidden={route.page !== 'experiments'}>
+        {route.page === 'experiments' ? <ExperimentLab accounts={dashboard.accounts} onSelectSymbol={symbol => { void queryChart(symbol, 'day'); }}/> : null}
       </div>
       <footer className="page-footer"><span>KIS AI League</span>{accountPage ? <span id="account-label">{account?.name ?? '계좌 선택 필요'}</span> : null}</footer>
     </main>
