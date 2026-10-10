@@ -7,16 +7,18 @@ from unittest.mock import Mock, patch
 
 from backend.timefolio_mirror import local_status, main, process_lock
 from backend.timefolio_browser import match_receipt
-from backend.mirror_runtime import MirrorUnknown
+from backend.mirror_runtime import MirrorBlocked, MirrorUnknown
 
 
 class TimefolioCliTests(unittest.TestCase):
     def test_default_status_does_not_create_db_or_start_browser(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.local.toml"
-            with patch("backend.timefolio_browser.TimefolioBrowser.open", side_effect=AssertionError("browser opened")):
+            with patch("backend.timefolio_browser.TimefolioBrowser", side_effect=AssertionError("browser constructed")):
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(main(["--config", str(config)]), 0)
+                    self.assertEqual(main(["--config", str(config), "--headless",
+                                           "--browser-executable", str(Path(directory) / "missing.exe")]), 0)
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_lock_rejects_second_process_and_releases(self):
@@ -39,11 +41,14 @@ class TimefolioCliTests(unittest.TestCase):
                     with process_lock(lock):
                         pass
             browser.close.side_effect = close
-            with patch("backend.timefolio_browser.TimefolioBrowser", return_value=browser), \
+            with patch("backend.timefolio_browser.TimefolioBrowser", return_value=browser) as browser_class, \
                     patch("backend.mirror_source.TimefolioMirrorSource") as source, \
                     patch("backend.mirror_runtime.MirrorRuntime") as runtime, \
-                    patch("builtins.input", return_value=""), redirect_stdout(io.StringIO()):
+                    patch("builtins.input", return_value="") as login_input, redirect_stdout(io.StringIO()):
                 self.assertEqual(main(["login", "--config", str(config)]), 0)
+                browser_class.assert_called_once_with(config.resolve().parent / ".local" / "timefolio-browser",
+                                                      executable_path=None, headless=False)
+                login_input.assert_called_once()
                 source.assert_not_called()
                 runtime.assert_not_called()
             browser.open.assert_called_once()
@@ -51,6 +56,43 @@ class TimefolioCliTests(unittest.TestCase):
             browser.close.assert_called_once()
             with process_lock(lock):
                 pass
+
+    def test_headless_login_uses_saved_identity_without_input_or_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.local.toml"
+            executable = Path(directory) / "browser" / "chrome.exe"
+            browser = Mock()
+            output = io.StringIO()
+            with patch("backend.timefolio_browser.TimefolioBrowser", return_value=browser) as browser_class, \
+                    patch("backend.mirror_source.TimefolioMirrorSource") as source, \
+                    patch("backend.mirror_runtime.MirrorRuntime") as runtime, \
+                    patch("backend.experiment_store.ExperimentStore") as store, \
+                    patch("builtins.input", side_effect=AssertionError("headless input")), redirect_stdout(output):
+                self.assertEqual(main(["login", "--config", str(config), "--headless",
+                                       "--browser-executable", str(executable)]), 0)
+                browser_class.assert_called_once_with(config.resolve().parent / ".local" / "timefolio-browser",
+                                                      executable_path=executable, headless=True)
+                source.assert_not_called()
+                runtime.assert_not_called()
+                store.assert_not_called()
+            browser.open.assert_called_once()
+            browser.identity.assert_called_once()
+            browser.close.assert_called_once()
+            self.assertNotIn("별도 Chrome", output.getvalue())
+
+    def test_headless_login_failure_closes_without_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            browser = Mock()
+            browser.identity.side_effect = MirrorBlocked("timefolio_login_required")
+            with patch("backend.timefolio_browser.TimefolioBrowser", return_value=browser), \
+                    patch("backend.mirror_runtime.MirrorRuntime") as runtime, \
+                    patch("backend.experiment_store.ExperimentStore") as store, \
+                    patch("builtins.input", side_effect=AssertionError("headless input")), redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["login", "--headless", "--config", str(Path(directory) / "config.toml")]), 1)
+                runtime.assert_not_called()
+                store.assert_not_called()
+            browser.identity.assert_called_once()
+            browser.close.assert_called_once()
 
     def test_run_without_existing_dashboard_db_does_not_open_browser(self):
         with tempfile.TemporaryDirectory() as directory:

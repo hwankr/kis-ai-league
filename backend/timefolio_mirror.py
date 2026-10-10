@@ -82,6 +82,8 @@ def main(argv=None):
     parser.add_argument("--dashboard", default="http://127.0.0.1:8765")
     parser.add_argument("--config", type=Path, default=ROOT / "config.local.toml")
     parser.add_argument("--interval", type=int, default=30, help="회차 종료 후 대기 초 (10~300)")
+    parser.add_argument("--browser-executable", type=Path, help="사용할 Chrome 실행 파일")
+    parser.add_argument("--headless", action="store_true", help="창 없이 저장된 로그인 사용")
     args = parser.parse_args(argv)
     if not 10 <= args.interval <= 300:
         parser.error("--interval은 10~300초입니다.")
@@ -99,15 +101,17 @@ def main(argv=None):
     from backend.mirror_runtime import MirrorRuntime
     from backend.mirror_source import TimefolioMirrorSource
     from backend.timefolio_browser import TimefolioBrowser
-    browser = TimefolioBrowser(directory / "timefolio-browser")
+    browser = TimefolioBrowser(directory / "timefolio-browser",
+                              executable_path=args.browser_executable, headless=args.headless)
     try:
         with process_lock(directory / "timefolio-mirror.lock"):
             try:
                 if args.command == "run" and not db_path.exists():
                     raise ValueError("먼저 기존 프로젝트 대시보드를 실행하세요.")
                 browser.open()
-                print("별도 Chrome 창에서 타임폴리오에 로그인하세요. 기존 Chrome 로그인은 복사하지 않습니다.", flush=True)
-                input("로그인을 마쳤으면 Enter (종료 Ctrl+C): ")
+                if not args.headless:
+                    print("별도 Chrome 창에서 타임폴리오에 로그인하세요. 기존 Chrome 로그인은 복사하지 않습니다.", flush=True)
+                    input("로그인을 마쳤으면 Enter (종료 Ctrl+C): ")
                 browser.identity()
                 if args.command == "login":
                     print("로그인 확인 완료. 주문 연동은 실행하지 않았습니다.")

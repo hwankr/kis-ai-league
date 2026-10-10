@@ -1,6 +1,10 @@
-"""Pure fake DOM/download tests. Never opens Playwright or contacts a website."""
+"""Fake adapter tests and optional local HTML checks. Never contacts a website."""
 from copy import deepcopy
 from datetime import datetime
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -135,6 +139,12 @@ class FakePage:
         self.alert_messages = []
         self.contest, self.portfolio_id = CONTEST, "pf13"
         self.responses = []
+        self.response_candidates = None
+        self.selected_response = None
+        self.finished_candidates = None
+        self.finished_requests = []
+        self.finish_error = None
+        self.evaluations = []
         self.download = SimpleNamespace(path=lambda: "offline-fake.csv", delete=Mock())
 
     def get_by_role(self, role, name=None, **kwargs):
@@ -145,6 +155,7 @@ class FakePage:
         return FakeLocator(self, selector)
 
     def evaluate(self, expression):
+        self.evaluations.append(expression)
         return None
 
     def expect_response(self, predicate, **kwargs):
@@ -153,9 +164,12 @@ class FakePage:
         urls += [ORIGIN + "/Portfolio/" + name for name in ("Session", "Orders", "Universe")]
         candidates = [SimpleNamespace(url=url, request=SimpleNamespace(method="GET"),
                       ok=self.validation_ok if "ValidateProduct" in url else True, finished=lambda: None) for url in urls]
+        if self.response_candidates is not None:
+            candidates = self.response_candidates
         response = next((candidate for candidate in candidates if predicate(candidate)), None)
         if response is None:
             raise TimeoutError("fake validation did not match requested product/date/side")
+        self.selected_response = response
         self.responses.append(response.url)
         event = SimpleNamespace(value=response)
 
@@ -164,6 +178,31 @@ class FakePage:
                 return event
 
             def __exit__(self, *args):
+                return False
+
+        return Context()
+
+    def expect_request_finished(self, predicate, **kwargs):
+        page = self
+        event = SimpleNamespace(value=None)
+
+        class Context:
+            def __enter__(self):
+                return event
+
+            def __exit__(self, exc_type, *args):
+                if exc_type:
+                    return False
+                if page.finish_error:
+                    raise page.finish_error
+                candidates = page.finished_candidates
+                if candidates is None:
+                    candidates = [page.selected_response.request]
+                request = next((request for request in candidates if predicate(request)), None)
+                if request is None:
+                    raise TimeoutError("fake selected request did not finish")
+                page.finished_requests.append(request)
+                event.value = request
                 return False
 
         return Context()
@@ -196,6 +235,70 @@ class TimefolioBrowserTests(unittest.TestCase):
 
     def submit_clicks(self):
         return self.page.clicks.count('button[type="submit"]')
+
+    def test_ui_query_accepts_same_origin_get_with_optional_api_prefix(self):
+        for prefix in ("", "/api"):
+            with self.subTest(prefix=prefix):
+                url = ORIGIN + prefix + "/Portfolio/Orders?period=A"
+                self.page.response_candidates = [SimpleNamespace(
+                    url=url, request=SimpleNamespace(method="GET"), ok=True, finished=lambda: None)]
+                action = Mock()
+                self.browser._ui_query("/Portfolio/Orders", action)
+                action.assert_called_once_with()
+                self.assertEqual(self.page.responses[-1], url)
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_ui_query_rejects_wrong_endpoint_origin_or_method(self):
+        for prefix in ("", "/api"):
+            path = prefix + "/Portfolio/Orders"
+            for url, method in (
+                (ORIGIN + prefix + "/Portfolio/Session", "GET"),
+                ("https://example.invalid" + path, "GET"),
+                ("http://contest.timefolio.net" + path, "GET"),
+                (ORIGIN + path, "POST"),
+            ):
+                with self.subTest(url=url, method=method):
+                    self.page.response_candidates = [SimpleNamespace(
+                        url=url, request=SimpleNamespace(method=method), ok=True, finished=lambda: None)]
+                    with self.assertRaises(TimeoutError):
+                        self.browser._ui_query("/Portfolio/Orders", Mock())
+        self.assertEqual(self.page.responses, [])
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_ui_query_waits_for_selected_request_not_same_url_request(self):
+        url = ORIGIN + "/api/Portfolio/Orders"
+        selected = SimpleNamespace(url=url, method="GET")
+        other = SimpleNamespace(url=url, method="GET")
+        self.page.response_candidates = [SimpleNamespace(url=url, request=selected, ok=True)]
+        self.page.finished_candidates = [other, selected]
+        self.browser._ui_query("/Portfolio/Orders", Mock())
+        self.assertIs(self.page.finished_requests[-1], selected)
+        self.page.finished_candidates = [other]
+        with self.assertRaisesRegex(TimeoutError, "selected request did not finish"):
+            self.browser._ui_query("/Portfolio/Orders", Mock())
+
+    def test_ui_query_http_failure_blocks_without_waiting_for_body(self):
+        response = SimpleNamespace(url=ORIGIN + "/api/Portfolio/Orders",
+                                   request=SimpleNamespace(method="GET"), ok=False)
+        self.page.response_candidates = [response]
+        self.page.finish_error = AssertionError("HTTP failure must not wait for the body")
+        with self.assertRaisesRegex(MirrorBlocked, "destination_read_failed"):
+            self.browser._ui_query("/Portfolio/Orders", Mock())
+        self.assertEqual(self.page.finished_requests, [])
+        self.assertEqual(self.page.evaluations, [])
+
+    def test_request_completion_failure_blocks_query_and_product_validation(self):
+        failure = TimeoutError("request body did not finish")
+        self.page.finish_error = failure
+        for action in (lambda: self.browser._ui_query("/Portfolio/Orders", Mock()),
+                       lambda: self.browser._select_validated(
+                           FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930")):
+            with self.subTest(action=action):
+                with self.assertRaises(TimeoutError) as caught:
+                    action()
+                self.assertIs(caught.exception, failure)
+        self.assertEqual(self.page.evaluations, [])
+        self.assertEqual(self.submit_clicks(), 0)
 
     def test_submit_confirms_exact_new_receipt_with_one_click(self):
         self.browser.receipt_snapshot = Mock(return_value={"verified": True, "session_date": "2026-10-12", "account_key": "account", "contest": CONTEST,
@@ -518,6 +621,89 @@ class TimefolioBrowserTests(unittest.TestCase):
         with self.assertRaisesRegex(MirrorBlocked, "changed_during_scroll"):
             self.browser._grid_dom(SimpleNamespace(evaluate=evaluate), expected=3)
         self.assertEqual(position["top"], 40)
+
+
+class TimefolioGridDOMBrowserTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from playwright.sync_api import Error, sync_playwright
+        except ModuleNotFoundError as error:
+            if error.name and error.name.startswith("playwright"):
+                raise unittest.SkipTest("Optional Playwright is not installed") from None
+            raise
+        cls.playwright = sync_playwright().start()
+        cls.addClassCleanup(cls.playwright.stop)
+        try:
+            cls.browser = cls.playwright.chromium.launch(channel="chrome", headless=True)
+        except Error as error:
+            if "Executable doesn't exist" in str(error) or "distribution 'chrome' is not found" in str(error):
+                raise unittest.SkipTest("Optional Chrome is not installed") from None
+            raise
+        cls.addClassCleanup(cls.browser.close)
+
+    def setUp(self):
+        context = self.browser.new_context()
+        self.addCleanup(context.close)
+        context.route("**/*", lambda route: route.abort())
+        self.page = context.new_page()
+        self.page.set_content("""<div class="space-y-1"><table id="outer">
+          <thead><tr>
+            <th><button><span>종목</span><span style="background-color: yellow;"></span></button></th>
+            <th><button><span>잔고 / 비중 / 평가액</span></button></th>
+            <th><button><span>손익률 / 손익</span></button></th>
+          </tr><tr>
+            <th id="prodId"><button>코드<span id="filter" style="background-color: yellow;"></span></button></th>
+          </tr></thead><tbody><tr><td id="nested"></td></tr></tbody>
+        </table></div>""")
+
+    def test_group_header_labels_with_empty_filter_badges_are_unfiltered(self):
+        result = self.page.locator("#outer").evaluate(GRID_DOM)
+        self.assertFalse(result["filtered"])
+        self.assertEqual(result["headers"], [{"id": "prodId", "text": "코드"}])
+
+    def test_nonempty_yellow_filter_badge_is_filtered(self):
+        self.page.locator("#filter").evaluate("e => e.textContent = '005930'")
+        self.assertTrue(self.page.locator("#outer").evaluate(GRID_DOM)["filtered"])
+
+    def test_filter_in_nested_table_does_not_filter_parent(self):
+        self.page.locator("#nested").evaluate("""e => e.innerHTML = `<table id="inner">
+          <thead><tr><th id="nestedCode"><button>코드
+            <span style="background-color: yellow;">005930</span>
+          </button></th></tr></thead><tbody></tbody></table>`""")
+        self.assertFalse(self.page.locator("#outer").evaluate(GRID_DOM)["filtered"])
+        self.assertTrue(self.page.locator("#inner").evaluate(GRID_DOM)["filtered"])
+
+    def test_completed_local_ui_request_closes_without_unhandled_task_warning(self):
+        script = textwrap.dedent(r'''
+            import gc
+            from playwright.sync_api import sync_playwright
+            from backend.timefolio_browser import TimefolioBrowser
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(channel="chrome", headless=True)
+                context = browser.new_context(service_workers="block")
+                html = """<button id="orders" onclick="fetch('/api/Portfolio/Orders')">Orders</button>"""
+                def fulfill(route):
+                    fixture = route.request.url.endswith("/fixture")
+                    route.fulfill(status=200, content_type="text/html" if fixture else "application/json",
+                                  body=html if fixture else "{}")
+                context.route("**/*", fulfill)
+                page = context.new_page()
+                page.goto("https://contest.timefolio.net/fixture")
+                adapter = TimefolioBrowser("unused-local-fixture-profile")
+                adapter.page = page
+                adapter._ui_query("/Portfolio/Orders", page.locator("#orders").click)
+                context.close()
+                browser.close()
+                gc.collect()
+            gc.collect()
+        ''')
+        result = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[1],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Task exception was never retrieved", result.stderr)
+        self.assertNotIn("Target closed", result.stderr)
 
 
 if __name__ == "__main__":

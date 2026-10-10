@@ -36,7 +36,9 @@ GRID_DOM = """table => {
        badges:Array.from(c.querySelectorAll('[title]')).map(e=>({text:e.innerText,title:e.title})),
        progress:Array.from(c.querySelectorAll('progress')).map(e=>({value:e.value,max:e.max}))}
      ]))})),
-   filtered: direct('thead button span').some(e=>e.textContent.trim()),
+   // Group labels also use spans; only yellow badges contain filter values.
+   filtered: direct('thead button span').some(e=>
+     getComputedStyle(e).backgroundColor==='rgb(255, 255, 0)' && e.textContent.trim()),
    // Count text, when present, must also agree with the unfiltered CSV.
    count_text: table.closest('.space-y-1')?.innerText.match(/선택[^\\n]*전체[^\\n]*/)?.[0] || ''
  };
@@ -83,11 +85,14 @@ def match_receipt(proposal, orders, *, order_id=None):
 
 
 class TimefolioBrowser:
-    def __init__(self, profile_dir, *, contest=CONTEST, channel="chrome", now=None, sleep=None):
+    def __init__(self, profile_dir, *, contest=CONTEST, channel="chrome",
+                 executable_path=None, headless=False, now=None, sleep=None):
         if contest != CONTEST:
             raise ValueError("unsupported_contest")
         self.profile_dir = Path(profile_dir)
         self.contest, self.channel = contest, channel
+        self.executable_path = str(Path(executable_path).resolve()) if executable_path else None
+        self.headless = headless
         self.now = now or (lambda: datetime.now(KST))
         self.sleep = sleep or time.sleep
         self.page = self.context = self.playwright = None
@@ -103,7 +108,8 @@ class TimefolioBrowser:
         self.playwright = sync_playwright().start()
         try:
             self.context = self.playwright.chromium.launch_persistent_context(
-                str(self.profile_dir), channel=self.channel, headless=False,
+                str(self.profile_dir), channel=None if self.executable_path else self.channel,
+                executable_path=self.executable_path, headless=self.headless,
                 accept_downloads=True, viewport={"width": 1500, "height": 1000})
             self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
             self.page.set_default_timeout(15000)
@@ -210,12 +216,26 @@ class TimefolioBrowser:
         def matches(response):
             url = urlsplit(response.url)
             return (url.scheme == "https" and url.netloc == "contest.timefolio.net"
-                    and url.path == path and response.request.method == "GET")
-        with self.page.expect_response(matches, timeout=15000) as event:
-            action()
-        response = event.value
-        if not response.ok or response.finished() is not None:
-            raise MirrorBlocked("destination_read_failed")
+                    and url.path in {path, "/api" + path} and response.request.method == "GET")
+        self._ui_response(matches, action, "destination_read_failed")
+
+    def _ui_response(self, matches, action, error):
+        selected = None
+
+        def select(response):
+            nonlocal selected
+            if matches(response):
+                selected = response.request
+                return True
+            return False
+
+        # Response.finished() in Playwright 1.63 leaves a close-watcher task.
+        # Keep the response match and wait for that exact request's body instead.
+        with self.page.expect_request_finished(lambda request: request is selected, timeout=15000):
+            with self.page.expect_response(select, timeout=15000) as event:
+                action()
+            if not event.value.ok:
+                raise MirrorBlocked(error)
         self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
 
     def _open_order(self):
@@ -346,12 +366,7 @@ class TimefolioBrowser:
                     and query.get("entry") == ["true" if side == "buy" else "false"])
         # Observe completion of the request caused by the UI, never send it or
         # read its response body. Validation results are read from the form.
-        with self.page.expect_response(matches, timeout=15000) as event:
-            suggestion.click()
-        response = event.value
-        if not response.ok or response.finished() is not None:
-            raise MirrorBlocked("destination_stock_validation_failed")
-        self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        self._ui_response(matches, suggestion.click, "destination_stock_validation_failed")
 
     def _date(self):
         values = self.page.locator("input[name=d]").evaluate_all("es=>es.map(e=>e.value)")
