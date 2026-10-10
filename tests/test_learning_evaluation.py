@@ -141,7 +141,8 @@ class EvaluationTests(unittest.TestCase):
     def test_synthetic_loop_consumes_invalid_slots_without_immediate_retry(self):
         from scripts.validate_learning import validate_loops
         path = daily_metrics([0.] * 40)
-        with patch("scripts.validate_learning._trial", return_value=(path, path, 0., 0., 0., True)) as trial:
+        truth = {'beneficial': False, 'post_regime_effect': None}
+        with patch("scripts.validate_learning._trial", return_value=(path, path, 0., 0., 0., True, truth)) as trial:
             report = validate_loops(histories=2, trials=5, repetitions=199, horizons=(40,))
         self.assertEqual(trial.call_count, 2 * 5 * 3)
         self.assertIsNone(report["selected_horizon"])
