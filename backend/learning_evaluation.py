@@ -9,32 +9,55 @@ import hashlib
 import json
 import math
 import random
+from statistics import NormalDist
 
 
-EVALUATION_VERSION = "paired-block-paper-v1"
+EVALUATION_VERSION = "paired-block-paper-v2"
 DEFAULT_HORIZON = 60
 HORIZONS = (40, 60, 120)
 CAMPAIGN_SIZE = 5
 CAMPAIGN_ALPHA = .10
-BOOTSTRAP_REPETITIONS = 999
 BLOCK_LENGTHS = (10, 20)
+MC_ERROR_FRACTION = .25
+MC_CONFIDENCE = .95
 
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def make_evaluation_spec(sequence, horizon=DEFAULT_HORIZON, *, bootstrap_repetitions=BOOTSTRAP_REPETITIONS):
+def make_evaluation_spec(sequence, horizon=DEFAULT_HORIZON, *, bootstrap_repetitions=None,
+                         candidate_count=1, candidate_index=1, scenario_ids=('base',),
+                         mc_error=None, mc_confidence=MC_CONFIDENCE):
     """Freeze this before observing evaluation outcomes; invalid trials use a slot."""
     if type(sequence) is not int or sequence < 1 or type(horizon) is not int or horizon not in HORIZONS:
         raise ValueError("invalid_evaluation_sequence_or_horizon")
-    if type(bootstrap_repetitions) is not int or not 199 <= bootstrap_repetitions <= 20000:
+    if type(candidate_count) is not int or candidate_count not in (1, 2) or type(candidate_index) is not int or not 1 <= candidate_index <= candidate_count:
+        raise ValueError("invalid_evaluation_candidates")
+    if not isinstance(scenario_ids, (list, tuple)) or not 1 <= len(scenario_ids) <= 8 or any(
+            not isinstance(item, str) or not item or len(item) > 80 for item in scenario_ids) or len(set(scenario_ids)) != len(scenario_ids):
+        raise ValueError("invalid_execution_scenarios")
+    alpha = CAMPAIGN_ALPHA / CAMPAIGN_SIZE / candidate_count
+    if mc_error is None:
+        mc_error = alpha * MC_ERROR_FRACTION
+    if type(mc_error) not in (int, float) or not math.isfinite(mc_error) or not .001 <= mc_error <= .01:
+        raise ValueError("invalid_mc_error")
+    if mc_confidence != MC_CONFIDENCE:
+        raise ValueError("invalid_mc_confidence")
+    z = NormalDist().inv_cdf((1 + mc_confidence) / 2)
+    planned = math.ceil(z * z * alpha * (1 - alpha) / mc_error ** 2)
+    if bootstrap_repetitions is None:
+        bootstrap_repetitions = planned
+    if type(bootstrap_repetitions) is not int or not 199 <= bootstrap_repetitions <= 200000:
         raise ValueError("invalid_bootstrap_repetitions")
     value = {"version": EVALUATION_VERSION, "phase": "paper_provisional", "sequence": sequence,
              "horizon": horizon, "campaign": (sequence - 1) // CAMPAIGN_SIZE + 1,
              "campaign_trial": (sequence - 1) % CAMPAIGN_SIZE + 1,
              "campaign_size": CAMPAIGN_SIZE, "campaign_alpha": CAMPAIGN_ALPHA,
-             "test_alpha": CAMPAIGN_ALPHA / CAMPAIGN_SIZE,
+             "window_alpha": CAMPAIGN_ALPHA / CAMPAIGN_SIZE, "test_alpha": alpha,
+             "candidate_count": candidate_count, "candidate_index": candidate_index,
+             "scenario_ids": list(scenario_ids), "mc_error": float(mc_error), "mc_confidence": mc_confidence,
+             "planned_bootstrap_repetitions": planned,
              "bootstrap_repetitions": bootstrap_repetitions, "block_lengths": list(BLOCK_LENGTHS),
              "minimum_relative_growth": .01, "maximum_drawdown_pct": 15.,
              "maximum_drawdown_worsening_pp": 2., "recent_intervals": horizon // 3,
@@ -46,7 +69,10 @@ def _validate_spec(spec):
     if not isinstance(spec, dict):
         raise ValueError("invalid_evaluation_spec")
     expected = make_evaluation_spec(spec.get("sequence"), spec.get("horizon"),
-                                    bootstrap_repetitions=spec.get("bootstrap_repetitions"))
+                                    bootstrap_repetitions=spec.get("bootstrap_repetitions"),
+                                    candidate_count=spec.get("candidate_count"), candidate_index=spec.get("candidate_index"),
+                                    scenario_ids=spec.get("scenario_ids"), mc_error=spec.get("mc_error"),
+                                    mc_confidence=spec.get("mc_confidence"))
     if spec != expected:
         raise ValueError("evaluation_spec_changed")
     return expected
@@ -95,6 +121,16 @@ def _quantile(values, probability):
     return values[min(len(values) - 1, max(0, math.ceil(probability * len(values)) - 1))]
 
 
+def _mc_interval(exceedances, repetitions, confidence):
+    """Wilson interval for simulation noise, NOT uncertainty in market evidence."""
+    probability = exceedances / repetitions
+    z = NormalDist().inv_cdf((1 + confidence) / 2)
+    divisor = 1 + z * z / repetitions
+    center = (probability + z * z / (2 * repetitions)) / divisor
+    width = z * math.sqrt(probability * (1 - probability) / repetitions + z * z / (4 * repetitions ** 2)) / divisor
+    return [max(0., center - width), min(1., center + width)]
+
+
 def paired_block_bootstrap(components, deltas, spec):
     """Resample identical circular date blocks across every paired comparison.
 
@@ -123,11 +159,18 @@ comparisons and both block lengths must pass; they are not independent tests.
         stats = {}
         for name, values in zip(names, draws):
             observed = means[name] - deltas[name]
-            stats[name] = {"p_value": (1 + sum(value >= observed for value in values)) / (repetitions + 1),
+            # Algebraically identical boundary paths can differ by floating-point
+            # cancellation. Never turn that difference into zero bootstrap tails.
+            exceedances = sum(value >= observed - 1e-12 for value in values)
+            stats[name] = {"p_value": (1 + exceedances) / (repetitions + 1),
+                           "mc_interval": _mc_interval(exceedances, repetitions, spec['mc_confidence']),
                            "daily_lower_bound": means[name] - _quantile(values, 1 - alpha)}
         result[str(block_length)] = stats
     return {"blocks": result,
             "p_max": max(item["p_value"] for block in result.values() for item in block.values()),
+            "mc_lower_max": max(item['mc_interval'][0] for block in result.values() for item in block.values()),
+            "mc_upper_max": max(item['mc_interval'][1] for block in result.values() for item in block.values()),
+            "mc_confidence": spec['mc_confidence'], "bootstrap_repetitions": repetitions,
             "minimum_p_resolution": 1 / (repetitions + 1),
             "interpretation": "model_conditional_bootstrap; no_lifetime_error_guarantee"}
 
@@ -185,8 +228,11 @@ Fixed-period NAV changes already contain cash, costs and unrealized holdings.
         deltas = {key: minimum / n if key.endswith("incumbent") else 0. for key in components}
         bootstrap = paired_block_bootstrap(components, deltas, spec)
         result["statistics"].update(bootstrap)
-        if bootstrap["p_max"] <= spec["test_alpha"]:
+        if bootstrap["p_max"] <= spec["test_alpha"] and bootstrap['mc_upper_max'] < spec['test_alpha']:
             result.update(decision="promote", reason="고정 기간 비용·불확실성·낙폭 기준 통과: 모의 정책 교체")
+        elif bootstrap['mc_lower_max'] <= spec['test_alpha'] <= bootstrap['mc_upper_max']:
+            result['statistics']['mc_uncertain'] = True
+            result['reason'] = '재표본화 계산 오차가 판정 경계에 걸려 교체 근거 부족'
         else:
             result["reason"] = "블록 재표본화에서 개선 근거가 충분하지 않음"
         return result
@@ -197,6 +243,53 @@ Fixed-period NAV changes already contain cash, costs and unrealized holdings.
             "missing_evaluation_dates", "invalid_evaluation_dates", "cost_scenarios_not_aligned", "portfolios_not_date_paired"
         } else "invalid_evaluation_input"
         return result
+
+
+def evaluate_scenarios(scenarios, spec, *, support):
+    """All preregistered fill environments must support the same replacement.
+
+    Support describes observed execution coverage; a sample count alone is not
+    evidence. Missing coverage means keep; malformed/missing replay data mean
+    invalid. Scenario names are frozen in the evaluation spec, not selected here.
+    """
+    invalid = {'decision': 'invalid', 'reason': '고정한 체결 가정의 비교 자료를 확인할 수 없습니다.',
+               'phase': 'paper_provisional', 'statistics': {'error': 'invalid_execution_scenarios'}}
+    try:
+        spec = _validate_spec(spec)
+        if not isinstance(scenarios, list) or [item.get('id') for item in scenarios] != spec['scenario_ids']:
+            return invalid
+        if not isinstance(support, dict) or type(support.get('sufficient')) is not bool or not isinstance(support.get('reasons', []), list):
+            return invalid
+        results = {item['id']: evaluate_candidate(item['incumbent'], item['candidate'], spec) for item in scenarios}
+        invalid_result = next((item for item in results.values() if item['decision'] == 'invalid'), None)
+        if invalid_result:
+            return {**invalid_result, 'statistics': {**invalid_result['statistics'], 'scenarios': results}}
+        # Even valid individual pairs must cover exactly the same fixed window.
+        dates = []
+        for item in scenarios:
+            for side in ('incumbent', 'candidate'):
+                if item[side].get('valid') is True:
+                    dates.append(_series(item[side])[2][:spec['horizon'] + 1])
+        if dates and any(value != dates[0] for value in dates[1:]):
+            return invalid
+        statistics = {key: spec[key] for key in ('horizon', 'sequence', 'campaign', 'campaign_trial',
+                                               'campaign_alpha', 'window_alpha', 'test_alpha')}
+        statistics.update({'scenarios': results, 'support': support,
+                      'p_max': max((item['statistics']['p_max'] for item in results.values()
+                                    if 'p_max' in item['statistics']), default=None),
+                      'scenario_ids': list(spec['scenario_ids'])})
+        result = {'decision': 'waiting', 'reason': '고정 평가 기간 관측 중',
+                  'phase': 'paper_provisional', 'spec_id': spec['id'], 'statistics': statistics}
+        if any(item['decision'] == 'waiting' for item in results.values()):
+            return result
+        if not support['sufficient']:
+            return {**result, 'decision': 'keep', 'reason': '관측 범위가 체결 가정을 뒷받침하지 않아 교체 근거 부족'}
+        rejected = next((item for item in results.values() if item['decision'] != 'promote'), None)
+        if rejected:
+            return {**result, 'decision': 'keep', 'reason': rejected['reason']}
+        return {**result, 'decision': 'promote', 'reason': '고정한 모든 체결·비용 가정에서 개선 근거 확인: 모의 정책 교체'}
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return invalid
 
 
 def daily_metrics(normal, stress=None, *, first_day="2020-01-01"):

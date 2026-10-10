@@ -1,5 +1,6 @@
 """AI-owned capital, daily scorecard and durable loss protection in the existing DB."""
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from backend.experiment_store import encode
@@ -121,14 +122,97 @@ class LearningAccount:
                 'risk', 'comparisons')} | {'observations': count, 'basis': 'project_confirmed_fills'}
 
 
-def execution_model(orders):
-    """Freeze a small empirical paper-fill model before a trial; never refit its past."""
-    terminal = [row for row in orders if row['status'] in {'filled', 'cancelled', 'rejected'}
-                and not row.get('submission_skipped')][-100:]
-    model = {'mode': 'observed_quotes', 'fill_ratio': 1., 'slippage_bps': 0,
-             'stress_slippage_bps': 0, 'stress_fee_rate': float(FEE) + .001}
+def confirmed_execution_orders(orders):
+    """Terminal orders with transmission evidence; retain zero-fill outcomes.
+
+    Legacy rejection status alone cannot distinguish an authentication failure
+    before transmission. Preserve ledger order; callers choose their own window.
+    """
+    terminal = []
+    for row in orders:
+        quantity, filled = row.get('quantity'), row.get('filled_quantity')
+        if (row.get('status') not in {'filled', 'cancelled', 'rejected'}
+                or row.get('submission_skipped') or row.get('request_sent') is False
+                or row.get('side') not in {'buy', 'sell'}
+                or type(quantity) is not int or quantity <= 0 or type(filled) is not int
+                or not 0 <= filled <= quantity or row['status'] == 'filled' and filled != quantity):
+            continue
+        if not (filled > 0 or row.get('order_id') or row.get('accepted_at')
+                or row.get('request_sent') is True or row.get('submission_skipped') is False):
+            continue
+        terminal.append(row)
+    return terminal
+
+
+def execution_profile(orders):
+    """Freeze terminal paper-order evidence and explicitly labelled assumptions.
+
+    Callers provide this account's past orders in ledger order. Zero-filled
+    terminal orders count; unsubmitted/uncertain orders never do. No data means
+    an unknown estimate, not a 100% fill estimate. Ranges describe the observed
+    domain, not confidence bounds or proof of future liquidity. Volume is the
+    latest positive one-minute bar, in shares, matching execution_quotes.volume.
+    """
+    terminal = confirmed_execution_orders(orders)[-100:]
+    estimates, basis, support, prediction_basis, prediction_mae = {}, {}, {}, {}, {}
+    def instant(value):
+        parsed = datetime.fromisoformat(value)
+        if parsed.utcoffset() is None:
+            raise ValueError('naive_execution_time')
+        return parsed
     for side in ('buy', 'sell'):
         rows = [row for row in terminal if row['side'] == side]
-        if len(rows) >= 5:
-            model[side + '_fill_ratio'] = sum(row['filled_quantity'] / row['quantity'] for row in rows) / len(rows)
-    return model
+        basis[side + '_orders'] = len(rows)
+        estimates[side + '_fill_ratio'] = (sum(row['filled_quantity'] / row['quantity'] for row in rows)
+                                         / len(rows) if rows else None)
+        contexts, errors = [], []
+        for row in rows:
+            try:
+                price, volume = number(row['decision_price']), number(row['decision_volume'])
+                observed = instant(row['decision_observed_at']).astimezone(timezone(timedelta(hours=9)))
+                if price <= 0 or volume <= 0:
+                    raise ValueError('invalid_execution_context')
+                contexts.append((float(price), observed.hour * 60 + observed.minute, float(volume)))
+            except (KeyError, ValueError, TypeError, ArithmeticError):
+                pass
+            prediction = row.get('execution_prediction')
+            if not isinstance(prediction, dict) or prediction.get('fill_ratio') is None:
+                continue
+            try:
+                expected = number(prediction['fill_ratio'])
+                created = instant(prediction['created_at'])
+                if not 0 <= expected <= 1 or created > instant(row['created_at']):
+                    continue
+                errors.append(abs(float(expected) - row['filled_quantity'] / row['quantity']))
+            except (KeyError, ValueError, TypeError, ArithmeticError):
+                pass
+        basis[side + '_context_orders'] = len(contexts)
+        support[side] = ({key + suffix: function(values[index] for values in contexts)
+                          for index, key in enumerate(('price', 'minute', 'volume'))
+                          for suffix, function in (('_min', min), ('_max', max))} if contexts else None)
+        prediction_basis[side] = len(errors)
+        prediction_mae[side] = sum(errors) / len(errors) if errors else None
+    base = {'mode': 'observed_quotes', 'slippage_bps': 0, 'stress_slippage_bps': 0,
+            'stress_fee_rate': float(FEE) + .001}
+    estimated = all(value is not None for value in estimates.values())
+    scenarios = []
+    if estimated:
+        scenarios.append({'id': 'empirical', 'assumption': 'past_terminal_order_mean',
+                          'model': {**base, **estimates}})
+    scenarios.extend([
+        {'id': 'partial_fill', 'assumption': 'fixed_half_fills_not_an_estimate',
+         'model': {**base, 'fill_ratio': .5}},
+        {'id': 'delayed_sell', 'assumption': 'full_fills_except_first_exit_delayed_one_session',
+         'model': {**base, 'fill_ratio': 1., 'sell_delay_sessions': 1}},
+        {'id': 'adverse_buy', 'assumption': 'ex_post_stress_omit_buys_with_close_above_decision_price',
+         'model': {**base, 'fill_ratio': 1., 'adverse_buy': True}},
+    ])
+    return {'version': 1, 'status': 'estimated' if estimated else 'insufficient',
+            'estimates': estimates, 'basis': basis, 'support': support, 'scenarios': scenarios,
+            'prediction_basis': prediction_basis, 'prediction_mae': prediction_mae,
+            'support_basis': 'observed_price_minute_one_minute_volume_ranges_only'}
+
+
+def execution_model(orders):
+    """Compatibility name: return the profile, never silently infer full fills."""
+    return execution_profile(orders)

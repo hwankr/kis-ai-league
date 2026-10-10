@@ -312,7 +312,8 @@ def _exit_policy(value):
 def _execution_model(value):
     value = {} if value is None else value
     allowed = {"mode", "fill_ratio", "buy_fill_ratio", "sell_fill_ratio", "fee_rate", "tax_rate",
-               "slippage_bps", "stress_slippage_bps", "stress_fee_rate", "stress_fill_ratio"}
+               "slippage_bps", "stress_slippage_bps", "stress_fee_rate", "stress_fill_ratio",
+               "sell_delay_sessions", "adverse_buy"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("invalid_execution_model")
     mode = value.get("mode", "daily_open")
@@ -321,6 +322,10 @@ def _execution_model(value):
     ratio = _number(value.get("fill_ratio", 1), "invalid_execution_model", minimum=0, maximum=1)
     fee = value.get("fee_rate", FEE)
     result = {"mode": mode}
+    result["sell_delay_sessions"] = _integer(value.get("sell_delay_sessions", 0), 0, 20, "invalid_sell_delay")
+    if type(value.get("adverse_buy", False)) is not bool:
+        raise ValueError("invalid_adverse_buy")
+    result["adverse_buy"] = value.get("adverse_buy", False)
     for key, default, maximum in (("buy_fill_ratio", ratio, 1), ("sell_fill_ratio", ratio, 1),
             ("fee_rate", fee, .05), ("tax_rate", TAX, .1),
             ("slippage_bps", 10 if mode == "daily_open" else 0, 1000),
@@ -362,11 +367,13 @@ def _initial_state(value, budget, first_day):
         position["exit_fill_remainder"] = _state_decimal(item.get("exit_fill_remainder", 0))
         if position["exit_fill_remainder"] >= 1:
             raise ValueError("invalid_exit_fill_remainder")
+        position["exit_delay_remaining"] = (None if item.get("exit_delay_remaining") is None else
+                                            _integer(item["exit_delay_remaining"], 0, 20, "invalid_exit_delay"))
         positions[symbol] = position
     return cash, reserved, positions, value
 
 
-def _replay(policy, frames, limits, model, initial_state, *, stress=False, execution_stress=False):
+def _replay(policy, frames, limits, model, initial_state, *, stress=False, execution_stress=False, support=None):
     budget, order_cap, daily_limit = (limits[key] for key in ("budget", "order_cap", "daily_buy_limit"))
     cash, reserved, positions, saved = _initial_state(initial_state, budget, frames[0]["as_of"])
     slip = model["stress_slippage_bps" if stress else "slippage_bps"] / 10000
@@ -379,7 +386,27 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
     curve, pending = [], []
     diagnostics = {key: 0 for key in ("buy_attempts", "sell_attempts", "buy_filled_quantity", "sell_filled_quantity",
                    "partial_orders", "unfilled_orders", "untradeable_bars", "ineligible_quotes", "limit_blocked",
-                   "delayed_exit_sessions")}
+                   "delayed_exit_sessions", "scenario_delayed_sells", "adverse_buys_omitted")}
+    coverage = {"checked": 0, "outside": 0, "reasons": set()}
+    def check_support(side, price, observed, quote):
+        if support is None:
+            return
+        coverage["checked"] += 1
+        bounds, reasons = support.get(side), []
+        if not bounds:
+            reasons.append(side + "_context_missing")
+        else:
+            values = {"price": float(price), "minute": observed.astimezone(KST).hour * 60 + observed.astimezone(KST).minute}
+            try:
+                values["volume"] = _number(quote.get("volume"), minimum=0)
+            except ValueError:
+                reasons.append(side + "_volume_missing")
+            for key, value in values.items():
+                if not bounds[key + "_min"] <= value <= bounds[key + "_max"]:
+                    reasons.append(side + "_" + key + "_outside")
+        if reasons:
+            coverage["outside"] += 1
+            coverage["reasons"].update(reasons)
     paid_fee, paid_tax = Decimal(0), Decimal(0)
     for index, frame in enumerate(frames):
         rows = {row["symbol"]: row for row in frame["rows"]}
@@ -390,7 +417,7 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                     raise ValueError("required_price_missing")
                 bars[symbol] = {key: _decimal(value) for key, value in _bar(rows[symbol]).items()}
             return bars[symbol]
-        def execution_price(symbol, side, limit=None):
+        def execution_price(symbol, side, limit=None, position=None):
             bar = bar_for(symbol)
             diagnostics[side + "_attempts"] += 1
             if bar["volume"] <= 0 or bar["high"] == bar["low"]:
@@ -413,6 +440,7 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                 price = _decimal(quote.get("price"))
                 if price <= 0:
                     raise ValueError("invalid_execution_quote")
+                check_support(side, price, observed, quote)
                 explicit = quote.get(side + "_limit_price", quote.get("limit_price", price))
                 if explicit is not None:
                     explicit = _decimal(explicit)
@@ -421,6 +449,20 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                     limit = explicit if limit is None else (min(limit, explicit) if side == "buy" else max(limit, explicit))
             else:
                 price = bar["open"]
+            # Deliberately ex-post stress, not an estimate or a signal feature.
+            # The same date/symbol/quote has the same outcome for either policy.
+            if side == "buy" and model["adverse_buy"] and bar["close"] > price:
+                diagnostics["adverse_buys_omitted"] += 1
+                diagnostics["unfilled_orders"] += 1
+                return None
+            if side == "sell" and position is not None:
+                if position["exit_delay_remaining"] is None:
+                    position["exit_delay_remaining"] = model["sell_delay_sessions"]
+                if position["exit_delay_remaining"]:
+                    position["exit_delay_remaining"] -= 1
+                    diagnostics["scenario_delayed_sells"] += 1
+                    diagnostics["unfilled_orders"] += 1
+                    return None
             price *= 1 + slip if side == "buy" else 1 - slip
             if limit is not None and (price > limit if side == "buy" else price < limit):
                 diagnostics["limit_blocked"] += 1
@@ -450,7 +492,7 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             taken = exit_policy["take_profit_pct"] > 0 and change >= _decimal(exit_policy["take_profit_pct"])
             if position["exit_pending"] or timed or stopped or taken:
                 position["exit_pending"] = True
-                price = execution_price(symbol, "sell")
+                price = execution_price(symbol, "sell", position=position)
                 quantity = fill_quantity(position["quantity"], "sell", position) if price is not None else 0
                 if quantity:
                     proceeds = quantity * price
@@ -502,7 +544,7 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             paid_fee += quantity * price * fee
             positions[symbol] = {"strategy_id": strategy, "quantity": quantity, "cost": cost,
                 "entry_price": price, "held_sessions": 0, "exit_policy": deepcopy(signal["exit_policy"]),
-                "exit_pending": False, "exit_fill_remainder": Decimal(0)}
+                "exit_pending": False, "exit_fill_remainder": Decimal(0), "exit_delay_remaining": None}
         for symbol, position in positions.items():
             position["last_close"] = bar_for(symbol)["close"]
         position_value = sum((position["quantity"] * position["last_close"] * (1 - slip) * (1 - fee - tax)
@@ -530,17 +572,20 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
     diagnostics.update(fees_paid=float(paid_fee), taxes_paid=float(paid_tax), mode=model["mode"],
                        buy_fill_ratio=float(ratios["buy"]), sell_fill_ratio=float(ratios["sell"]),
                        fee_rate=float(fee), tax_rate=float(tax), slippage_bps=float(slip * 10000),
+                       sell_delay_sessions=model["sell_delay_sessions"], adverse_buy=model["adverse_buy"],
                        entry_remainder="cancelled_after_observation", exit_remainder="retry_next_observation")
+    coverage.update(supported=coverage["outside"] == 0 if support is not None else None,
+                    reasons=sorted(coverage["reasons"]))
     return {"return": float((equities[-1] / start - 1) * 100), "drawdown": float(-drawdown),
             "closed": closed, "half_returns": [float((midpoint / start - 1) * 100),
                                                 float((equities[-1] / midpoint - 1) * 100)],
             "equity_curve": curve, "daily_log_returns": [math.log(float(after / before)) for before, after in zip(equities, equities[1:])],
             "final_state": {"as_of": frames[-1]["as_of"], "policy_id": identity, "cash": _decimal_text(cash),
                             "reserved_cash": _decimal_text(reserved), "positions": state_positions, "pending_entries": pending},
-            "diagnostics": diagnostics}
+            "diagnostics": diagnostics, "support": coverage}
 
 
-def portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_model=None):
+def _portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_model=None, support=None):
     """Replay one cash-funded portfolio twice, with normal/stress trading costs.
 
     Historical frame gaps invalidate evaluation when session_days proves a missed
@@ -571,7 +616,7 @@ def portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_m
               "intervals": max(0, len(frames) - 1) if isinstance(frames, list) else 0,
               "equity_curve": [], "stress_equity_curve": [], "daily_log_returns": [], "stress_daily_log_returns": [],
               "final_state": None, "stress_final_state": None, "execution_stress_return_pct": None,
-              "execution_stress_drawdown_pct": None, "diagnostics": {}}
+              "execution_stress_drawdown_pct": None, "diagnostics": {}, "support": {"supported": False}}
     try:
         policy = validate_policy(policy)
         if not isinstance(frames, list) or len(frames) < 2:
@@ -601,8 +646,8 @@ def portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_m
             "normal": initial_state, "stress": initial_state}
         if "normal" not in states or "stress" not in states:
             raise ValueError("invalid_initial_states")
-        normal = _replay(policy, frames, limits, model, states["normal"])
-        stress = _replay(policy, frames, limits, model, states["stress"], stress=True)
+        normal = _replay(policy, frames, limits, model, states["normal"], support=support)
+        stress = _replay(policy, frames, limits, model, states["stress"], stress=True, support=support)
         execution_stress = (_replay(policy, frames, limits, model, states["normal"], execution_stress=True)
                             if model["stress_fill_ratio"] is not None else None)
         result.update(valid=True, net_return_pct=normal["return"], stress_return_pct=stress["return"],
@@ -613,9 +658,95 @@ def portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_m
                       final_state=normal["final_state"], stress_final_state=stress["final_state"],
                       execution_stress_return_pct=execution_stress["return"] if execution_stress else None,
                       execution_stress_drawdown_pct=execution_stress["drawdown"] if execution_stress else None,
+                      support={"supported": (normal["support"]["supported"] and stress["support"]["supported"]),
+                               "normal": normal["support"], "cost_stress": stress["support"]},
                       diagnostics={"normal": normal["diagnostics"], "cost_stress": stress["diagnostics"],
                                    "execution_stress": execution_stress["diagnostics"] if execution_stress else None})
     except (ValueError, TypeError, KeyError, ArithmeticError, AttributeError) as error:
         reason = str(error)
         result["error"] = reason if re.fullmatch(r"[a-z][a-z0-9_]*", reason) else "invalid_evaluation_input"
     return result
+
+
+def portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_model=None):
+    """Evaluate a flat research model or a frozen execution_profile.
+
+    A profile evaluates every fixed environment for both normal and stressed
+    costs. The first scenario is a representative path, never a claim that an
+    unknown fill rate is one. Adoption must use all scenario_results and
+    promotion_supported. Coarse observed price/time/one-minute-volume ranges
+    only describe applicability, not the probability of an execution outcome.
+    For continuation pass {scenarios: {id: {normal: state, stress: state}}}; a
+    single initial state instead gives every scenario the same starting book.
+    Flat models remain explicit development assumptions, with no adoption proof.
+    """
+    profile = execution_model
+    if not isinstance(profile, dict) or "scenarios" not in profile:
+        result = _portfolio_metrics(policy, frames, limits, initial_state=initial_state, execution_model=profile)
+        result.update(promotion_supported=False, scenario_results={})
+        return result
+    try:
+        if type(profile.get("version")) is not int or profile["version"] != 1 or profile.get("status") not in {"estimated", "insufficient"}:
+            raise ValueError("invalid_execution_profile")
+        estimates = profile.get("estimates", {})
+        for side in ("buy", "sell"):
+            estimate = estimates.get(side + "_fill_ratio")
+            if estimate is not None:
+                _number(estimate, "invalid_execution_profile", minimum=0, maximum=1)
+            elif profile["status"] == "estimated":
+                raise ValueError("invalid_execution_profile")
+        support = profile.get("support")
+        if not isinstance(support, dict) or set(support) != {"buy", "sell"}:
+            raise ValueError("invalid_execution_support")
+        for bounds in support.values():
+            if bounds is None:
+                continue
+            if not isinstance(bounds, dict):
+                raise ValueError("invalid_execution_support")
+            for key in ("price", "minute", "volume"):
+                low = _number(bounds.get(key + "_min"), "invalid_execution_support", minimum=0)
+                high = _number(bounds.get(key + "_max"), "invalid_execution_support", minimum=low)
+                if key != "minute" and low <= 0 or key == "minute" and high >= 24 * 60:
+                    raise ValueError("invalid_execution_support")
+        scenarios = profile["scenarios"]
+        if not isinstance(scenarios, list) or not 3 <= len(scenarios) <= 4:
+            raise ValueError("invalid_execution_scenarios")
+        ids = [item["id"] for item in scenarios]
+        expected = {"partial_fill", "delayed_sell", "adverse_buy"}
+        if profile["status"] == "estimated":
+            expected.add("empirical")
+        if len(set(ids)) != len(ids) or set(ids) != expected:
+            raise ValueError("invalid_execution_scenarios")
+        saved = initial_state.get("scenarios") if isinstance(initial_state, dict) and "scenarios" in initial_state else None
+        if saved is not None and (not isinstance(saved, dict) or set(saved) != set(ids)):
+            raise ValueError("invalid_initial_scenario_states")
+        results = {}
+        for scenario in scenarios:
+            model = scenario["model"]
+            if model.get("mode") != "observed_quotes":
+                raise ValueError("invalid_execution_profile_mode")
+            current = _portfolio_metrics(policy, frames, limits, initial_state=saved[scenario["id"]] if saved is not None else initial_state,
+                                         execution_model=model, support=support)
+            current["assumption"] = _text(scenario.get("assumption"), "invalid_execution_assumption", 200)
+            results[scenario["id"]] = current
+        result = deepcopy(results[ids[0]])
+        reasons = {side + "_context_missing" for side in ("buy", "sell") if support[side] is None}
+        if profile["status"] == "insufficient":
+            reasons.add("insufficient_terminal_orders")
+        for current in results.values():
+            if not current["valid"]:
+                reasons.add(current["error"])
+            for side in ("normal", "cost_stress"):
+                reasons.update(current["support"].get(side, {}).get("reasons", []))
+        supported = not reasons and all(current["support"]["supported"] for current in results.values())
+        valid = all(current["valid"] for current in results.values())
+        result.update(valid=valid, error=next((current["error"] for current in results.values() if not current["valid"]), None),
+                      scenario_results=results, representative_scenario=ids[0], promotion_supported=supported,
+                      support={"supported": supported, "reasons": sorted(reasons)}, execution_profile_status=profile["status"])
+        return result
+    except (ValueError, TypeError, KeyError, ArithmeticError, AttributeError) as error:
+        result = _portfolio_metrics(policy, [], limits)
+        reason = str(error)
+        result.update(error=reason if re.fullmatch(r"[a-z][a-z0-9_]*", reason) else "invalid_execution_profile",
+                      promotion_supported=False, scenario_results={}, support={"supported": False, "reasons": ["invalid_execution_profile"]})
+        return result

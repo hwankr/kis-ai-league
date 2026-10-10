@@ -956,8 +956,11 @@ class ExperimentsTests(unittest.TestCase):
         self.assertEqual(sum(order["status"] == "rejected" for order in self.service.store.orders()), 3)
 
     def test_authentication_rejection_question_resolves_after_confirmed_acceptance(self):
-        self.broker.submit_error = BrokerRejected("모의 주문 전 인증에 실패했습니다.")
+        self.broker.submit_error = BrokerRejected("모의 주문 전 인증에 실패했습니다.", request_sent=False)
         self.submit()
+        self.assertTrue(self.service.store.orders()[0]['submission_skipped'])
+        from backend.learning_account import execution_profile
+        self.assertEqual(execution_profile(self.service.store.orders())['basis']['buy_orders'], 0)
         self.assertIn("인증", self.service.store.setting("issues")[0]["question"])
         self.current += timedelta(seconds=1)
         self.broker.submit_error = None

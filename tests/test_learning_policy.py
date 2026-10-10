@@ -530,5 +530,130 @@ class PortfolioTests(unittest.TestCase):
             self.assertFalse(result["valid"])
 
 
+class ExecutionProfileTests(unittest.TestCase):
+    def profile(self):
+        from backend.learning_account import execution_profile
+        rows = []
+        for side in ('buy', 'sell'):
+            for price, volume, hour in ((50, 100, '09:05'), (150, 2000, '15:15')):
+                rows.append({'status': 'filled', 'side': side, 'quantity': 10, 'filled_quantity': 10,
+                             'decision_price': price, 'decision_volume': volume,
+                             'decision_observed_at': '2026-06-30T' + hour + ':00+09:00'})
+        return execution_profile(rows)
+
+    def observed(self, count=4):
+        observations = frames(count)
+        for frame in observations:
+            frame['execution_quotes'] = {'005930': {'price': 100, 'volume': 1000, 'eligible': True,
+                'observed_at': frame['as_of'] + 'T09:10:00+09:00'}}
+        return observations
+
+    def test_every_frozen_scenario_has_both_dated_paths_and_keeps_input_immutable(self):
+        profile, observations = self.profile(), self.observed()
+        before = deepcopy((profile, observations))
+        result = portfolio_metrics(policy(), observations, LIMITS, execution_model=profile)
+        self.assertTrue(result['valid'], result)
+        self.assertTrue(result['promotion_supported'], result['support'])
+        self.assertEqual(set(result['scenario_results']), {'empirical', 'partial_fill', 'delayed_sell', 'adverse_buy'})
+        for scenario in result['scenario_results'].values():
+            self.assertEqual(scenario['intervals'], 3)
+            self.assertEqual(len(scenario['daily_log_returns']), 3)
+            self.assertEqual(len(scenario['stress_daily_log_returns']), 3)
+            self.assertEqual([point['as_of'] for point in scenario['equity_curve']], days(4))
+            self.assertEqual(len(scenario['stress_equity_curve']), 4)
+            self.assertLess(scenario['stress_return_pct'], scenario['net_return_pct'])
+        self.assertEqual((profile, observations), before)
+
+    def test_unknown_estimates_allow_assumption_exploration_but_not_promotion(self):
+        from backend.learning_account import execution_profile
+        profile = execution_profile([])
+        result = portfolio_metrics(policy(), self.observed(), LIMITS, execution_model=profile)
+        self.assertTrue(result['valid'], result)
+        self.assertFalse(result['promotion_supported'])
+        self.assertIn('insufficient_terminal_orders', result['support']['reasons'])
+        self.assertEqual(result['representative_scenario'], 'partial_fill')
+        self.assertEqual(result['final_state']['positions'][0]['quantity'], 49)
+        self.assertEqual(result['scenario_results']['delayed_sell']['final_state']['positions'][0]['quantity'], 99)
+
+    def test_each_outside_observed_domain_is_explicit_without_changing_numeric_path_validity(self):
+        for key, value, reason in (('volume', 10, 'buy_volume_outside'), ('volume', None, 'buy_volume_missing'),
+                                   ('price', 49, 'buy_price_outside'),
+                                   ('observed_at', days(2)[1] + 'T15:16:00+09:00', 'buy_minute_outside')):
+            observations = self.observed(2)
+            observations[1]['execution_quotes']['005930'][key] = value
+            result = portfolio_metrics(policy(), observations, LIMITS, execution_model=self.profile())
+            with self.subTest(key=key, value=value):
+                self.assertTrue(result['valid'], result)
+                self.assertFalse(result['promotion_supported'])
+                self.assertIn(reason, result['support']['reasons'])
+
+    def test_missing_quote_is_invalid_and_known_untradeable_bar_keeps_owned_loss(self):
+        result = portfolio_metrics(policy(), frames(2), LIMITS, execution_model=self.profile())
+        self.assertFalse(result['valid'])
+        self.assertTrue(all(item['error'] == 'execution_quote_missing' for item in result['scenario_results'].values()))
+        observations = self.observed(3)
+        observations[2]['rows'][0].update(open=70, high=70, low=70, close=70, volume=0)
+        value = policy()
+        value['strategies'][0]['holding_sessions'] = 1
+        result = portfolio_metrics(value, observations, LIMITS, execution_model=self.profile())
+        for scenario in result['scenario_results'].values():
+            self.assertTrue(scenario['valid'])
+            self.assertGreater(len(scenario['final_state']['positions']), 0)
+            self.assertLess(scenario['net_return_pct'], -10)
+
+    def test_adverse_buy_omits_favorable_buy_and_fills_unfavorable_same_opportunity(self):
+        profile = self.profile()
+        for close, expected in ((110, 0), (90, 99)):
+            observations = self.observed(2)
+            observations[1]['rows'][0].update(close=close, high=max(101, close), low=min(99, close))
+            result = portfolio_metrics(policy(), observations, LIMITS, execution_model=profile)
+            adverse = result['scenario_results']['adverse_buy']
+            actual = sum(row['quantity'] for row in adverse['final_state']['positions'])
+            self.assertEqual(actual, expected)
+            # A different policy identity sees the same environment on the same symbol/day.
+            renamed = policy(name='다른 이름')
+            renamed['strategies'][0]['id'] = 'other'
+            other = portfolio_metrics(renamed, observations, LIMITS, execution_model=profile)
+            self.assertEqual(adverse['daily_log_returns'], other['scenario_results']['adverse_buy']['daily_log_returns'])
+            self.assertIn('ex_post', adverse['assumption'])
+
+    def test_delayed_sell_retains_deteriorating_position_and_delay_survives_restart(self):
+        profile, observations, value = self.profile(), self.observed(4), policy()
+        value['strategies'][0]['holding_sessions'] = 1
+        for index, price in ((2, 80), (3, 60)):
+            observations[index]['rows'] = [row(price=price, learning_eligible=False)]
+            observations[index]['execution_quotes']['005930']['price'] = price
+        first = portfolio_metrics(value, observations[:3], LIMITS, execution_model=profile)
+        delayed = first['scenario_results']['delayed_sell']
+        self.assertEqual(delayed['closed_trades'], 0)
+        self.assertTrue(delayed['final_state']['positions'][0]['exit_pending'])
+        self.assertEqual(delayed['final_state']['positions'][0]['exit_delay_remaining'], 0)
+        state = {'scenarios': {key: {'normal': item['final_state'], 'stress': item['stress_final_state']}
+                              for key, item in first['scenario_results'].items()}}
+        resumed = portfolio_metrics(value, observations[2:], LIMITS,
+                                    initial_state=json.loads(json.dumps(state)), execution_model=profile)
+        full = portfolio_metrics(value, observations, LIMITS, execution_model=profile)
+        self.assertTrue(resumed['valid'], resumed)
+        for key in full['scenario_results']:
+            for prefix in ('', 'stress_'):
+                self.assertEqual(resumed['scenario_results'][key][prefix + 'final_state'],
+                                 full['scenario_results'][key][prefix + 'final_state'])
+                self.assertEqual(first['scenario_results'][key][prefix + 'daily_log_returns'] +
+                                 resumed['scenario_results'][key][prefix + 'daily_log_returns'],
+                                 full['scenario_results'][key][prefix + 'daily_log_returns'])
+        self.assertLess(full['scenario_results']['delayed_sell']['net_return_pct'],
+                        full['scenario_results']['empirical']['net_return_pct'])
+
+    def test_initial_anchor_preserves_all_scenario_ids_and_rejects_wrong_restart_set(self):
+        profile = self.profile()
+        result = portfolio_metrics(policy(), self.observed(1), LIMITS, execution_model=profile)
+        self.assertFalse(result['promotion_supported'])
+        self.assertEqual(len(result['scenario_results']), 4)
+        self.assertTrue(all(item['error'] == 'insufficient_frames' for item in result['scenario_results'].values()))
+        result = portfolio_metrics(policy(), self.observed(2), LIMITS, execution_model=profile,
+                                   initial_state={'scenarios': {'empirical': {'cash': 10000}}})
+        self.assertEqual(result['error'], 'invalid_initial_scenario_states')
+
+
 if __name__ == "__main__":
     unittest.main()

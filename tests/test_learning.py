@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from backend.experiment_store import ExperimentStore
 from backend.kis import KST
@@ -209,7 +210,8 @@ class LearningTests(unittest.TestCase):
                 ("filled", 10, "owned"), ("cancelled", 2, "owned"), ("rejected", 0, "owned"),
                 ("unknown", 0, "owned"), ("submitted", 0, "owned"), ("rejected", 0, "other")]):
             self.store.reserve_order({"id": str(index), "created_at": self.current.isoformat(), "status": status,
-                                      "filled_quantity": filled, "quantity": 10, "fingerprint": fingerprint}, str(index))
+                                      "filled_quantity": filled, "quantity": 10, "fingerprint": fingerprint,
+                                      "side": "buy", "request_sent": True}, str(index))
         self.store.reserve_order({'id': 'skipped', 'created_at': self.current.isoformat(),
                                   'status': 'cancelled', 'filled_quantity': 0, 'quantity': 10,
                                   'fingerprint': 'owned', 'submission_skipped': True}, 'skipped')
@@ -217,7 +219,7 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(feedback["terminal_orders"], 3)
         self.assertEqual(feedback["unresolved_orders"], 2)
         self.assertAlmostEqual(feedback["rejection_rate"], 1 / 3)
-        self.assertAlmostEqual(feedback["fill_ratio"], .6)
+        self.assertAlmostEqual(feedback["fill_ratio"], .4)
         self.store.save_setting("policy", {"fingerprint": "empty"})
         self.assertIsNone(self.learner._research_history()[0]["execution"]["fill_ratio"])
 
@@ -295,6 +297,54 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(len(self.proposals), 1)
         self.assertEqual(self.learner.state()["trial"]["initial_state"]["cash"], "900000")
         self.assertFalse(self.store.setting("enabled"))
+
+    def test_production_gate_requires_every_frozen_scenario_and_observation_support(self):
+        from backend.learning_account import execution_profile
+        for failure in ('none', 'adverse', 'support', 'missing'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                store = ExperimentStore(Path(directory) / 'experiment.sqlite3')
+                profile = execution_profile([])
+                original_profile = deepcopy(profile)
+                def evaluator(value, frames, limits):
+                    n = len(frames) - 1
+                    challenger = value['kind'] != 'legacy'
+                    metrics = daily_metrics([.002 if challenger else 0.] * n)
+                    scenarios = {item['id']: deepcopy(metrics) for item in original_profile['scenarios']}
+                    if challenger and failure == 'adverse':
+                        scenarios['adverse_buy'] = daily_metrics([-.001] * n)
+                    if failure == 'missing':
+                        scenarios.pop('adverse_buy')
+                    return {**metrics, 'scenario_results': scenarios,
+                            'promotion_supported': failure != 'support',
+                            'support': {'reasons': ['outside_observed_range'] if failure == 'support' else []}}
+                learner = LearningService(store, enabled=True, now=lambda: self.current,
+                    proposer=lambda champion, *a, **kw: {'policy': candidate(1 if champion['kind'] == 'legacy' else 2), 'hypothesis_test': {
+                        'metric': 'D11', 'direction': 'positive'}}, evaluator=evaluator)
+                self.addCleanup(learner.close)
+                store.save_settings({'enabled': False, 'user_paused': True})
+                with patch('backend.learning_attribution.cash_quote_symbols', return_value=[]), \
+                        patch.object(learner, '_attribution', return_value={
+                        'stage': 'supported', 'ranges': {'D11': {'low': 1, 'high': 2}}}):
+                    for index in range(61):
+                        data = raw_input(index)
+                        self.current = datetime.fromisoformat(data['observed_at'])
+                        book = {'as_of': data['as_of'], 'cash': LIMITS['budget'], 'equity': LIMITS['budget'],
+                                'positions': [], 'pending_orders': 0, 'unresolved_orders': 0}
+                        learner.process(data, [], LIMITS, context={'initial_state': book, 'execution_model': profile})
+                        if index == 0:
+                            identity = learner.state()['trial']['id']
+                            profile['estimates']['buy_fill_ratio'] = .9
+                            profile['scenarios'][0]['model']['fill_ratio'] = .9
+                finished = next(row for row in learner.history() if row['id'] == identity)
+                self.assertEqual(finished['execution_model'], original_profile)
+                self.assertEqual(finished['decision'], 'promote' if failure == 'none' else
+                                 'invalid' if failure == 'missing' else 'keep')
+                self.assertEqual(finished['hypothesis_test'], {'metric': 'D11', 'direction': 'positive'})
+                self.assertIn('hypothesis_result', finished)
+                self.assertEqual(learner.champion()['kind'], 'rules' if failure == 'none' else 'legacy')
+                self.assertFalse(store.setting('enabled'))
+                self.assertTrue(store.setting('user_paused'))
+                self.assertEqual(store.orders(), [])
 
 
 if __name__ == "__main__":

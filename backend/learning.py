@@ -30,9 +30,9 @@ class LearningService:
         self.lock = threading.Lock()
         self.pending = None
         self.attempted = None
-        self.version = hashlib.sha256(Path(__file__).read_bytes() +
-                                      Path(__file__).with_name("learning_policy.py").read_bytes() +
-                                      Path(__file__).with_name("learning_evaluation.py").read_bytes()).hexdigest()
+        self.version = hashlib.sha256(b''.join(Path(__file__).with_name(name).read_bytes() for name in (
+            'learning.py', 'learning_policy.py', 'learning_evaluation.py', 'learning_account.py',
+            'learning_attribution.py'))).hexdigest()
         with store.connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS learning_frames
@@ -66,6 +66,7 @@ class LearningService:
                 for index, item in enumerate(history)]
 
     def _research_history(self):
+        from backend.learning_account import confirmed_execution_orders
         from backend.learning_policy import policy_id
         history = self.history()
         fingerprint = (self.store.setting("policy") or {}).get("fingerprint")
@@ -80,11 +81,11 @@ class LearningService:
             groups.setdefault(identity, []).append(order)
         def execution(identity):
             orders = groups.get(identity, [])
-            terminal = [order for order in orders if order["status"] in {"filled", "cancelled", "rejected"}]
-            accepted = [order for order in terminal if order["status"] != "rejected"]
-            return {"terminal_orders": len(terminal), "unresolved_orders": len(orders) - len(terminal),
+            terminal = confirmed_execution_orders(orders)
+            return {"terminal_orders": len(terminal), "unresolved_orders": sum(
+                    order['status'] not in {'filled', 'cancelled', 'rejected'} for order in orders),
                     "rejection_rate": sum(order["status"] == "rejected" for order in terminal) / len(terminal) if terminal else None,
-                    "fill_ratio": sum(order["filled_quantity"] / order["quantity"] for order in accepted) / len(accepted) if accepted else None}
+                    "fill_ratio": sum(order["filled_quantity"] / order["quantity"] for order in terminal) / len(terminal) if terminal else None}
         for item in history:
             item["execution"] = execution(item["candidate_id"])
         champion = self.champion()
@@ -213,7 +214,8 @@ class LearningService:
             state['scorecard_start'] = frame['as_of']
             state['scorecard_capital'] = str(initial_state['equity'] if initial_state else limits['budget'])
             state['scorecard_limits'] = deepcopy(limits)
-            state['scorecard_model'] = deepcopy(model)
+            # This display carries one fixed reference path, not trial scenario inference.
+            state['scorecard_model'] = deepcopy(model['scenarios'][0]['model'] if model.get('scenarios') else model)
             state['scorecard_engine'] = self.version
             state['scorecard_market'] = frame.get('benchmark_prices', {}).get('KOSPI')
             state['scorecard_book'] = deepcopy(initial_state) if initial_state else {
@@ -245,32 +247,13 @@ class LearningService:
         state['scorecard_day'] = frame['as_of']
 
     def _attribution(self, trial, cohort):
-        from backend.learning_policy import portfolio_metrics
-        evidence = dict.fromkeys(('signal_excess_pp', 'execution_excess_pp', 'transition_excess_pp',
-                                  'execution_drag_pp', 'capital_drag_pp'))
-        parents, candidates = [], []
-        for kwargs in ({}, {'execution_model': trial['execution_model']},
-                       {'execution_model': trial['execution_model'], 'initial_state': trial.get('initial_state')}):
-            parents.append(portfolio_metrics(trial['incumbent'], cohort, trial['limits'], **kwargs))
-            candidates.append(portfolio_metrics(trial['policy'], cohort, trial['limits'], **kwargs))
-        for key, parent, candidate in zip(('signal_excess_pp', 'execution_excess_pp', 'transition_excess_pp'), parents, candidates):
-            if parent.get('valid') and candidate.get('valid'):
-                evidence[key] = candidate['net_return_pct'] - parent['net_return_pct']
-        signal, execution, transition = (evidence[key] for key in
-            ('signal_excess_pp', 'execution_excess_pp', 'transition_excess_pp'))
-        if signal is not None and execution is not None:
-            evidence['execution_drag_pp'] = execution - signal
-        if execution is not None and transition is not None:
-            evidence['capital_drag_pp'] = transition - execution
-        stage = ('insufficient' if any(value is None for value in (signal, execution, transition)) else
-                 'signal' if signal <= 0 else 'execution' if execution <= 0 else
-                 'capital' if transition <= 0 else 'supported')
-        return {'stage': stage, 'evidence': evidence}
+        from backend.learning_attribution import attribute_trial
+        return attribute_trial(trial, cohort)
 
     def process(self, data, baseline_signals, limits, *, context=None):
         from backend.learning_policy import BASELINE_POLICY, build_frame, policy_id, portfolio_metrics, validate_policy
         from backend.learning_research import propose_candidate
-        from backend.learning_evaluation import make_evaluation_spec, evaluate_candidate
+        from backend.learning_evaluation import make_evaluation_spec, evaluate_candidate, evaluate_scenarios
         if not self.enabled or self.stopping:
             return
         production_context = context is not None
@@ -329,8 +312,19 @@ class LearningService:
             b = evaluate(trial['policy'], cohort[:horizon + 1], trial['limits'], **kwargs)
             if error or len(cohort) > 1 and (not a.get('valid') or not b.get('valid')):
                 trial['invalid_reason'] = error or a.get('error') or b.get('error') or '평가 자료 부족'
-            result = ({'decision': 'invalid', 'reason': trial['invalid_reason'], 'phase': 'paper_provisional'}
-                      if trial.get('invalid_reason') else evaluate_candidate(a, b, trial['evaluation_spec']))
+            if trial.get('invalid_reason'):
+                result = {'decision': 'invalid', 'reason': trial['invalid_reason'], 'phase': 'paper_provisional'}
+            elif trial['execution_model'].get('scenarios'):
+                scenarios = [{'id': item['id'],
+                    'incumbent': (a.get('scenario_results') or {}).get(item['id'], {}),
+                    'candidate': (b.get('scenario_results') or {}).get(item['id'], {})}
+                    for item in trial['execution_model']['scenarios']]
+                support = {'sufficient': bool(a.get('promotion_supported') and b.get('promotion_supported')),
+                    'reasons': sorted(set((a.get('support') or {}).get('reasons', []) +
+                                          (b.get('support') or {}).get('reasons', [])))}
+                result = evaluate_scenarios(scenarios, trial['evaluation_spec'], support=support)
+            else:
+                result = evaluate_candidate(a, b, trial['evaluation_spec'])
             decision, reason = result['decision'], result['reason']
             state['last_evaluation'] = {'as_of': frame['as_of'], 'sessions': elapsed,
                 'required_sessions': horizon, 'champion_return_pct': a.get('net_return_pct'),
@@ -340,6 +334,9 @@ class LearningService:
                 'statistics': result.get('statistics')}
             trial.update(metrics={'champion': a, 'challenger': b}, decision=decision, reason=reason,
                          evaluated_through=frame['as_of'], statistics=result.get('statistics'))
+            if trial['execution_model'].get('scenarios'):
+                from backend.learning_attribution import cash_quote_symbols
+                trial['attribution_quote_symbols'] = cash_quote_symbols(trial, cohort[:horizon + 1])
             # Invalid attempts consume their original interval too. Never erase an unlucky window.
             finished = elapsed >= horizon
             if finished and decision == 'promote':
@@ -353,6 +350,8 @@ class LearningService:
                 if decision == 'waiting':
                     trial.update(decision='keep', reason='고정 평가 기간의 근거 부족')
                 trial['attribution'] = self._attribution(trial, cohort[:horizon + 1])
+                from backend.learning_attribution import assess_hypothesis
+                trial['hypothesis_result'] = assess_hypothesis(trial, trial['attribution'])
                 state.pop('trial', None)
             self._save(state, trial)
         state['engine_version'] = self.version
@@ -382,6 +381,7 @@ class LearningService:
                     'rationale': '이전 정책도 새 관측에서 같은 기준으로 비교합니다.',
                     'parent_id': policy_id(state['champion']['policy']), 'change_family': 'rollback',
                     'hypothesis': '이전 정책으로 전환하면 현재 상태의 성과가 개선되는가', 'changes': []}
+                proposal['hypothesis_test'] = {'metric': 'D11', 'direction': 'positive'}
             else:
                 llm = self.llm_factory() if self.llm_factory else None
                 proposal = (self.proposer or propose_candidate)(state['champion']['policy'], development, limits,
@@ -395,11 +395,13 @@ class LearningService:
                 'start_day': max(frame['as_of'], self.now().astimezone(KST).date().isoformat()),
                 'policy': policy, 'incumbent': deepcopy(state['champion']['policy']), 'limits': limits,
                 'fingerprint': fingerprint, 'engine_version': self.version, 'sequence': sequence,
-                'evaluation_spec': make_evaluation_spec(sequence), 'execution_model': model,
+                'evaluation_spec': make_evaluation_spec(sequence,
+                    scenario_ids=tuple(item['id'] for item in model['scenarios']) if model.get('scenarios') else ('base',)),
+                'execution_model': model,
                 'execution_basis': deepcopy(context.get('execution_basis')),
                 'initial_state': deepcopy(book), 'decision': 'waiting', 'elapsed_intervals': 0,
                 **{key: proposal.get(key) for key in ('method', 'rationale', 'development',
-                    'parent_id', 'change_family', 'hypothesis', 'changes')}}
+                    'parent_id', 'change_family', 'hypothesis', 'hypothesis_test', 'changes')}}
             state.update(trial=trial, trial_sequence=sequence)
         state.update(status='evaluating', processed_day=frame['as_of'])
         self._save(state, state.get('trial'))

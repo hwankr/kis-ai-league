@@ -9,6 +9,7 @@ import json
 import math
 
 from backend.learning_policy import BASELINE_POLICY, policy_id, portfolio_metrics, validate_policy
+from backend.learning_attribution import VERSION as ATTRIBUTION_VERSION, CONTRASTS, EFFECTS
 
 
 MAX_CANDIDATES = 16
@@ -31,6 +32,9 @@ changes weights/top_n/cash_reserve/max_positions; exit changes holding/stop/take
 execution changes entry_slippage_bps. Only a legacy champion permits bootstrap
 creation of a new rule strategy. Choose the supplied priority families using
 paired attribution evidence; never explain a loss using unsupported assumptions.
+Attribution is a model diagnostic, not a causal verdict. The latest supported,
+uncertain or insufficient result takes precedence over an older failed-stage
+explanation. For interaction, change one family and recheck both starting states.
 entry_slippage_bps is the permitted upward gap from signal close, not trading cost.
 cancel_after_minutes must equal the supplied incumbent value: daily bars cannot
 evaluate intraday cancellation timing. Costs and downside matter. Do not invent
@@ -119,13 +123,11 @@ def _score(metrics):
 
 
 def _feedback(history):
-    observed = [_metrics(item) for item in history if isinstance(item, dict)]
-    observed = [item for item in observed if _score(item) is not None]
-    if not observed:
+    latest = next((_metrics(item) for item in history if isinstance(item, dict)
+                   and ("metrics" in item or "development" in item)), None)
+    if latest is None or _score(latest) is None:
         return "bootstrap"
-    # The caller supplies newest trials first. A failed recent regime matters
-    # more than an old successful trial, which remains a mutation seed below.
-    latest = observed[0]
+    # A new unresolved result must not silently resurrect an older failure.
     net, stress = float(latest["net_return_pct"]), float(latest["stress_return_pct"])
     if stress < 0 or abs(float(latest["max_drawdown_pct"])) > max(3, net):
         return "defensive"
@@ -165,8 +167,42 @@ def _execution_hint(history):
 
 
 def _attribution(value):
-    if not isinstance(value, dict) or value.get("stage") not in {"signal", "execution", "capital", "insufficient"}:
+    stages = {"signal", "execution", "capital", "insufficient", "interaction", "supported", "uncertain"}
+    if not isinstance(value, dict):
         return None
+    if value.get("version") == ATTRIBUTION_VERSION:
+        result = {"version": ATTRIBUTION_VERSION, "stage": value.get("stage") if value.get("stage") in stages else "uncertain",
+                  "unit": "log_pp"}
+        for group, keys in (("contrasts", CONTRASTS), ("effects", EFFECTS)):
+            raw = value.get(group) if isinstance(value.get(group), dict) else {}
+            result[group] = {key: _number(raw.get(key)) for key in keys}
+        ranges = value.get("ranges") if isinstance(value.get("ranges"), dict) else {}
+        result["ranges"] = {}
+        for key in (*CONTRASTS, *EFFECTS):
+            item = ranges.get(key) if isinstance(ranges.get(key), dict) else {}
+            low, high = _number(item.get("low")), _number(item.get("high"))
+            result["ranges"][key] = {"low": low, "high": high} if low is not None and high is not None and low <= high else None
+        if value.get("unit") != "log_pp":
+            result["stage"] = "uncertain"
+        stage = result["stage"]
+        negative = {"signal": ("D00",), "execution": ("execution_cash", "execution_inherited"),
+                    "capital": ("capital_daily", "capital_observed")}.get(stage, ())
+        if negative and any(result["ranges"][key] is None or result["ranges"][key]["high"] >= 0 for key in negative):
+            result["stage"] = "uncertain"
+        if stage == "supported" and (result["ranges"]["D11"] is None or result["ranges"]["D11"]["low"] <= 0):
+            result["stage"] = "uncertain"
+        if stage == "interaction":
+            opposite = False
+            for left, right in (("execution_cash", "execution_inherited"), ("capital_daily", "capital_observed")):
+                a, b = result["ranges"][left], result["ranges"][right]
+                opposite = opposite or bool(a and b and (a["high"] < 0 < b["low"] or b["high"] < 0 < a["low"]))
+            if not opposite:
+                result["stage"] = "uncertain"
+        return result
+    if value.get("stage") in {"interaction", "supported", "uncertain"}:
+        return {"stage": "uncertain", "evidence": {}}
+    if value.get("stage") not in stages:
+        return {"stage": "uncertain", "evidence": {}}
     raw = value.get("evidence")
     if not isinstance(raw, dict):
         return None
@@ -187,12 +223,13 @@ def _attribution(value):
 
 
 def _research_direction(history, mode, execution_hint):
-    latest = next((value for item in history if isinstance(item, dict)
-                   if (value := _attribution(item.get("attribution"))) is not None), None)
+    latest = next((_attribution(item["attribution"]) for item in history
+                   if isinstance(item, dict) and isinstance(item.get("attribution"), dict)), None)
     if latest is not None:
         selected = {"signal": ("conditions", "ranking", "exit"),
                     "execution": ("execution", "conditions"),
-                    "capital": ("allocation",), "insufficient": FAMILIES}
+                    "capital": ("allocation",), "interaction": ("execution", "allocation", "conditions"),
+                    "supported": FAMILIES, "uncertain": FAMILIES, "insufficient": FAMILIES}
         return selected[latest["stage"]], latest
     if execution_hint:
         return ("execution", "conditions"), None
@@ -236,12 +273,27 @@ def _hypothesis(family, attribution, execution_hint):
                "allocation": "비중·보유 한도만 바꿔 자본 배분의 차이를 검증합니다.",
                "exit": "보유 기간·청산 조건만 바꿔 청산 결과의 차이를 검증합니다.",
                "execution": "진입 갭 허용값만 바꿔 집행 결과의 차이를 검증합니다."}
-    prefix = {"signal": "동일 관측의 신호 비교를 근거로 ",
-              "execution": "동일 관측의 집행 비교를 근거로 ",
-              "capital": "동일 관측의 자본 비교를 근거로 ",
+    prefix = {"signal": "현금·일봉 시가 모형의 정책 차이를 새 기간에 검증하도록 ",
+              "execution": "두 시작 상태의 조건부 집행 차이를 새 기간에 검증하도록 ",
+              "capital": "두 집행 모형의 상태 인계 차이를 새 기간에 검증하도록 ",
+              "interaction": "상태에 따른 효과 차이를 새 기간에 검증하도록 ",
+              "supported": "관측된 모형 내 우세에 추가 변경이 도움이 되는지 ",
+              "uncertain": "원인 미확정 상태에서 한 변경의 효과를 새 기간에 검증하도록 ",
               "insufficient": "평가 근거가 부족해 가설을 탐색합니다. "}
     evidence = prefix[attribution["stage"]] if attribution else "확정 주문 집계를 근거로 " if execution_hint else ""
     return evidence + changes[family]
+
+
+def _hypothesis_test(family, attribution, history):
+    metric = {"bootstrap": "D11", "conditions": "D00", "ranking": "D00", "exit": "D00",
+              "allocation": "capital_observed", "execution": "execution_inherited"}[family]
+    if family == "conditions" and attribution is not None and attribution["stage"] == "execution":
+        metric = "execution_inherited"
+    source = next((item for item in history if isinstance(item, dict) and isinstance(item.get("attribution"), dict)), {})
+    result = {"metric": metric, "direction": "positive"}
+    if isinstance(source.get("id"), str) and len(source["id"]) <= 128:
+        result["source_trial_id"] = source["id"]
+    return result
 
 
 def _summaries(frames):
@@ -421,6 +473,8 @@ def propose_candidate(champion, frames, limits, history, llm=None):
     mode, summaries = _feedback(history), _summaries(frames)
     execution_hint = _execution_hint(history)
     families, attribution = _research_direction(history, mode, execution_hint)
+    if attribution is not None and attribution["stage"] in {"interaction", "uncertain", "insufficient", "supported"}:
+        mode = "exploit" if attribution["stage"] == "supported" else "bootstrap"
     if attribution is not None and attribution["stage"] != "execution":
         execution_hint = False
     parent_id = policy_id(champion)
@@ -526,4 +580,5 @@ def propose_candidate(champion, frames, limits, history, llm=None):
     return {"policy": deepcopy(policy), "rationale": rationale, "parent_id": parent_id,
             "change_family": family, "changes": changes,
             "hypothesis": _hypothesis(family, attribution, execution_hint),
+            "hypothesis_test": _hypothesis_test(family, attribution, history),
             "method": method + ("_development" if evaluations else "_bootstrap"), "development": development}

@@ -19,9 +19,10 @@ MAX_PAGES = 1000
 class BrokerRejected(KisError):
     """주문 미전송 또는 KIS의 명시적인 업무 거절. 재시도 결정은 호출자에게 있다."""
 
-    def __init__(self, message="모의 주문이 거절됐습니다.", *, code=None):
+    def __init__(self, message="모의 주문이 거절됐습니다.", *, code=None, request_sent=True):
         super().__init__(message)
         self.code = code
+        self.request_sent = request_sent
 
 
 class BrokerUnknown(KisError):
@@ -364,7 +365,7 @@ class PaperBroker:
         try:
             token = self.client.token()
         except Exception:
-            raise BrokerRejected("모의 주문 전 인증에 실패했습니다.") from None
+            raise BrokerRejected("모의 주문 전 인증에 실패했습니다.", request_sent=False) from None
         headers = {"authorization": "Bearer " + token, "appkey": self.profile.settings.app_key,
                    "appsecret": self.profile.settings.app_secret, "tr_id": tr_id, "custtype": "P"}
         try:

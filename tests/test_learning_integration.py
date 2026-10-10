@@ -200,7 +200,8 @@ class LearningIntegrationTests(unittest.TestCase):
         self.assertTrue(self.service.store.setting("user_paused"))
         self.service._learn(self.input_data, {"signals": [], "collection_hash": "paused-attempt"})
         context = self.service.learning.enqueue.call_args.kwargs["context"]
-        self.assertEqual(context["execution_basis"], {"buy_orders": 0, "sell_orders": 0})
+        self.assertEqual(context["execution_basis"], {"buy_orders": 0, "sell_orders": 0,
+                                                     "buy_context_orders": 0, "sell_context_orders": 0})
 
     def test_pause_during_durable_reservation_is_rechecked_at_broker_boundary(self):
         self.enable()

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from backend.experiment_analysis import AnalysisError, CodexLLM, CompatibleLLM
 from backend.learning_policy import BASELINE_POLICY, policy_id, validate_policy
 from backend.learning_research import MAX_CANDIDATES, POLICY_SCHEMA, propose_candidate
+from backend.learning_attribution import VERSION as ATTRIBUTION_VERSION
 
 
 LIMITS = {"budget": "1000000", "order_cap": "100000", "daily_buy_limit": "300000"}
@@ -66,6 +67,7 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("신설", result["hypothesis"])
         self.assertIsNone(result["development"]["parent_comparison"])
         self.assertNotIn("parent_id", result["policy"])
+        self.assertEqual(result["hypothesis_test"], {"metric": "D11", "direction": "positive"})
 
     def test_same_inputs_are_deterministic_and_frozen(self):
         args = [deepcopy(BASELINE_POLICY), frames(), deepcopy(LIMITS), []]
@@ -254,6 +256,32 @@ class ResearchTests(unittest.TestCase):
         ignored = propose_candidate(champion, [], LIMITS, [{"attribution": {"stage": "capital", "evidence": {}}}])
         self.assertEqual(ignored["policy"], propose_candidate(champion, [], LIMITS, [])["policy"])
 
+    def test_next_candidate_freezes_a_direction_before_new_trial_results_exist(self):
+        cases = [("signal", {"signal_excess_pp": -2}, "D00"),
+                 ("execution", {"execution_drag_pp": -2}, "execution_inherited"),
+                 ("capital", {"capital_drag_pp": -2}, "capital_observed")]
+        for stage, evidence, metric in cases:
+            history = [{"id": "prior-trial", "attribution": {"stage": stage, "evidence": evidence}}]
+            before = deepcopy(history)
+            result = propose_candidate(rule(), [], LIMITS, history)
+            self.assertEqual(result["hypothesis_test"], {"metric": metric, "direction": "positive",
+                                                        "source_trial_id": "prior-trial"})
+            self.assertEqual(history, before)
+            self.assertNotIn("hypothesis_test", result["policy"])
+            self.assertIsNone(result["development"]["parent_comparison"])
+
+    def test_execution_feedback_precommits_liquidity_condition_effect(self):
+        returned = rule()
+        returned["strategies"][0]["conditions"].append({"feature": "turnover", "op": "gt", "value": 100000000})
+        class FakeLLM:
+            def generate(self, *args):
+                return returned
+        result = propose_candidate(rule(), [], LIMITS,
+            [{"id": "prior", "attribution": {"stage": "execution", "evidence": {"execution_drag_pp": -2}}}],
+            llm=FakeLLM())
+        self.assertEqual(result["change_family"], "conditions")
+        self.assertEqual(result["hypothesis_test"]["metric"], "execution_inherited")
+
     def test_llm_multifamily_or_wrong_attribution_family_is_rejected(self):
         champion = rule()
         multiple = deepcopy(champion)
@@ -343,6 +371,53 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(second["parent_id"], policy_id(champion))
         self.assertNotEqual(second["change_family"], first["change_family"])
         self.assertNotEqual(second["policy"]["strategies"][0]["rank_by"], champion["strategies"][0]["rank_by"])
+
+    def test_latest_supported_or_uncertain_result_never_resurrects_an_old_failure(self):
+        champion = rule()
+        old = {"metrics": metrics(-3, -6, 8), "attribution": {"stage": "capital", "evidence": {"capital_drag_pp": -3}},
+               "execution": {"terminal_orders": 20, "fill_ratio": 0, "rejection_rate": .5}}
+        for stage in ("supported", "uncertain", "insufficient"):
+            latest = {"metrics": {"valid": False}, "attribution": {"version": ATTRIBUTION_VERSION, "unit": "log_pp",
+                "stage": stage, "contrasts": {"D11": 2}, "effects": {}, "ranges": {"D11": {"low": 1, "high": 3}}}}
+            result = propose_candidate(champion, [], LIMITS, [latest, old])
+            self.assertEqual(result["change_family"], "conditions")
+            self.assertFalse(result["development"]["execution_hint"])
+            self.assertEqual(result["policy"]["cash_reserve"], champion["cash_reserve"])
+            self.assertNotIn("자본 비교", result["hypothesis"])
+
+    def test_new_log_attribution_drives_a_single_family_and_reaches_llm_as_numeric_evidence(self):
+        calls = []
+        attribution = {"version": ATTRIBUTION_VERSION, "unit": "log_pp", "stage": "capital",
+            "contrasts": {"D00": 2, "D01": -1, "D10": 2, "D11": -1},
+            "effects": {"capital_daily": -3, "capital_observed": -3, "gamma": 0},
+            "ranges": {"capital_daily": {"low": -4, "high": -2}, "capital_observed": {"low": -4, "high": -2}},
+            "account": "private-account"}
+        class FakeLLM:
+            def generate(self, prompt, payload, schema):
+                calls.append(payload)
+                return None
+        result = propose_candidate(rule(), [], LIMITS, [{"attribution": attribution}], llm=FakeLLM())
+        self.assertEqual(result["change_family"], "allocation")
+        self.assertIn("두 집행 모형", result["hypothesis"])
+        self.assertEqual(calls[0]["allowed_change_families"], ["allocation"])
+        self.assertEqual(calls[0]["attribution"]["unit"], "log_pp")
+        self.assertEqual(calls[0]["attribution"]["effects"]["capital_daily"], -3)
+        self.assertNotIn("private-account", json.dumps(calls))
+        attribution["ranges"]["capital_daily"] = {"low": -4, "high": 1}
+        uncertain = propose_candidate(rule(), [], LIMITS, [{"attribution": attribution}])
+        self.assertEqual(uncertain["change_family"], "conditions")
+        self.assertIn("미확정", uncertain["hypothesis"])
+
+    def test_interaction_hypothesis_changes_one_family_and_keeps_other_axes_frozen(self):
+        champion = rule()
+        result = propose_candidate(champion, [], LIMITS, [{"attribution": {"version": ATTRIBUTION_VERSION,
+            "unit": "log_pp", "stage": "interaction", "contrasts": {}, "effects": {"execution_cash": -1, "execution_inherited": 1},
+            "ranges": {"execution_cash": {"low": -2, "high": -.5}, "execution_inherited": {"low": .5, "high": 2}}}}])
+        self.assertEqual(result["change_family"], "execution")
+        self.assertEqual(result["policy"]["strategies"], champion["strategies"])
+        self.assertEqual(result["policy"]["cash_reserve"], champion["cash_reserve"])
+        self.assertIn("상태에 따른 효과 차이", result["hypothesis"])
+        self.assertEqual([item["path"] for item in result["changes"]], ["entry_slippage_bps"])
 
 
 class StructuredProviderTests(unittest.TestCase):

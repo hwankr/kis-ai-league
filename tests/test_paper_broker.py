@@ -94,6 +94,7 @@ class PaperBrokerTests(unittest.TestCase):
         with self.assertRaises(BrokerRejected) as caught:
             self.broker.submit("005930", "buy", 1, 70000)
         self.assertNotIn("test-secret", str(caught.exception))
+        self.assertFalse(caught.exception.request_sent)
         self.client._request.assert_not_called()
 
     def test_business_rejection_exposes_only_safe_code(self):
@@ -105,6 +106,7 @@ class PaperBrokerTests(unittest.TestCase):
         with self.assertRaises(BrokerRejected) as caught:
             self.broker.submit("005930", "buy", 1, 70000)
         self.assertEqual(caught.exception.code, "EGW00123")
+        self.assertTrue(caught.exception.request_sent)
 
     def test_raw_business_rejection_is_not_retried(self):
         self.client._request.return_value = ({"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "test-secret"}, {})

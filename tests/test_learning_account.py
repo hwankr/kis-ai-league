@@ -4,10 +4,12 @@ from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
+import json
 from unittest.mock import patch
 
 from backend.experiment_store import ExperimentStore
-from backend.learning_account import LearningAccount, owned_book, execution_model, FEE, TAX
+from backend.learning_account import (LearningAccount, owned_book, execution_model, execution_profile,
+                                     confirmed_execution_orders, FEE, TAX)
 from backend.learning_policy import portfolio_metrics
 from backend.kis import KisError
 from tests import test_experiments as fixtures
@@ -84,8 +86,9 @@ class AccountTests(unittest.TestCase):
         orders += [{'status': 'cancelled', 'side': 'buy', 'filled_quantity': 0, 'quantity': 10,
                     'submission_skipped': True} for _ in range(5)]
         model = execution_model(orders)
-        self.assertEqual(model['buy_fill_ratio'], .5)
-        self.assertNotIn('sell_fill_ratio', model)
+        self.assertEqual(model['estimates']['buy_fill_ratio'], .5)
+        self.assertIsNone(model['estimates']['sell_fill_ratio'])
+        self.assertEqual(model['status'], 'insufficient')
         sample = frames(3, price=10000)
         for frame in sample:
             frame['execution_quotes'] = {'005930': {'price': frame['rows'][0]['open'], 'eligible': True,
@@ -93,6 +96,82 @@ class AccountTests(unittest.TestCase):
         result = portfolio_metrics(rules(), sample, {'budget': '1000000', 'order_cap': '250000', 'daily_buy_limit': '500000'},
                                    execution_model=model)
         self.assertTrue(result['valid'], result['error'])
+        self.assertFalse(result['promotion_supported'])
+
+    def test_no_observations_never_become_a_full_fill_estimate(self):
+        profile = execution_profile([])
+        self.assertEqual(profile, execution_model([]))
+        self.assertEqual(profile['estimates'], {'buy_fill_ratio': None, 'sell_fill_ratio': None})
+        self.assertEqual(profile['basis']['buy_orders'], 0)
+        self.assertIsNone(profile['support']['buy'])
+        self.assertEqual([row['id'] for row in profile['scenarios']],
+                         ['partial_fill', 'delayed_sell', 'adverse_buy'])
+        self.assertEqual(profile['scenarios'][0]['model']['fill_ratio'], .5)
+        self.assertTrue(all(row['assumption'] for row in profile['scenarios']))
+
+    def test_terminal_zero_fills_count_but_unsent_unknown_and_inconsistent_do_not(self):
+        base = {'status': 'cancelled', 'side': 'buy', 'quantity': 10, 'filled_quantity': 0, 'request_sent': True}
+        orders = [base, {**base, 'status': 'rejected'}, {**base, 'filled_quantity': 5},
+                  {**base, 'status': 'filled', 'filled_quantity': 10},
+                  {**base, 'request_sent': False}, {**base, 'submission_skipped': True},
+                  {**base, 'status': 'partial'}, {**base, 'status': 'unknown'},
+                  {**base, 'status': 'filled'}, {**base, 'filled_quantity': 11},
+                  {**base, 'quantity': True}]
+        profile = execution_profile(orders)
+        self.assertEqual(profile['basis']['buy_orders'], 4)
+        self.assertEqual(profile['estimates']['buy_fill_ratio'], .375)
+
+    def test_legacy_zero_fill_status_needs_transmission_evidence(self):
+        legacy = {'status': 'rejected', 'side': 'buy', 'quantity': 10, 'filled_quantity': 0}
+        accepted = [{**legacy, 'order_id': '123'}, {**legacy, 'accepted_at': '2026-07-01T09:10:00+09:00'},
+                    {**legacy, 'request_sent': True}, {**legacy, 'submission_skipped': False},
+                    {**legacy, 'status': 'cancelled', 'filled_quantity': 2}]
+        orders = [legacy, {**legacy, 'status': 'cancelled'}, *accepted,
+                  {**legacy, 'request_sent': False}, {**legacy, 'order_id': '123', 'submission_skipped': True}]
+        self.assertEqual(confirmed_execution_orders(orders), accepted)
+        self.assertEqual(execution_profile(orders)['basis']['buy_orders'], len(accepted))
+        self.assertEqual(execution_profile(orders)['estimates']['buy_fill_ratio'], .04)
+
+    def test_context_ranges_are_frozen_by_side_and_use_minute_bar_volume(self):
+        base = {'status': 'cancelled', 'quantity': 10, 'filled_quantity': 5,
+                'decision_price': 100, 'decision_volume': 300,
+                'decision_observed_at': '2026-07-01T00:10:00+00:00'}
+        orders = [{**base, 'side': 'buy'}, {**base, 'side': 'buy', 'decision_price': 110,
+                  'decision_volume': 900, 'decision_observed_at': '2026-07-01T10:20:00+09:00'},
+                  {**base, 'side': 'sell', 'filled_quantity': 2}]
+        original = deepcopy(orders)
+        profile = execution_profile(orders)
+        self.assertEqual(profile['status'], 'estimated')
+        self.assertEqual(profile['support']['buy'], {'price_min': 100., 'price_max': 110.,
+            'minute_min': 550, 'minute_max': 620, 'volume_min': 300., 'volume_max': 900.})
+        self.assertEqual(profile['support']['sell']['price_max'], 100)
+        self.assertEqual(profile['estimates']['sell_fill_ratio'], .2)
+        self.assertEqual(orders, original)
+        self.assertEqual(profile, json.loads(json.dumps(profile)))
+        self.assertEqual(profile['scenarios'][0]['id'], 'empirical')
+
+    def test_prediction_error_uses_only_preorder_predictions_on_confirmed_terminal_orders(self):
+        base = {'status': 'cancelled', 'side': 'buy', 'quantity': 10, 'filled_quantity': 5,
+                'created_at': '2026-07-01T09:10:00+09:00'}
+        prediction = {'version': 1, 'fill_ratio': .8, 'created_at': base['created_at']}
+        orders = [{**base, 'execution_prediction': prediction},
+                  {**base, 'execution_prediction': {**prediction, 'fill_ratio': None}},
+                  {**base, 'execution_prediction': {**prediction, 'created_at': '2026-07-02T09:10:00+09:00'}},
+                  {**base, 'execution_prediction': prediction, 'submission_skipped': True},
+                  {**base, 'execution_prediction': prediction, 'status': 'partial'}]
+        profile = execution_profile(orders)
+        self.assertEqual(profile['prediction_basis'], {'buy': 1, 'sell': 0})
+        self.assertAlmostEqual(profile['prediction_mae']['buy'], .3)
+        self.assertIsNone(profile['prediction_mae']['sell'])
+
+    def test_bad_context_does_not_fabricate_support_or_discard_known_fill_ratio(self):
+        base = {'status': 'cancelled', 'quantity': 10, 'filled_quantity': 5,
+                'decision_price': 100, 'decision_volume': 300,
+                'decision_observed_at': '2026-07-01T09:10:00'}  # timezone missing
+        profile = execution_profile([{**base, 'side': side} for side in ('buy', 'sell')])
+        self.assertEqual(profile['status'], 'estimated')
+        self.assertEqual(profile['estimates']['sell_fill_ratio'], .5)
+        self.assertEqual(profile['support'], {'buy': None, 'sell': None})
 
 
 class ProtectiveExecutionTests(unittest.TestCase):
