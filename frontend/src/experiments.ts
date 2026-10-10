@@ -35,8 +35,15 @@ export interface LearningData {
   last_evaluation: { as_of: string; sessions: number; required_sessions: number;
     champion_return_pct: number | null; challenger_return_pct: number | null;
     champion_drawdown_pct: number | null; challenger_drawdown_pct: number | null;
-    closed_trades: number; decision: string; reason: string } | null;
+    closed_trades: number; decision: string; reason: string; phase?: 'paper_provisional' } | null;
   last_change: { at: string; from: string; to: string; reason: string } | null;
+  account?: { as_of: string; equity: string; cash: string; return_pct: number; max_drawdown_pct: number;
+    observations: number; basis: 'project_confirmed_fills';
+    risk: { active: boolean; limit_pct: number; drawdown_pct: number; triggered_at?: string };
+    comparisons?: { start_day: string; ai_return_pct: number | null;
+      baseline_return_pct: number | null; market_return_pct: number | null; cash_return_pct: 0;
+      status: string; basis: 'daily_open_model' | 'observed_quotes_model'; market_name: 'KOSPI 가격지수'; error?: string | null } | null;
+  } | null;
   error: string | null;
 }
 export interface ExperimentData {
@@ -55,7 +62,7 @@ export interface ExperimentData {
   autonomy?: AutonomyData;
   learning?: LearningData;
 }
-export type ExperimentCommand = { action: 'analyze' | 'start' | 'pause' | 'reconcile' }
+export type ExperimentCommand = { action: 'analyze' | 'start' | 'pause' | 'reconcile' | 'reset_risk' }
   | { action: 'configure'; policy: ExperimentPolicy }
   | { action: 'cancel'; order_id: string }
   | { action: 'resolve'; id: string; broker_order_id: string; branch_id: string }
@@ -73,6 +80,7 @@ const list = (value: unknown, valid: (row: Record<string, unknown>) => boolean) 
 const strings = (value: unknown) => Array.isArray(value) && value.every(text);
 const symbol = (value: unknown) => text(value) && /^[0-9A-Z]{6}$/.test(value);
 const nullableNumber = (value: unknown) => value === null || typeof value === 'number' && Number.isFinite(value);
+const finiteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 const dateOrTime = (value: unknown) => time(value) || text(value) && /^\d{4}-\d{2}-\d{2}$/.test(value)
   && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
 
@@ -121,10 +129,29 @@ export function readExperiments(value: unknown): ExperimentData {
         && count(learning.last_evaluation.sessions) && count(learning.last_evaluation.required_sessions) && Number(learning.last_evaluation.required_sessions) > 0
         && ['champion_return_pct', 'challenger_return_pct', 'champion_drawdown_pct', 'challenger_drawdown_pct']
           .every(key => nullableNumber((learning.last_evaluation as Record<string, unknown>)[key]))
-        && count(learning.last_evaluation.closed_trades) && text(learning.last_evaluation.decision) && text(learning.last_evaluation.reason))
+        && count(learning.last_evaluation.closed_trades) && text(learning.last_evaluation.decision) && text(learning.last_evaluation.reason)
+        && (learning.last_evaluation.phase === undefined || learning.last_evaluation.phase === 'paper_provisional'))
       || !(learning.last_change === null || object(learning.last_change) && time(learning.last_change.at)
         && ['from', 'to', 'reason'].every(key => text((learning.last_change as Record<string, unknown>)[key])))
       || !nullableText(learning.error)) throw new Error('학습 운용 응답 형식 확인 필요');
+    if (learning.account !== undefined && learning.account !== null) {
+      const account = learning.account;
+      if (!object(account) || !dateOrTime(account.as_of) || !money(account.equity) || !money(account.cash)
+        || !finiteNumber(account.return_pct) || !finiteNumber(account.max_drawdown_pct) || account.max_drawdown_pct < 0
+        || !count(account.observations) || account.basis !== 'project_confirmed_fills'
+        || !object(account.risk) || typeof account.risk.active !== 'boolean'
+        || !finiteNumber(account.risk.limit_pct) || account.risk.limit_pct <= 0 || account.risk.limit_pct > 100
+        || !finiteNumber(account.risk.drawdown_pct) || account.risk.drawdown_pct < 0
+        || !(account.risk.triggered_at === undefined || time(account.risk.triggered_at))) throw new Error('AI 운용 성과 형식 확인 필요');
+      const comparison = account.comparisons;
+      if (comparison !== undefined && comparison !== null && (!object(comparison)
+        || !text(comparison.start_day) || !/^\d{4}-\d{2}-\d{2}$/.test(comparison.start_day) || !dateOrTime(comparison.start_day)
+        || !nullableNumber(comparison.ai_return_pct)
+        || !nullableNumber(comparison.baseline_return_pct) || !nullableNumber(comparison.market_return_pct)
+        || comparison.cash_return_pct !== 0 || !['ready', 'waiting', 'invalid'].includes(String(comparison.status))
+        || !['daily_open_model', 'observed_quotes_model'].includes(String(comparison.basis)) || comparison.market_name !== 'KOSPI 가격지수'
+        || !(comparison.error === undefined || nullableText(comparison.error)))) throw new Error('AI 비교 성과 형식 확인 필요');
+    }
   }
   return value as unknown as ExperimentData;
 }

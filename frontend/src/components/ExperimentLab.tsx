@@ -35,6 +35,8 @@ const learningStates = { disabled: '중지', waiting: '대기', researching: '�
 const learningDecisions: Record<string, string> = { promote: '후보 채택', promoted: '후보 채택', keep: '현재 전략 유지',
   retained: '현재 전략 유지', waiting: '평가 중', wait: '평가 중', reject: '후보 제외', rejected: '후보 제외',
   invalid: '평가 무효', rollback: '이전 전략 복귀' };
+const comparisonStates: Record<string, string> = { ready: '비교 모형', waiting: '비교 관측 대기', invalid: '비교 자료 확인 필요' };
+const magnitudePercent = (value: number) => percent(value).replace(/^\+/, '');
 const PAGE_SIZE = 10;
 
 function Pager({ page, pages, count, label, onChange }: { page: number; pages: number; count: number; label: string; onChange: (page: number) => void }) {
@@ -71,6 +73,8 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
   const orderPages = Math.max(1, Math.ceil(orders.length / PAGE_SIZE));
   const currentOrderPage = Math.min(orderPage, orderPages);
   const learning = data?.learning;
+  const ownedAccount = learning?.account;
+  const comparisons = ownedAccount?.comparisons;
   const label = (id: string) => id === 'all-strategies-v1' ? learning?.enabled ? '자동 전략 운용' : '전체 전략 균등' : data?.strategies.find(strategy => strategy.id === id)?.label ?? id;
   const locked = !!pending || !data;
   const positive = (value: string | null) => value !== null && /^\d+(?:\.\d+)?$/.test(value) && Number(value) > 0;
@@ -86,6 +90,8 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
   const change = (key: keyof ExperimentPolicy, value: string) => setPolicy(previous => ({ ...previous, [key]: value || null }));
   const executionLabel = data?.policy.execution_strategy ? label(data.policy.execution_strategy) : autonomy ? '자동 설정 중' : '전략 미설정';
   const openOrderCount = orders.filter(order => order.filled_quantity < order.quantity && !['cancelled', 'canceled', 'rejected', 'failed', 'filled'].includes(order.status)).length;
+  const unresolvedOrders = orders.some(order => !['cancelled', 'canceled', 'rejected', 'failed', 'filled'].includes(order.status));
+  const riskResetBlocked = !!data?.automation.enabled || !!data?.positions.some(position => position.quantity > 0) || unresolvedOrders;
 
   return <div className="experiment-lab" aria-busy={loading && !data}>
     <section className="lab-control" aria-labelledby="lab-control-title">
@@ -127,7 +133,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
       <div className="lab-actions">
         <button type="button" className="lab-button lab-primary" disabled={locked || data?.busy} onClick={() => { void onExecute({ action: 'analyze' }); }}>{pending === 'analyze' || data?.busy ? '분석 중' : '지금 분석'}</button>
         {data?.automation.enabled ? <button type="button" className="lab-button lab-pause" disabled={locked} onClick={() => { void onExecute({ action: 'pause' }); }}>{pending === 'pause' ? '정지 중' : '신규 주문 정지'}</button>
-          : <button type="button" className="lab-button" disabled={locked || (!autonomy && !configured) || dirty || !!warning} onClick={() => { void onExecute({ action: 'start' }); }}>{pending === 'start' ? '시작 중' : '모의 자동 주문 시작'}</button>}
+          : <button type="button" className="lab-button" disabled={locked || (!autonomy && !configured) || dirty || !!warning} onClick={() => { void onExecute({ action: 'start' }); }}>{pending === 'start' ? '시작 중' : ownedAccount?.risk.active ? '보호 청산 재개' : '모의 자동 주문 시작'}</button>}
         <button type="button" className="lab-button" disabled={locked} onClick={() => { void onExecute({ action: 'reconcile' }); }}>{pending === 'reconcile' ? '확인 중' : '체결 확인'}</button>
       </div>
       <details className="lab-policy">
@@ -154,13 +160,39 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
     {learning ? <section className="lab-learning" aria-labelledby="lab-learning-title">
       <div className="panel-heading lab-heading"><h2 id="lab-learning-title">학습·전략 교체</h2>
         <span className={`lab-badge ${learning.enabled ? 'lab-badge-active' : ''}`}>{learningStates[learning.status]}</span></div>
+      {ownedAccount ? <div className="lab-owned-account" role="group" aria-label="AI 운용 성과">
+        <div className="lab-owned-heading"><h3>AI 운용 성과</h3><time dateTime={ownedAccount.as_of}>
+          {ownedAccount.as_of.length === 10 ? ownedAccount.as_of : timestamp(ownedAccount.as_of).text}</time></div>
+        <dl className="lab-owned-metrics"><div><dt>평가액</dt><dd>{number(ownedAccount.equity)}원</dd></div>
+          <div><dt>누적 수익률</dt><dd className={signClass(ownedAccount.return_pct)}>{percent(ownedAccount.return_pct)}</dd></div>
+          <div><dt>최대 낙폭</dt><dd>{magnitudePercent(ownedAccount.max_drawdown_pct)}</dd></div>
+          <div><dt>현금</dt><dd>{number(ownedAccount.cash)}원</dd></div></dl>
+        {comparisons ? <div className="lab-owned-comparisons">
+          <div className="lab-owned-basis">{comparisonStates[comparisons.status]} · <time dateTime={comparisons.start_day}>{comparisons.start_day}</time>부터 · 동기간 AI {percent(comparisons.ai_return_pct)}</div>
+          <table className="lab-learning-table" aria-label="AI 운용과 비교 기준 수익률"><thead><tr><th scope="col">기준</th><th scope="col">수익률</th><th scope="col">AI 초과</th></tr></thead>
+            <tbody>{([['최초 정책', comparisons.baseline_return_pct], ['현금', comparisons.cash_return_pct], [comparisons.market_name, comparisons.market_return_pct]] as const).map(([title, value]) => {
+              const excess = comparisons.status === 'ready' && value !== null && comparisons.ai_return_pct !== null ? comparisons.ai_return_pct - value : null;
+              return <tr key={title}><th scope="row">{title}</th><td className={signClass(value)}>{percent(value)}</td>
+                <td className={signClass(excess)}>{excess === null ? '—' : `${number(excess, true)}%p`}</td></tr>;
+            })}</tbody></table>
+          {comparisons.error ? <p className="lab-learning-reason" role="alert">{comparisons.error}</p> : null}
+        </div> : null}
+        <div className={`lab-owned-risk ${ownedAccount.risk.active ? 'lab-owned-risk-active' : ''}`}>
+          <span>{ownedAccount.risk.active ? '손실 보호 발동' : '손실 보호 정상'}</span>
+          <span>보호 낙폭 {magnitudePercent(ownedAccount.risk.drawdown_pct)} / 기준 {magnitudePercent(ownedAccount.risk.limit_pct)}</span>
+          {ownedAccount.risk.active ? <><button type="button" className="lab-button" disabled={locked || loading || !!warning || riskResetBlocked}
+            onClick={() => { void onExecute({ action: 'reset_risk' }); }}>{pending === 'reset_risk' ? '보호 해제 중' : '손실 보호 해제'}</button>
+            {riskResetBlocked ? <span>주문 정지·보유 및 미체결 정리 필요</span> : null}</> : null}
+        </div>
+      </div> : null}
       <dl className="lab-learning-strategies"><div><dt>현재 전략</dt><dd>{learning.champion.name}</dd>
         {learning.champion.adopted_at ? <dd className="lab-learning-time">채택 <time dateTime={learning.champion.adopted_at}>{timestamp(learning.champion.adopted_at).text}</time></dd> : null}</div>
         <div><dt>평가 후보</dt><dd>{learning.challenger?.name ?? '없음'}</dd>{learning.challenger ? <dd className="lab-learning-time">
-          <time dateTime={learning.challenger.started_at}>{timestamp(learning.challenger.started_at).text}</time> · {number(learning.challenger.sessions)}거래일</dd> : null}</div></dl>
+          <time dateTime={learning.challenger.started_at}>{timestamp(learning.challenger.started_at).text}</time> · 수익률 {number(learning.challenger.sessions)}구간</dd> : null}</div></dl>
       {learning.last_evaluation ? <div className="lab-learning-evaluation">
         <div className="lab-learning-result"><strong>{learningDecisions[learning.last_evaluation.decision] ?? learning.last_evaluation.decision}</strong>
-          <span>{number(learning.last_evaluation.sessions)} / {number(learning.last_evaluation.required_sessions)}거래일 · 완결 {number(learning.last_evaluation.closed_trades)}건</span>
+          {learning.last_evaluation.phase === 'paper_provisional' ? <span>모의 비교</span> : null}
+          <span>{number(learning.last_evaluation.sessions)} / {number(learning.last_evaluation.required_sessions)}구간 · 완결 {number(learning.last_evaluation.closed_trades)}건</span>
           <time dateTime={learning.last_evaluation.as_of}>{learning.last_evaluation.as_of.length === 10 ? learning.last_evaluation.as_of : timestamp(learning.last_evaluation.as_of).text}</time></div>
         <table className="lab-learning-table" aria-label="현재 전략과 후보의 평가 결과"><thead><tr><th scope="col">평가 지표</th><th scope="col">현재</th><th scope="col">후보</th></tr></thead>
           <tbody><tr><th scope="row">수익률</th><td className={signClass(learning.last_evaluation.champion_return_pct)}>{percent(learning.last_evaluation.champion_return_pct)}</td>

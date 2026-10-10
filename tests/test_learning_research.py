@@ -61,6 +61,11 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(result["development"]["valid"])
         self.assertIsNone(result["development"]["net_return_pct"])
         self.assertEqual(result["development"]["candidates_tested"], 0)
+        self.assertEqual(result["parent_id"], policy_id(BASELINE_POLICY))
+        self.assertEqual(result["change_family"], "bootstrap")
+        self.assertIn("신설", result["hypothesis"])
+        self.assertIsNone(result["development"]["parent_comparison"])
+        self.assertNotIn("parent_id", result["policy"])
 
     def test_same_inputs_are_deterministic_and_frozen(self):
         args = [deepcopy(BASELINE_POLICY), frames(), deepcopy(LIMITS), []]
@@ -103,7 +108,8 @@ class ResearchTests(unittest.TestCase):
             return metrics(10, 8, 2) if policy["cash_reserve"] >= .15 else metrics(30, -10, 20)
         with patch("backend.learning_research.portfolio_metrics", side_effect=evaluate):
             result = propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [])
-        self.assertEqual(len(calls), MAX_CANDIDATES)
+        self.assertEqual(len(calls), MAX_CANDIDATES + 1)
+        self.assertEqual(calls.pop(), validate_policy(BASELINE_POLICY))
         self.assertGreaterEqual(result["policy"]["cash_reserve"], .15)
         self.assertEqual(result["development"]["net_return_pct"], 10)
         self.assertGreater(len({item["strategies"][0]["rank_by"] for item in calls}), 1)
@@ -125,7 +131,7 @@ class ResearchTests(unittest.TestCase):
         # Make the LLM policy novel relative to this old trial.
         history[0]["policy"]["strategies"][0]["holding_sessions"] = 7
         with patch("backend.learning_research.portfolio_metrics", side_effect=lambda policy, *args:
-                   metrics(20, 18) if policy["strategies"][0]["id"] == "generated-rule" else metrics(1, .5)):
+                   metrics(20, 18) if policy["strategies"] and policy["strategies"][0]["id"] == "generated-rule" else metrics(1, .5)):
             result = propose_candidate(BASELINE_POLICY, frames(3), {**LIMITS, "budget": "987654321"}, history, llm=FakeLLM())
         self.assertEqual(len(calls), 1)
         self.assertEqual(result["method"], "llm_development")
@@ -200,6 +206,143 @@ class ResearchTests(unittest.TestCase):
                 result = propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [])
             self.assertFalse(result["development"]["valid"])
             self.assertIsNone(result["development"]["net_return_pct"])
+
+    def test_rule_candidates_change_one_family_and_metadata_describes_actual_changes(self):
+        champion = rule()
+        evaluated = []
+        def evaluate(policy, observations, limits):
+            evaluated.append(deepcopy(policy))
+            return metrics()
+        with patch("backend.learning_research.portfolio_metrics", side_effect=evaluate):
+            result = propose_candidate(champion, frames(3), LIMITS, [])
+        self.assertEqual(result["parent_id"], policy_id(champion))
+        for candidate in evaluated[:-1]:
+            changed = set()
+            for key in ("cash_reserve", "max_positions", "entry_slippage_bps"):
+                if champion[key] != candidate[key]:
+                    changed.add("execution" if key == "entry_slippage_bps" else "allocation")
+            a, b = champion["strategies"][0], candidate["strategies"][0]
+            for key in ("conditions", "rank_by", "descending", "weight", "top_n", "holding_sessions", "stop_loss_pct", "take_profit_pct"):
+                if a[key] != b[key]:
+                    changed.add("conditions" if key == "conditions" else "ranking" if key in {"rank_by", "descending"}
+                                else "allocation" if key in {"weight", "top_n"} else "exit")
+            self.assertEqual(len(changed), 1)
+            self.assertEqual(candidate["cancel_after_minutes"], champion["cancel_after_minutes"])
+        self.assertEqual(result["change_family"], "conditions")
+        self.assertEqual(result["changes"], [{"path": "strategies[0].conditions",
+                         "before": champion["strategies"][0]["conditions"],
+                         "after": result["policy"]["strategies"][0]["conditions"]}])
+
+    def test_attributed_failure_changes_allowed_mutations_and_selected_family(self):
+        champion = rule()
+        cases = [("signal", {"signal_excess_pp": -2}, {"conditions", "ranking", "exit"}),
+                 ("execution", {"execution_drag_pp": -2}, {"execution", "conditions"}),
+                 ("capital", {"capital_drag_pp": -2}, {"allocation"})]
+        selected = {}
+        for stage, evidence, allowed in cases:
+            history = [{"attribution": {"stage": stage, "evidence": evidence}}]
+            with patch("backend.learning_research.portfolio_metrics", return_value=metrics()):
+                result = propose_candidate(champion, frames(3), LIMITS, history)
+            self.assertIn(result["change_family"], allowed)
+            self.assertEqual(result["parent_id"], policy_id(champion))
+            selected[stage] = result
+        self.assertEqual(selected["signal"]["change_family"], "conditions")
+        self.assertEqual(selected["execution"]["change_family"], "execution")
+        self.assertEqual(selected["capital"]["change_family"], "allocation")
+        self.assertEqual(len({policy_id(item["policy"]) for item in selected.values()}), 3)
+        # An unsupported attribution label is not evidence of a cause.
+        ignored = propose_candidate(champion, [], LIMITS, [{"attribution": {"stage": "capital", "evidence": {}}}])
+        self.assertEqual(ignored["policy"], propose_candidate(champion, [], LIMITS, [])["policy"])
+
+    def test_llm_multifamily_or_wrong_attribution_family_is_rejected(self):
+        champion = rule()
+        multiple = deepcopy(champion)
+        multiple["strategies"][0].update(holding_sessions=5, rank_by="turnover")
+        wrong = deepcopy(champion)
+        wrong["strategies"][0]["holding_sessions"] = 5
+        history = [{"attribution": {"stage": "capital", "evidence": {"capital_drag_pp": -1}}}]
+        for returned in (multiple, wrong):
+            class FakeLLM:
+                def generate(self, *args):
+                    return returned
+            result = propose_candidate(champion, [], LIMITS, history, llm=FakeLLM())
+            self.assertEqual(result["development"]["llm_status"], "invalid_or_duplicate")
+            self.assertEqual(result["change_family"], "allocation")
+            self.assertEqual(result["policy"]["strategies"][0]["holding_sessions"], 3)
+
+    def test_llm_receives_numeric_attribution_and_valid_single_family_is_retained(self):
+        champion = rule()
+        calls = []
+        returned = deepcopy(champion)
+        returned["strategies"][0].update(id="rule-1", name="rule")
+        returned["entry_slippage_bps"] = 175
+        evidence = {"execution_drag_pp": -1.2, "terminal_orders": 6, "fill_ratio": .4,
+                    "rejection_rate": .2, "account": "private-account", "signal_excess_pp": float("nan")}
+        history = [{"attribution": {"stage": "execution", "evidence": evidence, "reason": "private-reason"}}]
+        class FakeLLM:
+            def generate(self, prompt, payload, schema):
+                calls.append(payload)
+                return returned
+        result = propose_candidate(champion, [], LIMITS, history, llm=FakeLLM())
+        self.assertEqual(result["method"], "llm_bootstrap")
+        self.assertEqual(result["change_family"], "execution")
+        self.assertEqual(result["changes"], [{"path": "entry_slippage_bps", "before": 100, "after": 175}])
+        self.assertEqual(result["policy"]["strategies"][0]["id"], champion["strategies"][0]["id"])
+        payload = calls[0]
+        self.assertEqual(payload["allowed_change_families"], ["execution", "conditions"])
+        self.assertEqual(payload["attribution"]["evidence"]["terminal_orders"], 6)
+        self.assertEqual(payload["history"][0]["attribution"], payload["attribution"])
+        self.assertIsNone(payload["attribution"]["evidence"]["signal_excess_pp"])
+        self.assertNotIn("private-", json.dumps(payload, allow_nan=False))
+
+    def test_parent_comparison_is_paired_and_missing_evidence_remains_null(self):
+        champion, observations = rule(), frames(3)
+        calls = []
+        def evaluate(policy, used_frames, used_limits):
+            calls.append((deepcopy(used_frames), deepcopy(used_limits)))
+            return metrics(3, 2, 4) if policy_id(policy) == policy_id(champion) else metrics(8, 6, 2)
+        with patch("backend.learning_research.portfolio_metrics", side_effect=evaluate):
+            result = propose_candidate(champion, observations, LIMITS, [])
+        self.assertTrue(all(item == (observations, LIMITS) for item in calls))
+        comparison = result["development"]["parent_comparison"]
+        self.assertEqual(comparison["parent_id"], policy_id(champion))
+        self.assertEqual(comparison["parent"]["net_return_pct"], 3)
+        self.assertEqual(comparison["delta"]["net_return_pct"], 5)
+        self.assertEqual(comparison["delta"]["stress_return_pct"], 4)
+        self.assertEqual(comparison["delta"]["max_drawdown_pct"], -2)
+        with patch("backend.learning_research.portfolio_metrics", side_effect=lambda policy, *args:
+                   {"valid": False} if policy_id(policy) == policy_id(champion) else metrics()):
+            missing = propose_candidate(champion, observations, LIMITS, [])
+        self.assertTrue(missing["development"]["valid"])
+        self.assertIsNone(missing["development"]["parent_comparison"])
+
+    def test_insufficient_feedback_does_not_manufacture_a_relative_result(self):
+        history = [{"attribution": {"stage": "insufficient", "evidence": {"terminal_orders": 0}}}]
+        result = propose_candidate(rule(), [], LIMITS, history)
+        self.assertIsNone(result["development"]["parent_comparison"])
+        self.assertIsNone(result["development"]["net_return_pct"])
+        self.assertIn("부족", result["hypothesis"])
+
+    def test_paired_feedback_also_guides_the_legacy_bootstrap(self):
+        normal = propose_candidate(BASELINE_POLICY, [], LIMITS, [])
+        execution = propose_candidate(BASELINE_POLICY, [], LIMITS,
+            [{"attribution": {"stage": "execution", "evidence": {"execution_drag_pp": -2}}}])
+        capital = propose_candidate(BASELINE_POLICY, [], LIMITS,
+            [{"attribution": {"stage": "capital", "evidence": {"capital_drag_pp": -2}}}])
+        self.assertEqual(execution["change_family"], "bootstrap")
+        self.assertLess(execution["policy"]["entry_slippage_bps"], normal["policy"]["entry_slippage_bps"])
+        self.assertLess(capital["policy"]["cash_reserve"], normal["policy"]["cash_reserve"])
+
+    def test_repeated_failed_rule_behavior_moves_to_another_single_family_candidate(self):
+        champion = rule()
+        first = propose_candidate(champion, [], LIMITS, [])
+        prior = deepcopy(first["policy"])
+        prior["name"] = "new label"
+        prior["strategies"][0]["id"] = "new-id"
+        second = propose_candidate(champion, [], LIMITS, [{"policy": prior, "decision": "keep"}])
+        self.assertEqual(second["parent_id"], policy_id(champion))
+        self.assertNotEqual(second["change_family"], first["change_family"])
+        self.assertNotEqual(second["policy"]["strategies"][0]["rank_by"], champion["strategies"][0]["rank_by"])
 
 
 class StructuredProviderTests(unittest.TestCase):

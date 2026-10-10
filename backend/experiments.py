@@ -103,6 +103,11 @@ class ExperimentService:
             self.autonomous = False
             settings = {}
         from backend.learning import LearningService
+        from backend.learning_account import LearningAccount
+        self.learning_account = LearningAccount(self.store)
+        self.risk_limit = float(settings.get('learning', {}).get('max_drawdown_pct', 15))
+        if not 0 < self.risk_limit <= 100:
+            raise KisError('학습 운용 최대 낙폭은 0 초과 100 이하로 설정하세요.')
         self.learning = LearningService(self.store,
             enabled=settings.get("learning", {}).get("enabled", self.autonomous) is True,
             now=self.now, llm_factory=self._get_llm, development_reader=self._development_inputs)
@@ -313,6 +318,7 @@ class ExperimentService:
                 if position["quantity"] == 0:
                     position.update(entry_date=order["order_date"], entry_id=order["id"],
                                     policy_id=order.get("policy_id"), exit_policy=order.get("exit_policy"),
+                                    exit_pending=order.get("exit_pending") is True,
                                     learning_engine_version=order.get("learning_engine_version"),
                                     cancel_after_minutes=order.get("cancel_after_minutes", 10))
                 position["quantity"] += quantity
@@ -348,6 +354,9 @@ class ExperimentService:
                         **actual.get(spec["id"], {}), **shadow.get(spec["id"], {})} for spec in self._specs()]
             enabled = self.store.setting("enabled", False)
             busy = self.worker is not None and self.worker.is_alive()
+            learning_account = self.learning_account.snapshot(policy)
+            if learning_account is not None:
+                learning_account['comparisons'] = self.learning.state().get('scorecard')
             return {"status": "running" if busy else "error" if self.error else "idle",
                     "busy": busy, "environment": "paper", "updated_at": self.updated_at,
                     "error": self.error, "llm": self._llm_meta(), "policy": public_policy(policy),
@@ -358,7 +367,8 @@ class ExperimentService:
                                  "blocked": self._blocked(), "issues": self.store.setting("issues", [])},
                     "strategies": self._specs(), "runs": self.store.runs(30, details=False),
                     "orders": list(reversed(orders[-200:])), "positions": positions,
-                    "metrics": metrics, "events": self.store.events(), "learning": self.learning.snapshot()}
+                    "metrics": metrics, "events": self.store.events(), "learning": {
+                        **self.learning.snapshot(), 'account': learning_account}}
 
     def mirror_snapshot(self, *, after=0, limit=100):
         """Read verified fill observations without fetching data or enabling orders."""
@@ -373,8 +383,18 @@ class ExperimentService:
         action = body["action"]
         allowed = {"configure": {"action", "policy"}, "cancel": {"action", "order_id"},
                    "resolve": {"action", "id", "broker_order_id", "branch_id"}}
-        if action not in {"analyze", "start", "pause", "reconcile", *allowed} or set(body) != allowed.get(action, {"action"}):
+        if action not in {"analyze", "start", "pause", "reconcile", "reset_risk", *allowed} or set(body) != allowed.get(action, {"action"}):
             raise KisError("실험 요청 항목이 올바르지 않습니다.")
+        if action == 'reset_risk':
+            with self.lock, file_lock(self.directory / 'runner.lock', blocking=False):
+                policy = self._policy()
+                positions, _ = self._portfolio(self._owned_orders(policy))
+                if self.store.setting('enabled', False) or positions or any(
+                        item['status'] in ACTIVE for item in self._owned_orders(policy)):
+                    raise KisError('주문을 정지하고 AI 보유·미체결을 정리한 뒤 보호를 해제하세요.')
+                self.learning_account.reset_protection(policy, self._timestamp())
+                self._event('risk_reset', '사용자가 손실 보호 기준을 다시 설정했습니다. 누적 성과는 유지합니다.')
+            return self.snapshot()
         if action == "pause":
             self._pause("사용자가 주문을 중지했습니다.")
             self._event("pause", "새 주문 중지")
@@ -496,6 +516,8 @@ class ExperimentService:
                     self._cycle()
                 elif any(item["status"] in ACTIVE for item in self._owned_orders(policy)):
                     self._reconcile(policy)
+                if self.learning.enabled and self._market_open():
+                    self._observe_learning_quotes(policy)
         except Exception as error:
             failure = error
         try:
@@ -599,7 +621,91 @@ class ExperimentService:
         policy = self._policy()
         if self.learning.enabled and policy.get("execution_strategy") == ALL_STRATEGIES:
             baseline = [item for item in run["signals"] if not item.get("policy_id")]
-            self.learning.enqueue(data, baseline, policy, source_id=run["collection_hash"])
+            from backend.learning_account import owned_book, execution_model
+            context = {'execution_model': execution_model(self._owned_orders(policy))}
+            terminal = [row for row in self._owned_orders(policy) if row['status'] in {'filled', 'cancelled', 'rejected'}
+                        and not row.get('submission_skipped')][-100:]
+            context['execution_basis'] = {side + '_orders': sum(row['side'] == side for row in terminal)
+                                          for side in ('buy', 'sell')}
+            quotes = self.store.setting('learning_quotes', {})
+            if quotes.get('day') == str(data['as_of']) and quotes.get('fingerprint') == policy.get('fingerprint'):
+                context['execution_quotes'] = quotes.get('quotes', {})
+            current = self.now().astimezone(KST)
+            if current.date().isoformat() == str(data['as_of']) and current.time() >= daytime(16):
+                orders = self._owned_orders(policy)
+                positions, metrics = self._portfolio(orders)
+                prices = {symbol: bar['close'] for symbol, bars in data.get('histories', {}).items()
+                          for day, bar in bars.items() if str(day) == str(data['as_of'])}
+                days = sorted({str(day) for values in data.get('calendars', {}).values() for day in values})
+                try:
+                    book = owned_book(policy, positions, metrics, orders, prices,
+                                      as_of=str(data['as_of']), session_days=days)
+                    context['initial_state'] = book
+                    self.learning_account.observe(policy, book, self._timestamp(), limit=self.risk_limit, daily=True,
+                                                  comparisons=self.learning.state().get('scorecard'))
+                except ValueError:
+                    context['book_error'] = 'AI 보유 평가가격 확인 필요'
+            self.learning.enqueue(data, baseline, policy, source_id=run["collection_hash"], context=context)
+
+    def _save_learning_quote(self, symbol, price=None, *, eligible=True, buy_eligible=True):
+        if not self.learning.enabled:
+            return
+        policy = self._policy()
+        if policy.get('execution_strategy') != ALL_STRATEGIES:
+            return
+        today = self.now().astimezone(KST).date().isoformat()
+        state = self.store.setting('learning_quotes', {})
+        if state.get('day') != today or state.get('fingerprint') != policy.get('fingerprint'):
+            state = {'day': today, 'fingerprint': policy.get('fingerprint'), 'quotes': {}}
+        if symbol not in state['quotes']:
+            state['quotes'][symbol] = {'price': str(price) if price is not None else None,
+                'eligible': eligible, 'buy_eligible': buy_eligible, 'observed_at': self._timestamp()}
+            self.store.save_setting('learning_quotes', state)
+
+    def _observe_learning_quotes(self, policy):
+        """One small decision-price observation per symbol/day, including a frozen challenger."""
+        if policy.get('execution_strategy') != ALL_STRATEGIES:
+            return
+        from backend.learning_policy import BASELINE_POLICY, signals
+        frames = self.learning.frames(1)
+        if not frames:
+            return
+        frame = frames[-1]
+        today = self.now().astimezone(KST).date().isoformat()
+        if frame['as_of'] >= today or stamp(frame['captured_at']) >= datetime.combine(
+                self.now().astimezone(KST).date(), daytime(9), KST):
+            return
+        state = self.learning.state()
+        policies = [BASELINE_POLICY, self.learning.champion()]
+        if state.get('trial'):
+            policies.append(state['trial']['policy'])
+        wanted = {row['symbol'] for candidate in policies for row in signals(candidate, frame)}
+        for candidate in (state.get('scorecard_book') or {}).get('positions', []):
+            wanted.add(candidate['symbol'])
+        trial = state.get('trial') or {}
+        wanted.update(row['symbol'] for row in (trial.get('initial_state') or {}).get('positions', []))
+        for metric in trial.get('metrics', {}).values():
+            if isinstance(metric, dict):
+                for key in ('final_state', 'stress_final_state'):
+                    wanted.update(row['symbol'] for row in (metric.get(key) or {}).get('positions', []))
+        quotes = self.store.setting('learning_quotes', {})
+        seen = quotes.get('quotes', {}) if quotes.get('day') == today and quotes.get('fingerprint') == policy.get('fingerprint') else {}
+        missing = sorted(wanted - seen.keys())[:5]
+        if missing:
+            broker = self._broker(policy)
+            if today not in broker.session_days(frame['as_of'], today):
+                return
+            account = broker.snapshot()
+            positions, _ = self._portfolio(self._owned_orders(policy))
+            owned = {}
+            for position in positions:
+                owned[position['symbol']] = owned.get(position['symbol'], 0) + position['quantity']
+            for symbol in missing:
+                buy_eligible = account['holdings'].get(symbol, {}).get('quantity', 0) <= owned.get(symbol, 0)
+                try:
+                    self._save_learning_quote(symbol, self._live_quote(broker, symbol), buy_eligible=buy_eligible)
+                except SymbolUnavailable:
+                    self._save_learning_quote(symbol, eligible=False, buy_eligible=buy_eligible)
 
     def _llm_retry_state(self, run):
         state = run.get("llm_status")
@@ -758,6 +864,8 @@ class ExperimentService:
     def _live_quote(self, broker, symbol):
         quote = broker.quote(symbol)
         if not quote["eligible"]:
+            if quote.get('reason') == 'status_unknown':
+                raise KisError('현재 종목 거래 상태를 확인할 수 없습니다.')
             raise SymbolUnavailable("현재 거래 제한 종목입니다.")
         session = broker.market_session(symbol)
         now = self.now().astimezone(KST)
@@ -807,10 +915,46 @@ class ExperimentService:
             raise OperationalBlock("전략 보유수량과 실제 계좌 잔고가 다릅니다. 체결 대조 필요", "balance_mismatch",
                                    "수동 매도·계좌 초기화·기업행사로 전략 보유수량이 변경됐는지 확인해 주세요.")
         self._resolve_issue("balance_mismatch")
+        protected = False
+        if policy.get('fingerprint'):
+            from backend.learning_account import owned_book
+            prices = {}
+            for position in positions:
+                symbol = position['symbol']
+                price = account['holdings'].get(symbol, {}).get('price')
+                if price is None:
+                    price = self._symbol_quote(broker, symbol,
+                        buy_eligible=account['holdings'].get(symbol, {}).get('quantity', 0) <= owned[symbol])
+                if price is not None:
+                    prices[symbol] = price
+            _, metrics = self._portfolio(orders)
+            try:
+                book = owned_book(policy, positions, metrics, orders, prices,
+                                  as_of=today.isoformat(), session_days=days)
+                value = self.learning_account.observe(policy, book, self._timestamp(), limit=self.risk_limit)
+                protected = bool(value and value['risk']['active'])
+            except ValueError:
+                raise OperationalBlock('AI 보유 평가가격이 없어 손실 한도를 확인할 수 없습니다.', 'risk_valuation') from None
+            self._resolve_issue('risk_valuation')
+            if protected:
+                for order in orders:
+                    if order['side'] == 'buy' and order['status'] in {'submitted', 'partial'} and order['order_date'] == today.isoformat():
+                        self._cancel(order['id'], broker)
+                orders = self._owned_orders(policy)
+                positions, _ = self._portfolio(orders)
+                account = broker.snapshot()
+                owned = {}
+                for position in positions:
+                    owned[position['symbol']] = owned.get(position['symbol'], 0) + position['quantity']
         # Process exits before considering new exposure. Only system-owned shares can be sold.
         for position in positions:
-            if not self._exit_due(position, days, today):
+            if not protected and not self._exit_due(position, days, today):
                 continue
+            if not position.get('exit_pending'):
+                entry = next(item for item in orders if item['id'] == position['entry_id'])
+                entry['exit_pending'] = True
+                self.store.save_order(entry)
+                position['exit_pending'] = True
             if any(item["symbol"] == position["symbol"] and item["status"] in ACTIVE for item in orders):
                 continue
             holding = account["holdings"].get(position["symbol"], {})
@@ -820,11 +964,14 @@ class ExperimentService:
                             question=f"{position['symbol']}에 수동 미체결 매도 주문이 있는지 확인해 주세요.")
                 continue
             self._resolve_issue("sellable:" + position["symbol"])
-            price = self._symbol_quote(broker, position["symbol"])
+            price = self._symbol_quote(broker, position["symbol"],
+                buy_eligible=holding.get('quantity', 0) <= owned[position['symbol']])
             if price is None:
                 continue
             self._submit(policy, broker, position, "sell", position["quantity"], price,
                          f"exit:{position['entry_id']}:{today.isoformat()}", run_id=None)
+        if protected:
+            return
         # The latest completed analysis must have existed before this session opened.
         runs = [run for run in self.store.runs(100, details=False) if run["as_of"] == prior_days[-1]
                 and stamp(run["created_at"]) < datetime.combine(today, daytime(9), KST)]
@@ -898,8 +1045,7 @@ class ExperimentService:
                       if learned else Decimal(1) / (4 if policy["execution_strategy"] == ALL_STRATEGIES else 1))
             exposure = Decimal(1) - Decimal(str(execution["cash_reserve"])) if learned else Decimal(1)
             cash_floor = decimal(policy["budget"]) * (1 - exposure)
-            owned_cash = (decimal(policy["budget"]) + sum(Decimal(item["realized_pnl"]) for item in portfolio_results) - used
-                          if learned else decimal(account["cash"]) - reserved)
+            owned_cash = decimal(policy["budget"]) + sum(Decimal(item["realized_pnl"]) for item in portfolio_results) - used
             available = min(caps[decision["strategy_id"]], decimal(policy["budget"]) * exposure - used,
                             decimal(policy["daily_buy_limit"]) - daily,
                             decimal(account["cash"]) - reserved - cash_floor, decimal(buying["cash"]),
@@ -912,16 +1058,20 @@ class ExperimentService:
             self._submit(policy, broker, decision, "buy", quantity, price,
                          f"entry:{policy['fingerprint']}:{today.isoformat()}:{symbol}", run_id=run["id"])
 
-    def _symbol_quote(self, broker, symbol):
+    def _symbol_quote(self, broker, symbol, *, buy_eligible=True):
         try:
             result = self._live_quote(broker, symbol)
         except SymbolUnavailable as error:
+            self._save_learning_quote(symbol, eligible=False, buy_eligible=buy_eligible)
             self._issue("symbol_unavailable", str(error), key="symbol:" + symbol, blocking=False)
             return None
         self._resolve_issue("symbol:" + symbol)
+        self._save_learning_quote(symbol, result, buy_eligible=buy_eligible)
         return result
 
     def _exit_due(self, position, days, today):
+        if position.get('exit_pending'):
+            return True
         rule = position.get("exit_policy") or {"holding_sessions": 5}
         if sum(position["entry_date"] <= day < today.isoformat() for day in days) >= rule["holding_sessions"]:
             return True
@@ -978,6 +1128,8 @@ class ExperimentService:
     def _submit(self, policy, broker, decision, side, quantity, price, intent_key, *, run_id):
         if self.stopping or not self.store.setting("enabled", False) or not self._market_open():
             return
+        if side == 'buy' and self.learning_account.state(policy.get('fingerprint', '')).get('risk', {}).get('active'):
+            return
         # Recheck credentials immediately before crossing the broker boundary.
         self._profile(policy)
         order = {"id": uuid4().hex, "strategy_id": decision["strategy_id"], "symbol": decision["symbol"],
@@ -986,12 +1138,20 @@ class ExperimentService:
                  "remaining_quantity": quantity, "status": "submitting", "order_id": None, "branch_id": None,
                  "order_date": self.now().astimezone(KST).date().isoformat(), "created_at": self._timestamp(),
                  "error": None, "fingerprint": policy["fingerprint"], "run_id": run_id}
+        order['decision_price'] = str(price)
         if decision.get("policy_id"):
             order.update(policy_id=decision["policy_id"], exit_policy=decision.get("exit_policy"),
                          cancel_after_minutes=decision.get("cancel_after_minutes", 10),
                          learning_engine_version=decision.get("learning_engine_version"),
                          reference_close=decision.get("reference_close"))
         if not self.store.reserve_order(order, intent_key):
+            return
+        # A pause can arrive while credentials or the durable intent are checked.
+        # This intent was never sent; it must not become an ambiguous broker order.
+        if self.stopping or not self.store.setting("enabled", False) or not self._market_open():
+            order.update(status="cancelled", remaining_quantity=0, submission_skipped=True,
+                         error="전송 직전 주문이 중지되어 보내지 않았습니다.")
+            self.store.save_order(order)
             return
         from backend.paper_broker import BrokerRejected
         try:

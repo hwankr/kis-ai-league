@@ -6,7 +6,7 @@ import { ExperimentLabPanel } from '../components/ExperimentLab';
 import { readExperiments } from '../experiments';
 import useExperiments from '../useExperiments';
 import { catalog, deferred, response } from './fixtures';
-import { autonomy, configuredPolicy, experimentOrder, experimentRun, experiments, learning } from './experiment-fixtures';
+import { autonomy, configuredPolicy, experimentOrder, experimentRun, experiments, learning, learningAccount } from './experiment-fixtures';
 
 const props = { loading: false, pending: null, error: null, accounts: catalog.accounts, onRefresh: () => {},
   onExecute: async () => true, onSelectSymbol: () => {} };
@@ -191,7 +191,8 @@ describe('experiment lab', () => {
     const panel = screen.getByRole('region', { name: '학습·전략 교체' });
     expect(within(panel).getByText('후보 평가 중')).toBeTruthy();
     expect(within(panel).getByText('거래량 회복 후보')).toBeTruthy();
-    expect(within(panel).getByText('4 / 20거래일 · 완결 3건')).toBeTruthy();
+    expect(within(panel).getByText('4 / 20구간 · 완결 3건')).toBeTruthy();
+    expect(panel.textContent).toContain('수익률 4구간');
     expect(within(panel).getByText('평가 기간 부족')).toBeTruthy();
     expect(within(panel).getByText('+1.75%')).toBeTruthy();
     expect(within(panel).getByText('-0.25%')).toBeTruthy();
@@ -240,6 +241,87 @@ describe('experiment lab', () => {
     await userEvent.keyboard('{Escape}');
     await userEvent.click(screen.getByRole('combobox', { name: '분석 전략' }));
     expect(screen.getByRole('option', { name: '학습 후보' })).toBeTruthy();
+  });
+
+  it('separates AI owned performance and model comparisons from whole paper account performance', () => {
+    render(<ExperimentLabPanel {...props} data={experiments({ autonomy: autonomy(), learning: learning({ account: learningAccount(),
+      last_evaluation: { ...learning().last_evaluation!, phase: 'paper_provisional' } }) })}/>);
+    const owned = screen.getByRole('group', { name: 'AI 운용 성과' });
+    expect(within(owned).getByText('1,025,000원')).toBeTruthy();
+    expect(within(owned).getByText('+2.50%')).toBeTruthy();
+    expect(within(owned).getByText('4.00%')).toBeTruthy();
+    expect(within(owned).getByText('700,000원')).toBeTruthy();
+    expect(within(owned).getByText('손실 보호 정상')).toBeTruthy();
+    expect(within(screen.getByLabelText('모의계좌 성과')).getByText('10,125,000')).toBeTruthy();
+    const comparison = within(owned).getByRole('table', { name: 'AI 운용과 비교 기준 수익률' });
+    const rows = within(comparison).getAllByRole('row');
+    expect(rows[1].textContent).toBe('최초 정책+1.50%-0.5%p');
+    expect(rows[2].textContent).toBe('현금0.00%+1%p');
+    expect(rows[3].textContent).toBe('KOSPI 가격지수+3.00%-2%p');
+    expect(within(owned).getByText('비교 모형 ·', { exact: false }).textContent).toBe('비교 모형 · 2026-10-05부터 · 동기간 AI +1.00%');
+    expect(screen.getByText('모의 비교')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '손실 보호 해제' })).toBeNull();
+  });
+
+  it.each(['waiting', 'invalid'])('never derives relative results from %s comparisons', status => {
+    render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ account: learningAccount({
+      comparisons: { ...learningAccount().comparisons!, status, error: '비교 관측 부족' } }) }) })}/>);
+    const table = screen.getByRole('table', { name: 'AI 운용과 비교 기준 수익률' });
+    for (const row of within(table).getAllByRole('row').slice(1)) expect(within(row).getAllByRole('cell')[1].textContent).toBe('—');
+    expect(screen.getByRole('alert').textContent).toBe('비교 관측 부족');
+  });
+
+  it('keeps unavailable benchmark values blank without hiding available comparisons', () => {
+    render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ account: learningAccount({
+      comparisons: { ...learningAccount().comparisons!, market_return_pct: null, error: '시장 지수 자료 없음' } }) }) })}/>);
+    const rows = within(screen.getByRole('table', { name: 'AI 운용과 비교 기준 수익률' })).getAllByRole('row');
+    expect(rows[1].textContent).toBe('최초 정책+1.50%-0.5%p');
+    expect(rows[3].textContent).toBe('KOSPI 가격지수——');
+  });
+
+  it('resets active protection once without enabling orders', async () => {
+    const onExecute = vi.fn().mockResolvedValue(true);
+    const account = learningAccount({ risk: { active: true, limit_pct: 15, drawdown_pct: 16, triggered_at: '2026-10-09T06:30:00Z' } });
+    const data = experiments({ policy: configuredPolicy, learning: learning({ account }) });
+    const { rerender } = render(<ExperimentLabPanel {...props} onExecute={onExecute} data={data}/>);
+    expect(screen.getByText('손실 보호 발동')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '보호 청산 재개' }).hasAttribute('disabled')).toBe(false);
+    await userEvent.click(screen.getByRole('button', { name: '손실 보호 해제' }));
+    expect(onExecute).toHaveBeenCalledExactlyOnceWith({ action: 'reset_risk' });
+    rerender(<ExperimentLabPanel {...props} onExecute={onExecute} data={{ ...data, learning: learning({ account: learningAccount() }) }}/>);
+    expect(screen.getByText('자동 주문 꺼짐')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '손실 보호 해제' })).toBeNull();
+    expect(onExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes protective liquidation without resetting protection while owned positions remain', async () => {
+    const onExecute = vi.fn().mockResolvedValue(true);
+    const data = experiments({ policy: configuredPolicy, learning: learning({ account: learningAccount({
+      risk: { active: true, limit_pct: 15, drawdown_pct: 16 } }) }),
+      positions: [{ strategy_id: 'rules', symbol: '005930', name: '삼성전자', quantity: 1, average_price: '100000' }] });
+    render(<ExperimentLabPanel {...props} onExecute={onExecute} data={data}/>);
+    expect(screen.getByRole('button', { name: '손실 보호 해제' }).hasAttribute('disabled')).toBe(true);
+    await userEvent.click(screen.getByRole('button', { name: '보호 청산 재개' }));
+    expect(onExecute).toHaveBeenCalledExactlyOnceWith({ action: 'start' });
+    expect(screen.getByText('손실 보호 발동')).toBeTruthy();
+  });
+
+  it('leaves relative returns blank when same-period AI performance is unavailable', () => {
+    render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ account: learningAccount({
+      comparisons: { ...learningAccount().comparisons!, ai_return_pct: null } }) }) })}/>);
+    const table = screen.getByRole('table', { name: 'AI 운용과 비교 기준 수익률' });
+    for (const row of within(table).getAllByRole('row').slice(1)) expect(within(row).getAllByRole('cell')[1].textContent).toBe('—');
+    expect(within(screen.getByRole('group', { name: 'AI 운용 성과' })).getByText('+2.50%')).toBeTruthy();
+  });
+
+  it.each(['enabled', 'position', 'unfilled', 'unknown', 'pending'] as const)('blocks protection reset while %s', reason => {
+    const data = experiments({ learning: learning({ account: learningAccount({ risk: { active: true, limit_pct: 15, drawdown_pct: 16 } }) }) });
+    if (reason === 'enabled') data.automation.enabled = true;
+    if (reason === 'position') data.positions = [{ strategy_id: 'rules', symbol: '005930', name: '삼성전자', quantity: 1, average_price: '100000' }];
+    if (reason === 'unfilled') data.orders = [experimentOrder()];
+    if (reason === 'unknown') data.orders = [experimentOrder({ status: 'unknown', filled_quantity: 3 })];
+    render(<ExperimentLabPanel {...props} pending={reason === 'pending' ? 'reset_risk' : null} data={data}/>);
+    expect(screen.getByRole('button', { name: reason === 'pending' ? '보호 해제 중' : '손실 보호 해제' }).hasAttribute('disabled')).toBe(true);
   });
 });
 
@@ -399,8 +481,49 @@ describe('experiment response validation', () => {
     { ...learning(), last_evaluation: { ...learning().last_evaluation, challenger_return_pct: '1.25' } },
     { ...learning(), last_evaluation: { ...learning().last_evaluation, champion_drawdown_pct: NaN } },
     { ...learning(), last_evaluation: { ...learning().last_evaluation, closed_trades: '3' } },
+    { ...learning(), last_evaluation: { ...learning().last_evaluation, phase: 'live' } },
     { ...learning(), last_change: { at: 'invalid', from: 'rules', to: 'llm', reason: '' } },
   ])('rejects malformed learning facts without coercing numbers', value => {
     expect(() => readExperiments({ ...experiments(), learning: value })).toThrow('학습 운용 응답 형식 확인 필요');
+  });
+
+  it('accepts optional owned performance, absent comparisons and unknown statistical fields', () => {
+    for (const account of [undefined, null, learningAccount(), learningAccount({ comparisons: null }), learningAccount({ comparisons: undefined })]) {
+      const data = experiments({ learning: learning({ account }) });
+      expect(readExperiments(data)).toBe(data);
+    }
+    const data = experiments({ learning: learning() });
+    Object.assign(data.learning!.last_evaluation!, { phase: 'paper_provisional', statistics: { combined_p_value: .02 } });
+    expect(readExperiments(data)).toBe(data);
+  });
+
+  it.each([
+    [], { ...learningAccount(), as_of: 'invalid' }, { ...learningAccount(), equity: 'NaN' },
+    { ...learningAccount(), cash: 0 }, { ...learningAccount(), return_pct: '2.5' },
+    { ...learningAccount(), return_pct: Infinity }, { ...learningAccount(), max_drawdown_pct: -1 },
+    { ...learningAccount(), observations: 1.5 }, { ...learningAccount(), basis: 'whole_account' },
+    { ...learningAccount(), risk: null }, { ...learningAccount(), risk: { ...learningAccount().risk, active: 'false' } },
+    { ...learningAccount(), risk: { ...learningAccount().risk, limit_pct: 0 } },
+    { ...learningAccount(), risk: { ...learningAccount().risk, limit_pct: 101 } },
+    { ...learningAccount(), risk: { ...learningAccount().risk, drawdown_pct: NaN } },
+    { ...learningAccount(), risk: { ...learningAccount().risk, triggered_at: 'invalid' } },
+  ])('rejects invalid owned account numbers and risk state', account => {
+    expect(() => readExperiments({ ...experiments(), learning: { ...learning(), account } })).toThrow('AI 운용 성과 형식 확인 필요');
+  });
+
+  it.each([
+    [], { ...learningAccount().comparisons, baseline_return_pct: Infinity },
+    { ...learningAccount().comparisons, market_return_pct: '3' },
+    { ...learningAccount().comparisons, ai_return_pct: Infinity },
+    { ...learningAccount().comparisons, ai_return_pct: '1' },
+    { ...learningAccount().comparisons, start_day: '2026-02-31' },
+    { ...learningAccount().comparisons, start_day: '2026-10-05T00:00:00Z' },
+    { ...learningAccount().comparisons, cash_return_pct: 1 },
+    { ...learningAccount().comparisons, status: 'unknown' },
+    { ...learningAccount().comparisons, basis: 'real_fills' },
+    { ...learningAccount().comparisons, market_name: 'KOSDAQ' },
+    { ...learningAccount().comparisons, error: 123 },
+  ])('rejects invalid benchmark comparison facts', comparisons => {
+    expect(() => readExperiments({ ...experiments(), learning: { ...learning(), account: { ...learningAccount(), comparisons } } })).toThrow('AI 비교 성과 형식 확인 필요');
   });
 });

@@ -1,8 +1,9 @@
 """Pure, bounded trading policies and prospective daily-bar portfolio evaluation.
 
 No training, storage, broker calls, or automatic adoption happens here. A signal
-uses a completed close and can enter only at the next session's open. Daily bars
-cannot evaluate cancellation minutes; that field is execution metadata only.
+uses a completed close and enters no earlier than the next session, using its
+open or an observed decision quote. Daily bars cannot evaluate cancellation
+minutes; that field is execution metadata only.
 """
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
@@ -213,8 +214,17 @@ def build_frame(data, baseline_signals=None):
                 pass
         rows.append({"symbol": symbol, "name": str(item.get("name", symbol)), "board": item["board"], **bar,
                      "features": features, "learning_eligible": item.get("learning_eligible", True) is True})
+    benchmark_prices = {}
+    for board in ("KOSPI", "KOSDAQ"):
+        try:
+            price = _number(benchmarks.get(board, {}).get(day), "invalid_benchmark", minimum=0)
+            if price > 0:
+                benchmark_prices[board] = price
+        except ValueError:
+            pass
     return {"as_of": day, "observed_at": observed.isoformat(), "rows": sorted(rows, key=lambda row: row["symbol"]),
             "baseline_signals": deepcopy(baseline_signals or []), "missing_symbols": sorted(missing),
+            "benchmark_prices": benchmark_prices,
             "session_days": sorted(set().union(*sessions.values())) if sessions else [day]}
 
 
@@ -277,33 +287,183 @@ def _decimal(value):
     return Decimal(str(_number(value)))
 
 
-def _replay(policy, frames, limits, slip):
+def _state_decimal(value):
+    # Restore money without a float round-trip, including partial-sale cost basis.
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ValueError("invalid_initial_number")
+    result = Decimal(str(value))
+    if not result.is_finite() or result < 0:
+        raise ValueError("invalid_initial_number")
+    return result
+
+
+def _decimal_text(value):
+    return format(value.normalize(), "f")
+
+
+def _exit_policy(value):
+    if not isinstance(value, dict):
+        raise ValueError("invalid_initial_exit_policy")
+    return {"holding_sessions": _integer(value.get("holding_sessions"), 1, 20, "invalid_initial_exit_policy"),
+            "stop_loss_pct": _number(value.get("stop_loss_pct"), minimum=0, maximum=20),
+            "take_profit_pct": _number(value.get("take_profit_pct"), minimum=0, maximum=100)}
+
+
+def _execution_model(value):
+    value = {} if value is None else value
+    allowed = {"mode", "fill_ratio", "buy_fill_ratio", "sell_fill_ratio", "fee_rate", "tax_rate",
+               "slippage_bps", "stress_slippage_bps", "stress_fee_rate", "stress_fill_ratio"}
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise ValueError("invalid_execution_model")
+    mode = value.get("mode", "daily_open")
+    if mode not in {"daily_open", "observed_quotes"}:
+        raise ValueError("invalid_execution_mode")
+    ratio = _number(value.get("fill_ratio", 1), "invalid_execution_model", minimum=0, maximum=1)
+    fee = value.get("fee_rate", FEE)
+    result = {"mode": mode}
+    for key, default, maximum in (("buy_fill_ratio", ratio, 1), ("sell_fill_ratio", ratio, 1),
+            ("fee_rate", fee, .05), ("tax_rate", TAX, .1),
+            ("slippage_bps", 10 if mode == "daily_open" else 0, 1000),
+            ("stress_slippage_bps", 20 if mode == "daily_open" else 0, 1000),
+            ("stress_fee_rate", fee if mode == "daily_open" else _decimal(fee) + Decimal(".001"), .05)):
+        result[key] = _decimal(_number(value.get(key, default), "invalid_execution_model", minimum=0, maximum=maximum))
+    result["stress_fill_ratio"] = (None if value.get("stress_fill_ratio") is None else
+                                   _decimal(_number(value["stress_fill_ratio"], "invalid_execution_model", minimum=0, maximum=1)))
+    if result["stress_slippage_bps"] < result["slippage_bps"] or result["stress_fee_rate"] < result["fee_rate"]:
+        raise ValueError("invalid_cost_stress")
+    return result
+
+
+def _initial_state(value, budget, first_day):
+    if value is None:
+        return budget, Decimal(0), {}, None
+    if not isinstance(value, dict) or value.get("as_of", first_day) != first_day:
+        raise ValueError("invalid_initial_state_date")
+    cash = _state_decimal(value.get("cash"))
+    reserved = _state_decimal(value.get("reserved_cash", 0))
+    if reserved > cash or not isinstance(value.get("positions", []), list):
+        raise ValueError("invalid_initial_state")
+    positions = {}
+    for item in value.get("positions", []):
+        symbol = _symbol(item.get("symbol"))
+        if symbol in positions:
+            raise ValueError("duplicate_initial_position")
+        position = {"strategy_id": _text(item.get("strategy_id"), "invalid_initial_strategy"),
+                    "quantity": _integer(item.get("quantity"), 1, 10**12, "invalid_initial_quantity"),
+                    "held_sessions": _integer(item.get("held_sessions", 0), 0, 10**6, "invalid_initial_age"),
+                    "exit_policy": _exit_policy(item.get("exit_policy"))}
+        for key in ("cost", "entry_price", "last_close"):
+            position[key] = _state_decimal(item.get(key))
+            if position[key] <= 0:
+                raise ValueError("invalid_initial_position")
+        if type(item.get("exit_pending", False)) is not bool:
+            raise ValueError("invalid_initial_exit_pending")
+        position["exit_pending"] = item.get("exit_pending", False)
+        position["exit_fill_remainder"] = _state_decimal(item.get("exit_fill_remainder", 0))
+        if position["exit_fill_remainder"] >= 1:
+            raise ValueError("invalid_exit_fill_remainder")
+        positions[symbol] = position
+    return cash, reserved, positions, value
+
+
+def _replay(policy, frames, limits, model, initial_state, *, stress=False, execution_stress=False):
     budget, order_cap, daily_limit = (limits[key] for key in ("budget", "order_cap", "daily_buy_limit"))
-    cash, positions, pending, equity_curve = budget, {}, [], []
+    cash, reserved, positions, saved = _initial_state(initial_state, budget, frames[0]["as_of"])
+    slip = model["stress_slippage_bps" if stress else "slippage_bps"] / 10000
+    fee, tax = model["stress_fee_rate" if stress else "fee_rate"], model["tax_rate"]
+    ratios = {side: model[side + "_fill_ratio"] for side in ("buy", "sell")}
+    if execution_stress:
+        ratios = {side: min(ratio, model["stress_fill_ratio"]) for side, ratio in ratios.items()}
     weights = {row["id"]: _decimal(row["weight"]) for row in _strategies(policy)}
-    reserve, closed = budget * _decimal(policy["cash_reserve"]), 0
-    previous_rows = {}
+    reserve, closed, identity = budget * _decimal(policy["cash_reserve"]), 0, policy_id(policy)
+    curve, pending = [], []
+    diagnostics = {key: 0 for key in ("buy_attempts", "sell_attempts", "buy_filled_quantity", "sell_filled_quantity",
+                   "partial_orders", "unfilled_orders", "untradeable_bars", "ineligible_quotes", "limit_blocked",
+                   "delayed_exit_sessions")}
+    paid_fee, paid_tax = Decimal(0), Decimal(0)
     for index, frame in enumerate(frames):
         rows = {row["symbol"]: row for row in frame["rows"]}
-        def trade_bar(symbol):
-            if symbol not in rows:
-                raise ValueError("required_price_missing")
-            bar = _bar(rows[symbol])
+        bars = {}
+        def bar_for(symbol):
+            if symbol not in bars:
+                if symbol not in rows:
+                    raise ValueError("required_price_missing")
+                bars[symbol] = {key: _decimal(value) for key, value in _bar(rows[symbol]).items()}
+            return bars[symbol]
+        def execution_price(symbol, side, limit=None):
+            bar = bar_for(symbol)
+            diagnostics[side + "_attempts"] += 1
             if bar["volume"] <= 0 or bar["high"] == bar["low"]:
-                raise ValueError("fill_unverifiable")
-            return {key: _decimal(value) for key, value in bar.items()}
+                diagnostics["untradeable_bars"] += 1
+                diagnostics["unfilled_orders"] += 1
+                return None
+            quote = {}
+            if model["mode"] == "observed_quotes":
+                quote = frame.get("execution_quotes", {}).get(symbol)
+                if (not isinstance(quote, dict) or type(quote.get("eligible")) is not bool
+                        or type(quote.get("buy_eligible", True)) is not bool):
+                    raise ValueError("execution_quote_missing")
+                observed = _instant(quote.get("observed_at"))
+                if observed.astimezone(KST).date().isoformat() != frame["as_of"] or observed > _instant(frame["observed_at"]):
+                    raise ValueError("execution_quote_outside_session")
+                if not quote["eligible"] or side == "buy" and not quote.get("buy_eligible", True):
+                    diagnostics["ineligible_quotes"] += 1
+                    diagnostics["unfilled_orders"] += 1
+                    return None
+                price = _decimal(quote.get("price"))
+                if price <= 0:
+                    raise ValueError("invalid_execution_quote")
+                explicit = quote.get(side + "_limit_price", quote.get("limit_price", price))
+                if explicit is not None:
+                    explicit = _decimal(explicit)
+                    if explicit <= 0:
+                        raise ValueError("invalid_execution_limit")
+                    limit = explicit if limit is None else (min(limit, explicit) if side == "buy" else max(limit, explicit))
+            else:
+                price = bar["open"]
+            price *= 1 + slip if side == "buy" else 1 - slip
+            if limit is not None and (price > limit if side == "buy" else price < limit):
+                diagnostics["limit_blocked"] += 1
+                diagnostics["unfilled_orders"] += 1
+                return None
+            return price
+        def fill_quantity(requested, side, position=None):
+            expected = requested * ratios[side]
+            if position is not None:
+                expected += position["exit_fill_remainder"]
+            quantity = min(requested, int(expected.to_integral_value(rounding=ROUND_FLOOR)))
+            if position is not None:
+                position["exit_fill_remainder"] = expected - quantity
+            diagnostics[side + "_filled_quantity"] += quantity
+            if quantity < requested:
+                diagnostics["partial_orders" if quantity else "unfilled_orders"] += 1
+            return quantity
         for symbol, position in list(positions.items()):
-            bar = trade_bar(symbol)
-            prior_close = _decimal(previous_rows[symbol]["close"])
-            change = (prior_close / position["entry_price"] - 1) * 100
+            bar_for(symbol)  # Suspensions still have a close for valuation.
+            if not index:
+                continue
+            position["held_sessions"] += 1
+            change = (position["last_close"] / position["entry_price"] - 1) * 100
             exit_policy = position["exit_policy"]
-            timed = index - position["entry_index"] >= exit_policy["holding_sessions"]
+            timed = position["held_sessions"] >= exit_policy["holding_sessions"]
             stopped = exit_policy["stop_loss_pct"] > 0 and change <= -_decimal(exit_policy["stop_loss_pct"])
             taken = exit_policy["take_profit_pct"] > 0 and change >= _decimal(exit_policy["take_profit_pct"])
-            if timed or stopped or taken:
-                cash += position["quantity"] * bar["open"] * (1 - slip) * (1 - FEE - TAX)
-                del positions[symbol]
-                closed += 1
+            if position["exit_pending"] or timed or stopped or taken:
+                position["exit_pending"] = True
+                price = execution_price(symbol, "sell")
+                quantity = fill_quantity(position["quantity"], "sell", position) if price is not None else 0
+                if quantity:
+                    proceeds = quantity * price
+                    cash += proceeds * (1 - fee - tax)
+                    paid_fee += proceeds * fee
+                    paid_tax += proceeds * tax
+                    position["cost"] *= Decimal(position["quantity"] - quantity) / position["quantity"]
+                    position["quantity"] -= quantity
+                if not position["quantity"]:
+                    del positions[symbol]
+                    closed += 1
+                else:
+                    diagnostics["delayed_exit_sessions"] += 1
         if policy["kind"] == "legacy":
             offset = date.fromisoformat(frame["as_of"]).toordinal() % len(LEGACY_IDS)
             ordering = LEGACY_IDS[offset:] + LEGACY_IDS[:offset]
@@ -315,55 +475,103 @@ def _replay(policy, frames, limits, slip):
         spent, strategy_spent = Decimal(0), dict.fromkeys(weights, Decimal(0))
         for signal in pending:
             symbol, strategy = signal["symbol"], signal["strategy_id"]
-            bar = trade_bar(symbol)
             if symbol in positions or policy["kind"] != "legacy" and len(positions) >= policy["max_positions"]:
-                continue
-            if (policy["kind"] != "legacy" and bar["open"] > _decimal(signal["reference_close"]) *
-                    (1 + _decimal(policy["entry_slippage_bps"]) / 10000)):
                 continue
             used = sum((position["cost"] for position in positions.values()), Decimal(0))
             strategy_used = sum((position["cost"] for position in positions.values() if position["strategy_id"] == strategy), Decimal(0))
             capacity = min(order_cap, daily_limit * weights[strategy] / max(1, counts[strategy]),
-                           budget - used, daily_limit - spent, cash - reserve,
+                           budget - reserve - used, daily_limit - spent, cash - reserved - reserve,
                            budget * weights[strategy] - strategy_used,
                            daily_limit * weights[strategy] - strategy_spent[strategy])
-            price = bar["open"] * (1 + slip)
-            unit_cost = price * (1 + FEE)
-            quantity = max(0, int((capacity / unit_cost).to_integral_value(rounding=ROUND_FLOOR)))
+            if capacity <= 0:
+                continue
+            limit = (None if policy["kind"] == "legacy" else _decimal(signal["reference_close"]) *
+                     (1 + _decimal(policy["entry_slippage_bps"]) / 10000))
+            price = execution_price(symbol, "buy", limit)
+            if price is None:
+                continue
+            unit_cost = price * (1 + fee)
+            requested = max(0, int((capacity / unit_cost).to_integral_value(rounding=ROUND_FLOOR)))
+            quantity = fill_quantity(requested, "buy") if requested else 0
             if not quantity:
                 continue
             cost = quantity * unit_cost
             cash -= cost
             spent += cost
             strategy_spent[strategy] += cost
+            paid_fee += quantity * price * fee
             positions[symbol] = {"strategy_id": strategy, "quantity": quantity, "cost": cost,
-                "entry_price": price, "entry_index": index, "exit_policy": signal["exit_policy"]}
-        equity = cash + sum((position["quantity"] * trade_bar(symbol)["close"] * (1 - slip) * (1 - FEE - TAX)
-                             for symbol, position in positions.items()), Decimal(0))
-        equity_curve.append(equity)
-        pending, previous_rows = signals(policy, frame), rows
-    peak, drawdown = budget, Decimal(0)
-    for equity in equity_curve:
+                "entry_price": price, "held_sessions": 0, "exit_policy": deepcopy(signal["exit_policy"]),
+                "exit_pending": False, "exit_fill_remainder": Decimal(0)}
+        for symbol, position in positions.items():
+            position["last_close"] = bar_for(symbol)["close"]
+        position_value = sum((position["quantity"] * position["last_close"] * (1 - slip) * (1 - fee - tax)
+                              for position in positions.values()), Decimal(0))
+        equity = cash + position_value
+        if equity <= 0:
+            raise ValueError("nonpositive_equity")
+        curve.append({"as_of": frame["as_of"], "equity": float(equity), "cash": float(cash),
+                      "position_value": float(position_value), "reserved_cash": float(reserved)})
+        pending = signals(policy, frame)
+        if not index and saved and saved.get("policy_id") == identity and "pending_entries" in saved:
+            supplied = saved["pending_entries"]
+            if not isinstance(supplied, list) or supplied != pending:
+                raise ValueError("initial_pending_signals_changed")
+    equities = [_decimal(point["equity"]) for point in curve]
+    start, peak, drawdown = equities[0], equities[0], Decimal(0)
+    for equity in equities:
         peak = max(peak, equity)
         drawdown = min(drawdown, (equity / peak - 1) * 100)
-    midpoint = equity_curve[max(0, len(equity_curve) // 2 - 1)]
-    return {"return": float((equity_curve[-1] / budget - 1) * 100), "drawdown": float(-drawdown),
-            "closed": closed, "half_returns": [float((midpoint / budget - 1) * 100),
-                                                float((equity_curve[-1] / midpoint - 1) * 100)]}
+    midpoint = equities[max(0, len(equities) // 2 - 1)]
+    state_positions = []
+    for symbol, position in sorted(positions.items()):
+        state_positions.append({"symbol": symbol, **{key: _decimal_text(value) if isinstance(value, Decimal) else deepcopy(value)
+                                                     for key, value in position.items()}})
+    diagnostics.update(fees_paid=float(paid_fee), taxes_paid=float(paid_tax), mode=model["mode"],
+                       buy_fill_ratio=float(ratios["buy"]), sell_fill_ratio=float(ratios["sell"]),
+                       fee_rate=float(fee), tax_rate=float(tax), slippage_bps=float(slip * 10000),
+                       entry_remainder="cancelled_after_observation", exit_remainder="retry_next_observation")
+    return {"return": float((equities[-1] / start - 1) * 100), "drawdown": float(-drawdown),
+            "closed": closed, "half_returns": [float((midpoint / start - 1) * 100),
+                                                float((equities[-1] / midpoint - 1) * 100)],
+            "equity_curve": curve, "daily_log_returns": [math.log(float(after / before)) for before, after in zip(equities, equities[1:])],
+            "final_state": {"as_of": frames[-1]["as_of"], "policy_id": identity, "cash": _decimal_text(cash),
+                            "reserved_cash": _decimal_text(reserved), "positions": state_positions, "pending_entries": pending},
+            "diagnostics": diagnostics}
 
 
-def portfolio_metrics(policy, frames, limits):
+def portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_model=None):
     """Replay one cash-funded portfolio twice, with normal/stress trading costs.
 
     Historical frame gaps invalidate evaluation when session_days proves a missed
-    session. Missing/untradeable prices for held or pending-entry symbols also
-    invalidate it. Existing unused/unavailable universe rows need no invented
-    price. Final positions are marked net of estimated exit costs, not forcibly
-    counted as completed trades. cancel_after_minutes cannot be scored by bars.
+    session. Missing required prices invalidate evaluation; zero-volume/flat bars
+    merely prevent fills, retaining the position and its loss. Frame zero is the
+    close-valued anchor; its signals execute on the next frame. Initial positions
+    retain their exit policy. held_sessions=0 means the entry-day close, increasing
+    once per subsequent session. Cash includes reserved_cash, which cannot fund a
+    buy. initial_state accepts one common state or {normal: state, stress: state}.
+
+    observed_quotes uses next-frame execution_quotes[symbol] with an aware
+    observed_at on that session, eligible bool, and price when eligible. Optional
+    quote.price is the decision limit unless a side-specific or common limit_price
+    is supplied. Worse synthetic fills are forbidden. Its default
+    cost stress adds 10bp commission, without inventing a worse-than-limit price.
+    Daily-open defaults retain 10/20bp slippage. Optional stress_fill_ratio runs a
+    separate execution stress with normal costs. Entry remainders are cancelled
+    after each observation; exit intent persists. Fractional sell-fill remainder
+    carries to the next attempt, so a positive ratio can eventually close one
+    remaining share. Cancellation minutes and queue priority cannot be inferred
+    from these inputs. The caller supplies quotes observed inside its live order
+    window. Final holdings are marked net
+    of estimated liquidation costs, not counted as completed trades.
     """
     result = {"valid": False, "error": None, "net_return_pct": None, "stress_return_pct": None,
               "max_drawdown_pct": None, "stress_drawdown_pct": None, "closed_trades": 0,
-              "sessions": len(frames) if isinstance(frames, list) else 0, "half_returns": [None, None]}
+              "sessions": len(frames) if isinstance(frames, list) else 0, "half_returns": [None, None],
+              "intervals": max(0, len(frames) - 1) if isinstance(frames, list) else 0,
+              "equity_curve": [], "stress_equity_curve": [], "daily_log_returns": [], "stress_daily_log_returns": [],
+              "final_state": None, "stress_final_state": None, "execution_stress_return_pct": None,
+              "execution_stress_drawdown_pct": None, "diagnostics": {}}
     try:
         policy = validate_policy(policy)
         if not isinstance(frames, list) or len(frames) < 2:
@@ -388,11 +596,25 @@ def portfolio_metrics(policy, frames, limits):
             if len(symbols) != len(set(symbols)):
                 raise ValueError("duplicate_frame_symbol")
             last = day
-        normal = _replay(policy, frames, limits, Decimal("0.001"))
-        stress = _replay(policy, frames, limits, Decimal("0.002"))
+        model = _execution_model(execution_model)
+        states = initial_state if isinstance(initial_state, dict) and "normal" in initial_state else {
+            "normal": initial_state, "stress": initial_state}
+        if "normal" not in states or "stress" not in states:
+            raise ValueError("invalid_initial_states")
+        normal = _replay(policy, frames, limits, model, states["normal"])
+        stress = _replay(policy, frames, limits, model, states["stress"], stress=True)
+        execution_stress = (_replay(policy, frames, limits, model, states["normal"], execution_stress=True)
+                            if model["stress_fill_ratio"] is not None else None)
         result.update(valid=True, net_return_pct=normal["return"], stress_return_pct=stress["return"],
                       max_drawdown_pct=normal["drawdown"], stress_drawdown_pct=stress["drawdown"],
-                      closed_trades=normal["closed"], half_returns=normal["half_returns"])
+                      closed_trades=normal["closed"], half_returns=normal["half_returns"],
+                      equity_curve=normal["equity_curve"], stress_equity_curve=stress["equity_curve"],
+                      daily_log_returns=normal["daily_log_returns"], stress_daily_log_returns=stress["daily_log_returns"],
+                      final_state=normal["final_state"], stress_final_state=stress["final_state"],
+                      execution_stress_return_pct=execution_stress["return"] if execution_stress else None,
+                      execution_stress_drawdown_pct=execution_stress["drawdown"] if execution_stress else None,
+                      diagnostics={"normal": normal["diagnostics"], "cost_stress": stress["diagnostics"],
+                                   "execution_stress": execution_stress["diagnostics"] if execution_stress else None})
     except (ValueError, TypeError, KeyError, ArithmeticError, AttributeError) as error:
         reason = str(error)
         result["error"] = reason if re.fullmatch(r"[a-z][a-z0-9_]*", reason) else "invalid_evaluation_input"

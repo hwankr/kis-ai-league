@@ -33,3 +33,10 @@ export function learning(overrides: Partial<LearningData> = {}): LearningData {
       closed_trades: 3, decision: 'keep', reason: '평가 기간 부족' },
     last_change: null, error: null, ...overrides };
 }
+export function learningAccount(overrides: Partial<NonNullable<LearningData['account']>> = {}): NonNullable<LearningData['account']> {
+  return { as_of: '2026-10-09T06:30:00Z', equity: '1025000', cash: '700000', return_pct: 2.5,
+    max_drawdown_pct: 4, observations: 12, basis: 'project_confirmed_fills',
+    risk: { active: false, limit_pct: 15, drawdown_pct: 1 },
+    comparisons: { start_day: '2026-10-05', ai_return_pct: 1, baseline_return_pct: 1.5, market_return_pct: 3, cash_return_pct: 0,
+      status: 'ready', basis: 'observed_quotes_model', market_name: 'KOSPI 가격지수', error: null }, ...overrides };
+}

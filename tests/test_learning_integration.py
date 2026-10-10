@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from backend.experiment_analysis import analysis_version, build_snapshot
 from backend.experiments import ALL_STRATEGIES, FEE
 from backend.kis import KST, KisError
-from backend.learning_policy import BASELINE_POLICY, policy_id, validate_policy
+from backend.learning_policy import BASELINE_POLICY, build_frame, policy_id, validate_policy
 from tests import test_experiments as fixtures
 
 
@@ -125,6 +125,7 @@ class LearningIntegrationTests(unittest.TestCase):
         self.assertEqual(self.service.store.orders(), [])
 
     def test_external_account_cash_does_not_replenish_strategy_losses(self):
+        self.service.risk_limit = 50  # Isolate capital sizing from the independent loss trigger.
         self.analyze_before_open()
         self.broker.account["cash"] = "9000000"
         original = self.service._portfolio
@@ -180,6 +181,101 @@ class LearningIntegrationTests(unittest.TestCase):
         self.assertEqual(self.broker.submissions, [])
         self.assertEqual(self.service.store.orders(), [])
 
+    def test_pause_during_profile_check_cancels_unsent_intent(self):
+        self.enable()
+        original = self.service._profile
+        def pause_before_boundary(policy):
+            profile = original(policy)
+            self.service._pause("사용자가 주문을 중지했습니다.")
+            return profile
+        with patch.object(self.service, "_profile", side_effect=pause_before_boundary):
+            self.service._submit(self.service._policy(), self.broker, fixtures.decision(), "buy", 1,
+                                 Decimal(10000), "paused-profile", run_id=None)
+        self.assertEqual(self.broker.submissions, [])
+        order = self.service.store.orders()[0]
+        self.assertEqual(order["status"], "cancelled")
+        self.assertEqual(order["remaining_quantity"], 0)
+        self.assertIsNone(order["order_id"])
+        self.assertTrue(order["submission_skipped"])
+        self.assertTrue(self.service.store.setting("user_paused"))
+        self.service._learn(self.input_data, {"signals": [], "collection_hash": "paused-attempt"})
+        context = self.service.learning.enqueue.call_args.kwargs["context"]
+        self.assertEqual(context["execution_basis"], {"buy_orders": 0, "sell_orders": 0})
+
+    def test_pause_during_durable_reservation_is_rechecked_at_broker_boundary(self):
+        self.enable()
+        original = self.service.store.reserve_order
+        def reserve_then_pause(order, intent):
+            reserved = original(order, intent)
+            self.service._pause("사용자가 주문을 중지했습니다.")
+            return reserved
+        with patch.object(self.service.store, "reserve_order", side_effect=reserve_then_pause):
+            self.service._submit(self.service._policy(), self.broker, fixtures.decision(), "buy", 1,
+                                 Decimal(10000), "paused-reservation", run_id=None)
+        self.assertEqual(self.broker.submissions, [])
+        self.assertEqual(self.service.store.orders()[0]["status"], "cancelled")
+        self.assertTrue(self.service.store.orders()[0]["submission_skipped"])
+        self.assertFalse(self.service.store.setting("enabled"))
+        # A later restart cannot reinterpret the unsent intent as an unknown order.
+        self.service = self.make_service()
+        self.assertEqual(self.service.store.orders()[0]["status"], "cancelled")
+        self.assertFalse(any(item["code"] == "unknown_order" and item["state"] == "open"
+                             for item in self.service.store.setting("issues", [])))
+
+    def test_unfilled_stop_exit_survives_rebound_restart_and_preserves_manual_shares(self):
+        value = rules_policy()
+        value["strategies"][0].update(holding_sessions=20, stop_loss_pct=5, take_profit_pct=0)
+        self.set_champion(value)
+        self.analyze_before_open()
+        self.enable()
+        self.service._cycle()
+        quantity = self.broker.submissions[0][2]
+        self.fill(quantity, status="filled")
+        self.broker.account["holdings"]["005930"] = {
+            "quantity": quantity + 5, "sellable_quantity": quantity + 5, "price": "10000"}
+        self.broker.days += ["2026-10-07", "2026-10-08"]
+        self.current = fixtures.NOW.replace(day=7)
+        self.broker.eligible = False
+        with patch("backend.experiments.HistoryCache") as cache:
+            cache.return_value._read.return_value = {date(2026, 10, 6): {"close": Decimal(9000)}}
+            self.service._cycle()
+        self.assertEqual(len(self.broker.submissions), 1)  # Failed quote cannot become a fake sell.
+        self.assertIs(self.service.store.orders()[0]["exit_pending"], True)
+        self.assertIs(self.service.store.setting("learning_quotes")["quotes"]["005930"]["buy_eligible"], False)
+        self.service = self.make_service()
+        positions, _ = self.service._portfolio(self.service._owned_orders())
+        self.assertIs(positions[0]["exit_pending"], True)
+        self.current = fixtures.NOW.replace(day=8)
+        self.broker.eligible, self.broker.price = True, "10200"
+        self.broker.account["holdings"]["005930"]["price"] = "10200"
+        with patch("backend.experiments.HistoryCache") as cache:
+            cache.return_value._read.return_value = {date(2026, 10, 7): {"close": Decimal(10200)}}
+            self.service._cycle()
+        self.assertEqual(self.broker.submissions[-1], ("005930", "sell", quantity, "10200"))
+        quote = self.service.store.setting("learning_quotes")["quotes"]["005930"]
+        self.assertTrue(quote["eligible"])
+        self.assertFalse(quote["buy_eligible"])
+        self.service._save_learning_quote("005930", 9900)  # First quote, including buy eligibility, stays fixed.
+        self.assertEqual(self.service.store.setting("learning_quotes")["quotes"]["005930"], quote)
+
+    def test_quote_batch_excludes_only_external_holdings_from_buys_with_one_snapshot(self):
+        frame = build_frame(self.completed_input())
+        frame["captured_at"] = "2026-10-02T17:00:00+09:00"
+        self.broker.account["holdings"] = {"005930": {"quantity": 5}, "000660": {"quantity": 3}}
+        with patch.object(self.service.learning, "frames", return_value=[frame]), \
+                patch.object(self.service, "_portfolio", return_value=([{"symbol": "000660", "quantity": 3}], [])), \
+                patch.object(self.broker, "snapshot", wraps=self.broker.snapshot) as snapshot:
+            self.service._observe_learning_quotes(self.service._policy())
+            snapshot.assert_called_once()
+            quotes = self.service.store.setting("learning_quotes")["quotes"]
+            self.assertFalse(quotes["005930"]["buy_eligible"])
+            self.assertTrue(quotes["000660"]["buy_eligible"])
+            self.assertTrue(quotes["005930"]["eligible"])
+            self.assertEqual(quotes["005930"]["price"], "10000")
+            self.service._observe_learning_quotes(self.service._policy())
+            snapshot.assert_called_once()  # No repeated batch query once all quotes exist.
+        self.assertEqual(self.broker.submissions, [])
+
     def test_legacy_rollback_cannot_execute_old_policy_or_reroll_cached_baseline(self):
         learned = self.analyze_before_open()
         self.assertEqual(self.analyzer.call_count, 1)
@@ -209,7 +305,7 @@ class LearningIntegrationTests(unittest.TestCase):
         snapshot = self.service.snapshot()
         json.dumps(snapshot, allow_nan=False)
         learning = snapshot["learning"]
-        self.assertEqual(set(learning), {"enabled", "status", "champion", "challenger", "last_evaluation", "last_change", "error"})
+        self.assertEqual(set(learning), {"enabled", "status", "champion", "challenger", "last_evaluation", "last_change", "error", "account"})
         self.assertTrue(learning["enabled"])
         self.assertEqual(learning["champion"]["id"], policy_id(rules_policy()))
         self.assertEqual(learning["champion"]["name"], "검증 후보")

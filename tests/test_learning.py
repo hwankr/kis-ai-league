@@ -8,6 +8,7 @@ import unittest
 from backend.experiment_store import ExperimentStore
 from backend.kis import KST
 from backend.learning import LearningService
+from backend.learning_evaluation import daily_metrics, make_evaluation_spec
 from backend.learning_policy import BASELINE_POLICY, policy_id
 from tests.test_learning_policy import days, policy
 
@@ -55,14 +56,20 @@ class LearningTests(unittest.TestCase):
         return data
 
     def test_prospective_evidence_promotes_and_survives_restart_without_unpausing(self):
-        for index in range(39):
+        for index in range(60):
             self.advance(index)
         self.assertEqual(self.learner.champion()["kind"], "legacy")
-        self.advance(39)
+        before = self.learner.state()["trial"]
+        self.assertEqual(before["elapsed_intervals"], 59)
+        self.assertEqual(before["decision"], "waiting")
+        self.assertEqual(before["evaluation_spec"], make_evaluation_spec(1))
+        self.advance(60)
         self.assertEqual(policy_id(self.learner.champion()), policy_id(candidate()))
         evaluation = self.learner.snapshot()["last_evaluation"]
         self.assertEqual(evaluation["decision"], "promote")
-        self.assertGreaterEqual(evaluation["closed_trades"], 20)
+        self.assertEqual(evaluation["sessions"], 60)
+        self.assertEqual(evaluation["required_sessions"], 60)
+        self.assertEqual(evaluation["phase"], "paper_provisional")
         self.assertGreater(evaluation["challenger_return_pct"], 1)
         self.assertEqual(self.learner.snapshot()["challenger"]["sessions"], 0)
         restored = LearningService(self.store, enabled=True, now=lambda: self.current, proposer=self.learner.proposer)
@@ -72,6 +79,11 @@ class LearningTests(unittest.TestCase):
         self.assertTrue(self.store.setting("user_paused"))
         self.assertEqual(self.store.orders(), [])
         self.assertEqual(sum(item["decision"] == "promote" for item in restored.history()), 1)
+        promoted = next(item for item in restored.history() if item["decision"] == "promote")
+        self.assertEqual(promoted["metrics"]["champion"]["intervals"], 60)
+        self.assertEqual(promoted["metrics"]["challenger"]["intervals"], 60)
+        self.assertEqual(len(promoted["metrics"]["challenger"]["daily_log_returns"]), 60)
+        self.assertEqual(restored.state()["trial_sequence"], 2)
 
     def test_same_observation_restart_and_timestamp_refresh_do_not_research_again(self):
         data = self.advance(0)
@@ -94,7 +106,7 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(self.learner.snapshot()["last_evaluation"]["decision"], "waiting")
         self.advance(4)
         self.assertEqual(self.learner.state()["trial"]["id"], identity)
-        self.assertEqual(self.learner.snapshot()["challenger"]["sessions"], 2)
+        self.assertEqual(self.learner.snapshot()["challenger"]["sessions"], 1)
 
     def test_changed_same_day_evidence_is_not_replaced(self):
         data = self.advance(0)
@@ -102,12 +114,15 @@ class LearningTests(unittest.TestCase):
         data["histories"]["005930"][data["as_of"]]["volume"] += 1
         self.learner.process(data, [], LIMITS)
         self.assertEqual(self.learner.frames()[0], original)
-        self.assertIsNone(self.learner.snapshot()["challenger"])
+        self.assertEqual(self.learner.state()["trial"]["decision"], "invalid")
+        self.assertIsNotNone(self.learner.snapshot()["challenger"])
         self.assertEqual(self.learner.history()[0]["decision"], "invalid")
         self.assertEqual(self.learner.champion()["kind"], "legacy")
 
     def test_changed_historical_price_invalidates_cohort_not_previous_record(self):
         first = self.advance(0)
+        original = self.learner.frames()[0]
+        identity = self.learner.state()["trial"]["id"]
         self.advance(1)
         data = raw_input(2)
         self.current = datetime.fromisoformat(data["observed_at"])
@@ -115,70 +130,78 @@ class LearningTests(unittest.TestCase):
         self.learner.process(data, [], LIMITS)
         self.assertEqual(self.learner.snapshot()["last_evaluation"]["decision"], "invalid")
         self.assertEqual(self.learner.champion()["kind"], "legacy")
+        self.assertEqual(self.learner.state()["trial"]["id"], identity)
+        self.assertEqual(self.learner.frames()[0], original)
+        self.advance(3)  # A later unmodified input must not erase the invalid window.
+        self.assertEqual(self.learner.state()["trial"]["decision"], "invalid")
+        self.assertEqual(len(self.proposals), 1)
 
     def test_late_observation_and_session_gap_cannot_support_promotion(self):
         self.advance(0)
+        identity = self.learner.state()["trial"]["id"]
         data = raw_input(1)
         self.current = datetime.fromisoformat(raw_input(2)["as_of"] + "T10:00:00+09:00")
         self.learner.process(data, [], LIMITS)
         self.advance(2)
         self.assertEqual(self.learner.snapshot()["last_evaluation"]["decision"], "invalid")
         self.advance(4)
-        # The interrupted cohort restarts, rather than assigning skipped returns zero.
+        # Missing observations consume the original window, never a fresh lucky start.
         self.assertEqual(self.learner.champion()["kind"], "legacy")
+        self.assertEqual(self.learner.state()["trial"]["id"], identity)
+        self.assertEqual(self.learner.state()["trial"]["elapsed_intervals"], 4)
+        self.assertEqual(len(self.proposals), 1)
 
-    def test_judge_rejects_negative_stress_large_drawdown_and_inconsistent_halves(self):
-        base = {"valid": True, "sessions": 40, "closed_trades": 30, "net_return_pct": 1.,
-                "stress_return_pct": 0., "max_drawdown_pct": 1., "stress_drawdown_pct": 2., "half_returns": [.5, .5]}
-        winner = {**base, "net_return_pct": 5., "stress_return_pct": 3., "half_returns": [2., 3.]}
+    def test_judge_uses_paired_returns_not_trade_count_or_old_headline_metrics(self):
+        base = daily_metrics([0.] * 60)
+        winner = {**daily_metrics([.002] * 60, [.0015] * 60), "closed_trades": 0}
         self.assertEqual(self.learner.judge(base, winner)[0], "promote")
-        for changes in ({"stress_return_pct": -.1}, {"max_drawdown_pct": 90.},
-                        {"max_drawdown_pct": -90.}, {"half_returns": [-1., 6.]}, {"valid": False}):
-            self.assertNotEqual(self.learner.judge(base, {**winner, **changes})[0], "promote")
+        inflated = {**daily_metrics([0.] * 60), "closed_trades": 999, "net_return_pct": 900,
+                    "stress_return_pct": 800, "half_returns": [100, 100]}
+        self.assertEqual(self.learner.judge(base, inflated)[0], "keep")
+        self.assertEqual(self.learner.judge(daily_metrics([0.] * 59), daily_metrics([.002] * 59))[0], "waiting")
+        negative_stress = daily_metrics([.002] * 60, [-.001] * 60)
+        self.assertEqual(self.learner.judge(base, negative_stress)[0], "keep")
 
-    def test_deterioration_uses_new_period_and_restores_previous_policy(self):
-        for index in range(20):
-            self.advance(index)
-        active = candidate()
+    def test_rolling_guard_cannot_restore_a_policy_outside_a_new_fixed_comparison(self):
+        self.advance(0)
+        active = candidate(2)
         state = self.learner.state()
         state.update(champion={"policy": active, "adopted_at": self.current.isoformat()},
                      guard={"policy": BASELINE_POLICY, "limits": LIMITS, "start_day": raw_input(0)["as_of"]})
         self.store.save_setting("learning", state)
-        def evaluate(policy, frames, limits):
-            good = policy["kind"] == "legacy"
-            return {"valid": True, "sessions": len(frames), "closed_trades": 20,
-                    "net_return_pct": 0 if good else -10, "stress_return_pct": -1 if good else -12,
-                    "max_drawdown_pct": 1 if good else 12, "half_returns": [0, 0] if good else [-5, -5]}
-        self.learner.evaluator = evaluate
-        self.advance(20)
-        self.assertEqual(self.learner.champion()["kind"], "legacy")
-        self.assertIn("복귀", self.learner.snapshot()["last_change"]["reason"])
+        self.advance(1)
+        self.assertEqual(self.learner.champion(), active)
+        self.assertNotIn("guard", self.learner.state())
+        self.assertIsNone(self.learner.snapshot()["last_change"])
         self.assertFalse(self.store.setting("enabled"))
-        rollback = next(item for item in self.learner.history() if item["decision"] == "rollback")
-        self.assertEqual(rollback["metrics"]["challenger"]["net_return_pct"], -10)
-        self.assertEqual(rollback["id"], self.learner.snapshot()["last_change"]["trial_id"])
+        self.assertFalse(any(item["decision"] == "rollback" for item in self.learner.history()))
 
-    def test_changed_limits_restart_comparison_without_mutating_account_settings(self):
+    def test_changed_limits_invalidate_original_window_without_mutating_account_settings(self):
         self.advance(0)
+        original = deepcopy(self.learner.state()["trial"])
         data = raw_input(1)
         self.current = datetime.fromisoformat(data["observed_at"])
         limits = {**LIMITS, "order_cap": "100000"}
         self.learner.process(data, [], limits)
-        self.assertEqual(self.learner.state()["trial"]["limits"], limits)
-        self.assertIn("운용 한도", next(item["reason"] for item in self.learner.history() if item["decision"] == "invalid"))
+        trial = self.learner.state()["trial"]
+        self.assertEqual(trial["id"], original["id"])
+        self.assertEqual(trial["limits"], LIMITS)
+        self.assertEqual(trial["evaluation_spec"], original["evaluation_spec"])
+        self.assertEqual(trial["decision"], "invalid")
+        self.assertIn("한도 변경", trial["reason"])
         self.assertIsNone(self.store.setting("policy"))
 
-    def test_engine_change_restarts_trial_and_keeps_original_evidence(self):
+    def test_engine_change_consumes_original_window_and_keeps_original_evidence(self):
         self.advance(0)
         original = self.learner.frames()
         identity = self.learner.state()["trial"]["id"]
         self.learner.version = "new-evaluation-version"
         self.advance(1)
-        self.assertNotEqual(self.learner.state()["trial"]["id"], identity)
+        self.assertEqual(self.learner.state()["trial"]["id"], identity)
         retired = next(item for item in self.learner.history() if item["id"] == identity)
         self.assertEqual(retired["reason"], "평가 코드 버전 변경")
         self.assertEqual(self.learner.frames()[0], original[0])
-        self.assertEqual(self.learner.state()["trial"]["engine_version"], self.learner.version)
+        self.assertNotEqual(self.learner.state()["trial"]["engine_version"], self.learner.version)
 
     def test_execution_feedback_excludes_unresolved_and_other_accounts(self):
         self.store.save_setting("policy", {"fingerprint": "owned"})
@@ -187,6 +210,9 @@ class LearningTests(unittest.TestCase):
                 ("unknown", 0, "owned"), ("submitted", 0, "owned"), ("rejected", 0, "other")]):
             self.store.reserve_order({"id": str(index), "created_at": self.current.isoformat(), "status": status,
                                       "filled_quantity": filled, "quantity": 10, "fingerprint": fingerprint}, str(index))
+        self.store.reserve_order({'id': 'skipped', 'created_at': self.current.isoformat(),
+                                  'status': 'cancelled', 'filled_quantity': 0, 'quantity': 10,
+                                  'fingerprint': 'owned', 'submission_skipped': True}, 'skipped')
         feedback = self.learner._research_history()[0]["execution"]
         self.assertEqual(feedback["terminal_orders"], 3)
         self.assertEqual(feedback["unresolved_orders"], 2)
@@ -210,8 +236,65 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(len(self.learner.frames()), 1)
         self.assertEqual(self.learner.champion()["kind"], "legacy")
         self.advance(46)
-        self.assertEqual(self.learner.snapshot()["last_evaluation"]["sessions"], 2)
+        self.assertEqual(self.learner.snapshot()["last_evaluation"]["sessions"], 1)
         self.assertEqual(self.learner.snapshot()["last_evaluation"]["decision"], "waiting")
+
+    def test_invalid_attempt_keeps_deadline_and_sequence_survives_restart(self):
+        self.advance(0)
+        original = deepcopy(self.learner.state()["trial"])
+        self.advance(2)  # Missing day 1 makes the original comparison unusable.
+        self.assertEqual(self.learner.state()["trial"]["decision"], "invalid")
+        restored = LearningService(self.store, enabled=True, now=lambda: self.current, proposer=self.learner.proposer)
+        self.addCleanup(restored.close)
+        self.learner = restored
+        for index in range(3, 60):
+            self.advance(index)
+        self.assertEqual(restored.state()["trial"]["id"], original["id"])
+        self.assertEqual(restored.state()["trial_sequence"], 1)
+        self.assertEqual(len(self.proposals), 1)
+        self.advance(60)
+        retired = next(item for item in restored.history() if item["id"] == original["id"])
+        self.assertEqual(retired["decision"], "invalid")
+        self.assertEqual(retired["elapsed_intervals"], 60)
+        self.assertEqual(retired["evaluation_spec"], original["evaluation_spec"])
+        self.assertEqual(restored.state()["trial_sequence"], 2)
+        self.assertEqual(restored.state()["trial"]["evaluation_spec"], make_evaluation_spec(2))
+        self.assertFalse(self.store.setting("enabled"))
+        self.assertTrue(self.store.setting("user_paused"))
+
+    def test_model_initial_book_and_spec_are_frozen_before_new_observations(self):
+        data = raw_input(0)
+        book = {"as_of": data["as_of"], "cash": "900000", "positions": [], "reserved_cash": "0",
+                "pending_orders": 0, "unresolved_orders": 0, "equity": "900000"}
+        model = {"mode": "daily_open", "buy_fill_ratio": .5, "sell_fill_ratio": .8}
+        self.learner.process(data, [], LIMITS, context={"initial_state": book, "execution_model": model})
+        before = deepcopy(self.learner.state()["trial"])
+        model["buy_fill_ratio"] = 0
+        book["cash"] = "100"
+        data = raw_input(1)
+        self.current = datetime.fromisoformat(data["observed_at"])
+        book["as_of"] = data["as_of"]
+        self.learner.process(data, [], LIMITS, context={"initial_state": book, "execution_model": model})
+        after = self.learner.state()["trial"]
+        for key in ("id", "limits", "initial_state", "execution_model", "evaluation_spec"):
+            self.assertEqual(after[key], before[key])
+        self.assertTrue(after["metrics"]["challenger"]["valid"])
+        self.assertEqual(after["metrics"]["challenger"]["equity_curve"][0]["equity"], 900000)
+
+    def test_production_trial_waits_for_pending_orders_to_settle(self):
+        data = raw_input(0)
+        book = {"as_of": data["as_of"], "cash": "900000", "positions": [], "reserved_cash": "100000",
+                "pending_orders": 1, "unresolved_orders": 0, "equity": "900000"}
+        self.learner.process(data, [], LIMITS, context={"initial_state": book})
+        self.assertIsNone(self.learner.state().get("trial"))
+        self.assertEqual(len(self.proposals), 0)
+        data = raw_input(1)
+        self.current = datetime.fromisoformat(data["observed_at"])
+        book.update(as_of=data["as_of"], pending_orders=0, reserved_cash="0")
+        self.learner.process(data, [], LIMITS, context={"initial_state": book})
+        self.assertEqual(len(self.proposals), 1)
+        self.assertEqual(self.learner.state()["trial"]["initial_state"]["cash"], "900000")
+        self.assertFalse(self.store.setting("enabled"))
 
 
 if __name__ == "__main__":

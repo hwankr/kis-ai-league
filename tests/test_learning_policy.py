@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import date, timedelta
 from decimal import Decimal
 import json
+import math
 import unittest
 
 from backend.learning_policy import (BASELINE_POLICY, FEATURES, FEE, TAX, build_frame,
@@ -121,6 +122,7 @@ class FrameTests(unittest.TestCase):
         self.assertAlmostEqual(feature["breakout_20d_pct"], (120 / 101 - 1) * 100)
         self.assertEqual(feature["volume_ratio"], 2)
         self.assertEqual(feature["turnover"], 100000)
+        self.assertEqual(result["benchmark_prices"], {"KOSPI": 1000})
         self.assertAlmostEqual(feature["close_sma20_pct"], (120 / 101 - 1) * 100)
         self.assertAlmostEqual(feature["close_sma60_pct"], (120 / (6020 / 60) - 1) * 100)
 
@@ -224,7 +226,7 @@ class PortfolioTests(unittest.TestCase):
         value["strategies"][0].update(take_profit_pct=0, holding_sessions=1)
         self.assertEqual(self.evaluate(value, frames(3))["closed_trades"], 1)
 
-    def test_required_missing_or_untradeable_prices_invalidate_not_zero_fill(self):
+    def test_required_missing_prices_invalidate_but_known_halts_do_not_fill(self):
         for index in (1, 2):
             observations = frames(3)
             observations[index]["rows"] = []
@@ -233,7 +235,11 @@ class PortfolioTests(unittest.TestCase):
         for changes in ({"volume": 0}, {"open": 100, "high": 100, "low": 100, "close": 100}):
             observations = frames(3)
             observations[1]["rows"][0].update(changes)
-            self.assertEqual(self.evaluate(observations=observations)["error"], "fill_unverifiable")
+            result = self.evaluate(observations=observations)
+            self.assertTrue(result["valid"], result)
+            self.assertEqual(result["net_return_pct"], 0)
+            self.assertEqual(result["final_state"]["positions"], [])
+            self.assertEqual(result["diagnostics"]["normal"]["untradeable_bars"], 1)
 
     def test_missing_session_or_duplicate_day_is_invalid(self):
         observations = frames(4)
@@ -283,6 +289,245 @@ class PortfolioTests(unittest.TestCase):
         first, second = result["half_returns"]
         self.assertAlmostEqual(((1 + first / 100) * (1 + second / 100) - 1) * 100, result["net_return_pct"])
         self.assertEqual((value, observations, LIMITS), original)
+
+    def test_dated_equity_and_log_returns_have_one_value_per_interval(self):
+        observations = frames()
+        result = self.evaluate(observations=observations)
+        self.assertEqual(result["intervals"], 6)
+        self.assertEqual([point["as_of"] for point in result["equity_curve"]], days(7))
+        for prefix, return_key in (("", "net_return_pct"), ("stress_", "stress_return_pct")):
+            values = result[prefix + "daily_log_returns"]
+            self.assertEqual(len(values), 6)
+            self.assertAlmostEqual(math.expm1(sum(values)) * 100, result[return_key], places=10)
+            for point in result[prefix + "equity_curve"]:
+                self.assertAlmostEqual(point["equity"], point["cash"] + point["position_value"])
+
+    def test_json_state_restart_matches_uninterrupted_normal_and_stress(self):
+        observations = frames()
+        original = portfolio_metrics(policy(), observations, LIMITS)
+        first = portfolio_metrics(policy(), observations[:3], LIMITS)
+        state = json.loads(json.dumps({"normal": first["final_state"], "stress": first["stress_final_state"]}))
+        resumed = portfolio_metrics(policy(), observations[2:], LIMITS, initial_state=state)
+        self.assertTrue(resumed["valid"], resumed)
+        for prefix in ("", "stress_"):
+            self.assertEqual(resumed[prefix + "final_state"], original[prefix + "final_state"])
+            self.assertEqual(first[prefix + "daily_log_returns"] + resumed[prefix + "daily_log_returns"],
+                             original[prefix + "daily_log_returns"])
+
+    def test_inherited_exit_policy_survives_replacement_and_realizes_loss(self):
+        observations = frames(2, price=80)
+        for frame in observations:
+            frame["rows"][0]["learning_eligible"] = False
+        observations[1]["rows"] = [row(price=70, learning_eligible=False)]
+        state = {"as_of": observations[0]["as_of"], "cash": "9000", "positions": [
+            {"symbol": "005930", "strategy_id": "retired-policy", "quantity": 10, "cost": "1000",
+             "entry_price": "100", "last_close": "80", "held_sessions": 1,
+             "exit_policy": {"holding_sessions": 20, "stop_loss_pct": 5, "take_profit_pct": 0}}]}
+        result = portfolio_metrics(policy(), observations, LIMITS, initial_state=state)
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["closed_trades"], 1)
+        self.assertEqual(result["final_state"]["positions"], [])
+        self.assertLess(Decimal(result["final_state"]["cash"]), Decimal(9700))
+        self.assertLess(result["net_return_pct"], -1)
+        self.assertEqual(state["positions"][0]["quantity"], 10)
+
+    def test_reserved_cash_is_owned_cash_but_cannot_be_spent(self):
+        state = {"cash": "10000", "reserved_cash": "2000", "positions": []}
+        result = portfolio_metrics(policy(), frames(2), LIMITS, initial_state=state)
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["equity_curve"][0]["equity"], 10000)
+        self.assertEqual(result["final_state"]["positions"][0]["quantity"], 79)
+        self.assertGreaterEqual(Decimal(result["final_state"]["cash"]), Decimal(2000))
+        self.assertEqual(result["final_state"]["reserved_cash"], "2000")
+
+    def test_inherited_old_strategy_and_profit_cash_share_total_investable_cap(self):
+        value = policy(cash_reserve=.2)
+        value["strategies"][0]["weight"] = .8
+        observations = frames(2)
+        for frame in observations:
+            frame["rows"].append(row("000660", learning_eligible=False))
+        # Original budget 10,000: an old strategy still owns cost 4,000, while
+        # realized gains have restored cash to 10,000. They do not enlarge caps.
+        state = {"cash": "10000", "positions": [{"symbol": "000660", "strategy_id": "retired-policy",
+                 "quantity": 40, "cost": "4000", "entry_price": "100", "last_close": "100",
+                 "held_sessions": 0, "exit_policy": {"holding_sessions": 20, "stop_loss_pct": 0,
+                                                       "take_profit_pct": 0}}]}
+        result = portfolio_metrics(value, observations, LIMITS, initial_state=state)
+        self.assertTrue(result["valid"], result)
+        for key in ("final_state", "stress_final_state"):
+            positions = {item["symbol"]: item for item in result[key]["positions"]}
+            self.assertEqual(positions["005930"]["quantity"], 39)
+            self.assertEqual(positions["000660"]["quantity"], 40)
+            self.assertLessEqual(sum(Decimal(item["cost"]) for item in positions.values()), Decimal(8000))
+        self.assertEqual(state["positions"][0]["cost"], "4000")
+
+    def test_holding_age_counts_after_entry_close_and_continues_on_restart(self):
+        value = policy()
+        value["strategies"][0]["holding_sessions"] = 1
+        first = portfolio_metrics(value, frames(2), LIMITS)
+        self.assertEqual(first["final_state"]["positions"][0]["held_sessions"], 0)
+        rest = portfolio_metrics(value, frames(3)[1:], LIMITS,
+                                 initial_state={"normal": first["final_state"], "stress": first["stress_final_state"]})
+        self.assertTrue(rest["valid"], rest)
+        self.assertEqual(rest["closed_trades"], 1)
+
+    def test_halted_loss_exit_stays_in_equity_and_retries_after_rebound(self):
+        value = policy()
+        value["strategies"][0]["stop_loss_pct"] = 5
+        observations = frames(4)
+        observations[1]["rows"][0].update(close=90, low=89)
+        observations[2]["rows"] = [row(price=70, volume=0, learning_eligible=False)]
+        observations[3]["rows"] = [row(price=102, learning_eligible=False)]
+        first = portfolio_metrics(value, observations[:3], LIMITS)
+        self.assertTrue(first["valid"], first)
+        self.assertLess(first["net_return_pct"], -29)
+        self.assertTrue(first["final_state"]["positions"][0]["exit_pending"])
+        result = portfolio_metrics(value, observations, LIMITS)
+        self.assertEqual(result["closed_trades"], 1)
+        self.assertGreater(result["max_drawdown_pct"], 29)
+        self.assertEqual(result["diagnostics"]["normal"]["delayed_exit_sessions"], 1)
+
+    def test_partial_buys_and_sells_keep_remaining_cost_quantity_and_fees(self):
+        value = policy()
+        value["strategies"][0]["holding_sessions"] = 1
+        result = portfolio_metrics(value, frames(4), LIMITS,
+                                   execution_model={"buy_fill_ratio": .5, "sell_fill_ratio": .5})
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["diagnostics"]["normal"]["buy_filled_quantity"], 49)
+        self.assertEqual(result["diagnostics"]["normal"]["sell_filled_quantity"], 37)
+        self.assertEqual(result["final_state"]["positions"][0]["quantity"], 12)
+        self.assertEqual(result["closed_trades"], 0)
+        self.assertEqual(result["diagnostics"]["normal"]["partial_orders"], 3)
+        unit = Decimal(100) * Decimal("1.001") * (1 + FEE)
+        self.assertAlmostEqual(float(result["final_state"]["positions"][0]["cost"]), float(12 * unit))
+        self.assertGreater(result["diagnostics"]["normal"]["fees_paid"], 0)
+        self.assertGreater(result["diagnostics"]["normal"]["taxes_paid"], 0)
+
+    def test_zero_sell_ratio_retains_loss_instead_of_removing_failed_trade(self):
+        value = policy()
+        value["strategies"][0]["holding_sessions"] = 1
+        observations = frames(4)
+        observations[2]["rows"] = [row(price=80, learning_eligible=False)]
+        observations[3]["rows"] = [row(price=60, learning_eligible=False)]
+        result = portfolio_metrics(value, observations, LIMITS, execution_model={"sell_fill_ratio": 0})
+        self.assertTrue(result["valid"], result)
+        self.assertLess(result["net_return_pct"], -39)
+        self.assertEqual(result["final_state"]["positions"][0]["quantity"], 99)
+        self.assertEqual(result["closed_trades"], 0)
+        self.assertEqual(result["diagnostics"]["normal"]["delayed_exit_sessions"], 2)
+
+    def test_fractional_sell_model_can_close_last_share_after_restart(self):
+        observations = frames(3)
+        for frame in observations:
+            frame["rows"][0]["learning_eligible"] = False
+        state = {"cash": 9000, "positions": [{"symbol": "005930", "strategy_id": "old", "quantity": 1,
+                 "cost": "100.0140527", "entry_price": 100, "last_close": 100, "held_sessions": 1,
+                 "exit_policy": {"holding_sessions": 1, "stop_loss_pct": 0, "take_profit_pct": 0}}]}
+        model = {"sell_fill_ratio": .5}
+        first = portfolio_metrics(policy(), observations[:2], LIMITS, initial_state=state, execution_model=model)
+        self.assertTrue(first["valid"], first)
+        self.assertEqual(first["final_state"]["positions"][0]["quantity"], 1)
+        self.assertEqual(first["final_state"]["positions"][0]["exit_fill_remainder"], "0.5")
+        resumed = portfolio_metrics(policy(), observations[1:], LIMITS,
+                                    initial_state=json.loads(json.dumps({"normal": first["final_state"], "stress": first["stress_final_state"]})),
+                                    execution_model=model)
+        full = portfolio_metrics(policy(), observations, LIMITS, initial_state=state, execution_model=model)
+        self.assertTrue(resumed["valid"], resumed)
+        self.assertEqual(resumed["closed_trades"], 1)
+        self.assertEqual(resumed["final_state"], full["final_state"])
+
+    def observed(self, count=3):
+        observations = frames(count)
+        for frame in observations:
+            frame["execution_quotes"] = {"005930": {"price": 100, "eligible": True,
+                                           "observed_at": frame["as_of"] + "T09:10:00+09:00"}}
+        return observations
+
+    def test_observed_execution_uses_decision_price_not_daily_open(self):
+        observations = self.observed(2)
+        observations[1]["rows"][0].update(open=50, low=49)
+        result = portfolio_metrics(policy(), observations, LIMITS, execution_model={"mode": "observed_quotes"})
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["final_state"]["positions"][0]["quantity"], 99)
+        self.assertEqual(Decimal(result["final_state"]["positions"][0]["entry_price"]), 100)
+        self.assertEqual(result["diagnostics"]["cost_stress"]["slippage_bps"], 0)
+        self.assertAlmostEqual(result["diagnostics"]["cost_stress"]["fee_rate"], float(FEE) + .001)
+        self.assertLess(result["stress_return_pct"], result["net_return_pct"])
+
+    def test_missing_quote_invalid_but_known_ineligible_quote_does_not_fill(self):
+        result = portfolio_metrics(policy(), frames(2), LIMITS, execution_model={"mode": "observed_quotes"})
+        self.assertEqual(result["error"], "execution_quote_missing")
+        observations = self.observed(2)
+        observations[1]["execution_quotes"]["005930"].update(eligible=False)
+        observations[1]["execution_quotes"]["005930"].pop("price")
+        result = portfolio_metrics(policy(), observations, LIMITS, execution_model={"mode": "observed_quotes"})
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["net_return_pct"], 0)
+        self.assertEqual(result["diagnostics"]["normal"]["ineligible_quotes"], 1)
+
+    def test_manual_holding_blocks_new_buys_but_keeps_owned_exits_available(self):
+        observations = self.observed(2)
+        observations[1]['execution_quotes']['005930']['buy_eligible'] = False
+        model = {'mode': 'observed_quotes'}
+        result = portfolio_metrics(policy(), observations, LIMITS, execution_model=model)
+        self.assertTrue(result['valid'], result)
+        self.assertEqual(result['final_state']['positions'], [])
+        state = {'cash': 9000, 'positions': [{'symbol': '005930', 'strategy_id': 'old', 'quantity': 10,
+                 'cost': 1000, 'entry_price': 100, 'last_close': 100, 'held_sessions': 1,
+                 'exit_policy': {'holding_sessions': 1, 'stop_loss_pct': 0, 'take_profit_pct': 0}}]}
+        result = portfolio_metrics(policy(), observations, LIMITS, initial_state=state, execution_model=model)
+        self.assertTrue(result['valid'], result)
+        self.assertEqual(result['closed_trades'], 1)
+        self.assertEqual(result['final_state']['positions'], [])
+
+    def test_quote_time_outside_its_session_is_invalid(self):
+        observations = self.observed(2)
+        observations[1]["execution_quotes"]["005930"]["observed_at"] = "2027-01-04T09:10:00+09:00"
+        result = portfolio_metrics(policy(), observations, LIMITS, execution_model={"mode": "observed_quotes"})
+        self.assertEqual(result["error"], "execution_quote_outside_session")
+
+    def test_slippage_cannot_fill_beyond_buy_limit_or_sell_limit(self):
+        observations = frames(2)
+        observations[1]["rows"] = [row(price=101, learning_eligible=False)]
+        result = self.evaluate(observations=observations)
+        self.assertEqual(result["net_return_pct"], 0)  # 101.101 is worse than the 101 limit.
+        self.assertEqual(result["diagnostics"]["normal"]["limit_blocked"], 1)
+        value = policy()
+        value["strategies"][0]["holding_sessions"] = 1
+        observations = self.observed(3)
+        observations[2]["execution_quotes"]["005930"]["sell_limit_price"] = 101
+        result = portfolio_metrics(value, observations, LIMITS, execution_model={"mode": "observed_quotes"})
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["closed_trades"], 0)
+        self.assertEqual(result["diagnostics"]["normal"]["limit_blocked"], 1)
+        self.assertTrue(result["final_state"]["positions"][0]["exit_pending"])
+        result = portfolio_metrics(policy(), self.observed(2), LIMITS,
+                                   execution_model={"mode": "observed_quotes", "slippage_bps": 10, "stress_slippage_bps": 20})
+        self.assertEqual(result["diagnostics"]["normal"]["limit_blocked"], 1)
+        self.assertEqual(result["final_state"]["positions"], [])
+
+    def test_cost_and_fill_stress_are_separate_and_do_not_mutate_frozen_model(self):
+        model = {"buy_fill_ratio": 1, "sell_fill_ratio": .8, "stress_fill_ratio": .25}
+        original = deepcopy(model)
+        result = portfolio_metrics(policy(), frames(), LIMITS, execution_model=model)
+        self.assertTrue(result["valid"], result)
+        normal, cost, fills = (result["diagnostics"][key] for key in ("normal", "cost_stress", "execution_stress"))
+        self.assertEqual(cost["buy_fill_ratio"], normal["buy_fill_ratio"])
+        self.assertEqual(cost["sell_fill_ratio"], normal["sell_fill_ratio"])
+        self.assertGreater(cost["slippage_bps"], normal["slippage_bps"])
+        self.assertEqual(fills["slippage_bps"], normal["slippage_bps"])
+        self.assertEqual(fills["buy_fill_ratio"], .25)
+        self.assertIsNotNone(result["execution_stress_return_pct"])
+        self.assertEqual(model, original)
+
+    def test_invalid_initial_state_and_execution_model_fail_without_side_effects(self):
+        for state in ({"cash": 100, "reserved_cash": 101}, {"cash": -1}, {"cash": 100, "as_of": "2000-01-01"}):
+            result = portfolio_metrics(policy(), frames(2), LIMITS, initial_state=state)
+            self.assertFalse(result["valid"])
+        for model in ({"fill_ratio": float("nan")}, {"sell_fill_ratio": -1}, {"mode": "market"},
+                      {"slippage_bps": 30, "stress_slippage_bps": 20}):
+            result = portfolio_metrics(policy(), frames(2), LIMITS, execution_model=model)
+            self.assertFalse(result["valid"])
 
 
 if __name__ == "__main__":
