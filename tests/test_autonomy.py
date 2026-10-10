@@ -3,7 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from backend.autonomy import AutonomousMonitor
 from backend.experiment_store import ExperimentStore
@@ -61,6 +61,33 @@ class AutonomyTests(unittest.TestCase):
         self.assertEqual(Decimal(result["max_drawdown_pct"]), Decimal(-10))
         self.assertEqual(result["observations"], 3)
         self.assertEqual(monitor.performance("different-account")["observations"], 0)
+
+    def test_health_snapshot_keeps_status_without_reading_equity_or_reports(self):
+        self.account()
+        self.monitor._issue("account", "연결 확인 중", blocking=True)
+        full = self.monitor.snapshot()
+        with patch.object(self.monitor, "performance", side_effect=AssertionError("history read")):
+            health = self.monitor.snapshot(include_history=False)
+        for key in ("status", "issues", "error", "last_account_at"):
+            self.assertEqual(health[key], full[key])
+        self.assertIsNone(health["performance"])
+        self.assertEqual(health["daily_reports"], [])
+
+    def test_normal_checks_do_not_rewrite_resolved_issues(self):
+        with patch.object(self.store, "save_setting", wraps=self.store.save_setting) as save:
+            self.monitor._issue("account")
+            save.assert_not_called()
+        self.monitor._issue("account", "연결 확인 중")
+        self.current += timedelta(minutes=1)
+        self.monitor._issue("account")
+        resolved = self.store.setting("monitor_issues")
+        self.current += timedelta(minutes=1)
+        with patch.object(self.store, "save_setting", wraps=self.store.save_setting) as save:
+            self.monitor._issue("account")
+            save.assert_not_called()
+        self.assertEqual(self.store.setting("monitor_issues"), resolved)
+        self.monitor._issue("account", "새 연결 오류")
+        self.assertEqual(self.store.setting("monitor_issues")[0]["state"], "open")
 
     def test_failed_or_stale_account_never_becomes_zero_or_observation(self):
         self.account()

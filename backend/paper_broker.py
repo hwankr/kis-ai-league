@@ -95,7 +95,7 @@ def _order_row(raw, start, end):
     quantity = _number(raw.get("ord_qty"), integer=True, positive=True)
     filled = _number(raw.get("tot_ccld_qty"), integer=True)
     remaining = _number(raw.get("rmn_qty"), integer=True)
-    cancelled = _number(raw.get("cnc_cfrm_qty"), integer=True)
+    cancelled = _number(raw.get("cncl_cfrm_qty"), integer=True)
     rejected = _number(raw.get("rjct_qty"), integer=True)
     if filled + remaining + cancelled + rejected > quantity:
         raise KisError("모의 주문 내역의 누적 수량이 주문수량을 초과합니다.")

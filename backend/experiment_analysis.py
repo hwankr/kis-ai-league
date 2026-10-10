@@ -75,6 +75,29 @@ def _hash(value):
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _structured_object(content):
+    """Decode data only; the caller still validates its domain-specific schema."""
+    def invalid_constant(value):
+        raise ValueError("non-finite JSON")
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        result = json.loads(content, parse_constant=invalid_constant, object_pairs_hook=unique)
+        if not isinstance(result, dict):
+            raise ValueError()
+        _json(result)  # Also rejects overflowed exponents, e.g. 1e999.
+        return result
+    except (ValueError, TypeError):
+        raise AnalysisError("LLM 구조화 응답이 올바르지 않습니다.") from None
+
+
 def _day(value):
     if type(value) is date:
         return value.isoformat()
@@ -358,17 +381,19 @@ class CompatibleLLM:
             raise AnalysisError("LLM 응답 크기 한도를 초과했습니다.")
         return raw
 
-    def analyze(self, public_input, allowed_evidence):
+    def _generate(self, system_prompt, public_input, schema, *, schema_name="paper_research_policy"):
         state = self.status()
         if state["status"] != "ready":
             raise AnalysisError(state["error"] or "LLM 공급자가 설정되지 않았습니다.")
         config = self._config
         payload = {"model": config["model"], "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": _json(public_input)}],
             "max_completion_tokens": config["max_output_tokens"],
             "response_format": {"type": "json_schema", "json_schema": {
-                "name": "paper_experiment_decisions", "strict": True, "schema": RESPONSE_SCHEMA}}}
+                "name": schema_name, "strict": True, "schema": schema}}}
+        if len(_json(payload).encode("utf-8")) > 512 * 1024:
+            raise AnalysisError("LLM 분석 입력 한도를 초과했습니다.")
         headers = {"Content-Type": "application/json"}
         secret = self.environ.get(self.settings.get("api_key_env", ""), "")
         if secret:
@@ -385,10 +410,23 @@ class CompatibleLLM:
             choice, message = choices[0], choices[0]["message"]
             if choice["finish_reason"] != "stop" or message.get("refusal") or message.get("tool_calls") or message.get("function_call"):
                 raise ValueError()
-            decisions = validate_llm_output(message["content"], allowed_evidence)
+            content = message["content"]
             # Persist content hashes, never raw transport errors/headers/credentials.
-            return {"decisions": decisions, "request_hash": _hash(payload),
+            return {"content": content, "request_hash": _hash(payload),
                     "response_hash": hashlib.sha256(raw).hexdigest()}
+        except Exception:
+            raise AnalysisError("LLM 요청 실패 또는 응답 검증 실패") from None
+
+    def generate(self, system_prompt, payload, schema):
+        """Generate a JSON object from public research data, without tool calls."""
+        return _structured_object(self._generate(system_prompt, payload, schema)["content"])
+
+    def analyze(self, public_input, allowed_evidence):
+        result = self._generate(SYSTEM_PROMPT, public_input, RESPONSE_SCHEMA,
+                                schema_name="paper_experiment_decisions")
+        content = result.pop("content")
+        try:
+            return {"decisions": validate_llm_output(content, allowed_evidence), **result}
         except Exception:
             raise AnalysisError("LLM 요청 실패 또는 응답 검증 실패") from None
 
@@ -462,7 +500,7 @@ class CodexLLM:
                 "reasoning_effort": self.preferences.get("model_reasoning_effort"),
                 "timeout_seconds": self.timeout, "max_response_bytes": self.limit}
 
-    def _command(self, directory, schema_path, answer_path):
+    def _command(self, directory, schema_path, answer_path, system_prompt=SYSTEM_PROMPT):
         command = [self.executable, "--no-daemon", "exec", "--ignore-user-config", "--ignore-rules",
                    "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only",
                    "--color", "never", "--json", "-C", str(directory),
@@ -471,7 +509,7 @@ class CodexLLM:
             command.extend(["--disable", feature])
         for value in ('approval_policy="never"', 'web_search="disabled"', "project_doc_max_bytes=0",
                       "features.skip_host_skill_discovery=true", "skills.max_context_tokens=1",
-                      'shell_environment_policy.inherit="none"', 'developer_instructions=' + _json(SYSTEM_PROMPT)):
+                      'shell_environment_policy.inherit="none"', 'developer_instructions=' + _json(system_prompt)):
             command.extend(["-c", value])
         if self.model:
             command.extend(["--model", self.model])
@@ -488,19 +526,19 @@ class CodexLLM:
                    "HOME", "CODEX_HOME", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"}
         return {key: value for key, value in self.environ.items() if key.upper() in allowed}
 
-    def analyze(self, public_input, allowed_evidence):
+    def _generate(self, system_prompt, public_input, response_schema):
         state = self.status()
         if state["status"] != "ready":
             raise AnalysisError(state["error"] or "Codex 분석이 꺼져 있습니다.")
         prompt = _json(public_input)
-        if len(prompt.encode("utf-8")) > 512 * 1024:
+        if len((prompt + system_prompt + _json(response_schema)).encode("utf-8")) > 512 * 1024:
             raise AnalysisError("Codex 분석 입력 한도를 초과했습니다.")
         try:
             with tempfile.TemporaryDirectory(prefix="kis-public-analysis-") as name:
                 directory = Path(name)
                 schema, answer = directory / "schema.json", directory / "answer.json"
-                schema.write_text(_json(RESPONSE_SCHEMA), encoding="utf-8")
-                command = self._command(directory, schema, answer)
+                schema.write_text(_json(response_schema), encoding="utf-8")
+                command = self._command(directory, schema, answer, system_prompt)
                 with (directory / "events.jsonl").open("wb") as events, (directory / "stderr.log").open("wb") as errors:
                     result = self.runner(command, input=prompt.encode("utf-8"), cwd=directory,
                                          stdout=events, stderr=errors, timeout=self.timeout,
@@ -537,9 +575,8 @@ class CodexLLM:
                 if terminal_event != "turn.completed":
                     raise AnalysisError("Codex 분석 완료 이벤트를 확인하지 못했습니다.", "codex_incomplete_turn")
                 content = answer.read_text(encoding="utf-8")
-                decisions = validate_llm_output(content, allowed_evidence)
-                return {"decisions": decisions, "request_hash": _hash({"input": public_input,
-                        "prompt": SYSTEM_PROMPT, "schema": RESPONSE_SCHEMA, "config": self.public_config()}),
+                return {"content": content, "request_hash": _hash({"input": public_input,
+                        "prompt": system_prompt, "schema": response_schema, "config": self.public_config()}),
                         "response_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                         "runtime_warnings": runtime_warnings}
         except subprocess.TimeoutExpired:
@@ -548,6 +585,15 @@ class CodexLLM:
             raise
         except Exception:
             raise AnalysisError("Codex 분석 응답을 읽지 못했습니다.", "codex_invalid_output") from None
+
+    def generate(self, system_prompt, payload, schema):
+        """Reuse the isolated, tool-free CLI for public policy research."""
+        return _structured_object(self._generate(system_prompt, payload, schema)["content"])
+
+    def analyze(self, public_input, allowed_evidence):
+        result = self._generate(SYSTEM_PROMPT, public_input, RESPONSE_SCHEMA)
+        content = result.pop("content")
+        return {"decisions": validate_llm_output(content, allowed_evidence), **result}
 
 
 def make_llm(config_path):

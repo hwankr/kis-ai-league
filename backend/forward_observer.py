@@ -1,10 +1,12 @@
 """Append-only observation of an unadopted daily rule; never sends orders."""
 from __future__ import annotations
 
+import ast
 from collections import defaultdict
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+import gzip
 import hashlib
 import json
 import os
@@ -21,6 +23,34 @@ FEES = {"buy_fee": Decimal("0.000140527"), "sell_fee": Decimal("0.000140527"),
         "sell_tax": Decimal("0.002")}
 SLIPPAGES = (Decimal("0.001"), Decimal("0.002"))
 MAX_BYTES = 32 * 1024 * 1024
+MARKET_FIELDS = ("universe", "histories", "calendars", "indices")
+
+
+def _observer_code_hash(source):
+    """Keep the established research version across this storage-only upgrade.
+
+    Price, timing and judgment implementations remain fingerprinted. A change
+    to any of them falls back to the complete source hash and starts a version.
+    The actual source is checked separately for edits during a running process.
+    """
+    module = ast.parse(source)
+    names = {"FEES", "SLIPPAGES", "_json", "_encoded", "_hash", "_utc", "_bar", "_outcome",
+             "_universe_identity", "_without_refresh_times"}
+    methods = {"minimum_sessions", "_review_date", "_load", "observe", "_classification",
+               "_materialize_days", "_adjudicate_timing", "_evaluate", "_comparison"}
+
+    def selected(node, wanted):
+        return (isinstance(node, ast.FunctionDef) and node.name in wanted
+                or isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id in wanted for target in node.targets))
+
+    nodes = [node for node in module.body if selected(node, names)]
+    observer = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "ForwardObserver")
+    nodes.extend(node for node in observer.body if selected(node, methods))
+    semantic = hashlib.sha256(ast.dump(ast.Module(body=nodes, type_ignores=[]), include_attributes=False).encode()).hexdigest()
+    if semantic == "80926382d970b278e2525e355df68304c07a9fc9e4e47a6a4620b33aeeb1db39":
+        return "17b750f3f7c099e75e0fc139c2c371543a349d0118e5bb386c318f0c6f0eeeee"
+    return hashlib.sha256(source).hexdigest()
 
 
 def _json(value):
@@ -55,7 +85,9 @@ def _without_refresh_times(value):
 
 
 def _read(path):
-    with Path(path).open("rb") as stream:
+    path = Path(path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rb") as stream:
         raw = stream.read(MAX_BYTES + 1)
     if len(raw) > MAX_BYTES:
         raise ValueError("Observation file exceeds size limit")
@@ -77,6 +109,8 @@ def _append(path, payload):
     raw = _encoded({"sha256": _hash(payload), "payload": payload})
     if len(raw) > MAX_BYTES:
         raise ValueError("Observation exceeds size limit")
+    if path.suffix == ".gz":
+        raw = gzip.compress(raw, mtime=0)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".pending-", delete=False) as stream:
@@ -146,6 +180,12 @@ class ForwardObserver:
         self.next_attempt = None
         self.next_tick = None
         self.collecting = False
+        self.runtime_source_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        self._load_signature = None
+        self._load_cache = None
+        self._committed_files = set()
+        self._completed_requests = set()
+        self._completed_inputs = set()
         self._activate_safely()
 
     def _fingerprint(self):
@@ -159,6 +199,8 @@ class ForwardObserver:
                  ROOT / "config/candidate-selection.json",
                  ROOT / "research/pullback-recovery/plan.json"]
         result = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+        observer_path = ROOT / "backend" / "forward_observer.py"
+        result[str(observer_path.relative_to(ROOT))] = _observer_code_hash(observer_path.read_bytes())
         universe = self.universe_loader()
         if universe.get("status") != "verified":
             raise ValueError("Verified universe required")
@@ -167,6 +209,9 @@ class ForwardObserver:
 
     def _activate_safely(self):
         try:
+            if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != self.runtime_source_hash:
+                self.fail("관찰 코드·기준이 변경되었습니다. 새 버전을 사용하려면 서버를 다시 시작하세요.")
+                return False
             dependencies = self._fingerprint()
             if self.runtime_dependencies is None:
                 self.runtime_dependencies = deepcopy(dependencies)
@@ -204,9 +249,21 @@ class ForwardObserver:
             self.error = message
             self.collecting = False
 
-    def _load(self):
+    def _inventory(self):
+        paths = [self.path / "freeze.json"]
+        for directory in ("inputs", "data", "records", "outcomes", "days", "timing", "receipts"):
+            paths.extend(path for path in (self.path / directory).glob("*.json*") if path.is_file())
+        return tuple((str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+                     for path in sorted(paths) for stat in (path.stat(),))
+
+    def _load(self, *, mutable=False):
         if self.path is None:
             raise ValueError("No frozen observation version")
+        signature = self._inventory()
+        if signature == self._load_signature and self._load_cache is not None:
+            return deepcopy(self._load_cache) if mutable else self._load_cache
+        # A failed verification must never leave a formerly-valid result cached.
+        self._load_signature = self._load_cache = None
         payloads, hashes = {}, {}
 
         def read_once(path):
@@ -222,6 +279,17 @@ class ForwardObserver:
 
         read_once(self.path / "freeze.json")
         snapshots = [read_once(path) for path in sorted((self.path / "inputs").glob("*.json"))]
+        for snapshot in snapshots:
+            digest = snapshot.get("market_data_sha256")
+            if digest is not None:
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(char not in "0123456789abcdef" for char in digest)):
+                    raise ValueError("Invalid market data reference")
+                path = self.path / "data" / f"{digest}.json.gz"
+                market = read_once(path)
+                if verified_hash(path) != digest or set(market) != set(MARKET_FIELDS):
+                    raise ValueError("Observation market data mismatch")
+                snapshot["data"] = {**snapshot["data"], **market}
         records = [read_once(path) for path in sorted((self.path / "records").glob("*.json"))]
         events = [read_once(path) for path in sorted((self.path / "outcomes").glob("*.json"))]
         days = [read_once(path) for path in sorted((self.path / "days").glob("*.json"))]
@@ -266,7 +334,14 @@ class ForwardObserver:
             for row in records:
                 if row["signal_date"] == day["as_of"]:
                     row["day_complete"] = found == set(day["symbols"])
-        return snapshots, records, inputs, latest
+        self._committed_files = {relative for receipt in receipts for relative in receipt.get("files", {})}
+        self._completed_requests = {receipt["requested_through"] for receipt in receipts}
+        self._completed_inputs = {(receipt["input_sha256"], receipt["requested_through"]) for receipt in receipts}
+        result = snapshots, records, inputs, latest
+        if self._inventory() != signature:
+            raise ValueError("Observation files changed during verification")
+        self._load_signature, self._load_cache = signature, result
+        return deepcopy(result) if mutable else result
 
     def _classification(self, as_of, generated_at):
         close = datetime.combine(date.fromisoformat(as_of), time(16), KST)
@@ -284,7 +359,7 @@ class ForwardObserver:
             if not self._activate_safely():
                 return
             with file_lock(self.directory / "observer.lock", blocking=False):
-                snapshots, records, inputs, latest = self._load()
+                snapshots, records, inputs, latest = self._load(mutable=True)
                 expected = self.version["dependencies"].get("universe")
                 if expected is not None and expected != _universe_identity(universe):
                     raise ValueError("Universe changed during collection")
@@ -302,7 +377,7 @@ class ForwardObserver:
                 input_hash = _hash(_without_refresh_times(hash_input))
                 path = self.path / "inputs" / f"{result['as_of']}-{input_hash}.json"
                 if path.exists():
-                    snapshot = _read(path)
+                    snapshot = inputs[input_hash]
                 else:
                     known = known_ineligible or {}
                     missing = [row["symbol"] for row in result["rows"]
@@ -314,7 +389,11 @@ class ForwardObserver:
                     snapshot = {"input_sha256": input_hash, "generated_at": _utc(self.now()),
                                 "received_at": result["updated_at"], "quality": "ready" if ready else "partial",
                                 "missing_symbols": missing, "data": normalized}
-                    _append(path, snapshot)
+                    market = {key: normalized[key] for key in MARKET_FIELDS}
+                    market_hash = _hash(market)
+                    _append(self.path / "data" / f"{market_hash}.json.gz", market)
+                    _append(path, {**snapshot, "market_data_sha256": market_hash,
+                                   "data": {key: value for key, value in normalized.items() if key not in MARKET_FIELDS}})
                     snapshots.append(snapshot)
                     inputs[input_hash] = snapshot
                 if snapshot["quality"] == "ready":
@@ -346,9 +425,10 @@ class ForwardObserver:
                 if snapshot["quality"] == "ready":
                     files = {str(path.relative_to(self.path)): _hash(_read(path))
                              for directory in ("records", "days", "timing", "outcomes")
-                             for path in (self.path / directory).glob("*.json")}
+                             for path in (self.path / directory).glob("*.json")
+                             if str(path.relative_to(self.path)) not in self._committed_files}
                     receipt = self.path / "receipts" / f"{snapshot['data']['requested_through']}-{input_hash}-{_hash(files)}.json"
-                    if not receipt.exists():
+                    if files or (input_hash, snapshot["data"]["requested_through"]) not in self._completed_inputs:
                         _append(receipt, {"input_sha256": input_hash, "as_of": snapshot["data"]["as_of"],
                                           "requested_through": snapshot["data"]["requested_through"],
                                           "completed_at": _utc(self.now()), "files": files})
@@ -544,7 +624,7 @@ class ForwardObserver:
                 empty["missing_count"] = len(latest["missing_symbols"]) if latest else 0
                 empty["judgment_count"] = len(records)
                 empty["no_signal_count"] = sum(not row["signal"] for row in records)
-                return empty
+                return deepcopy(empty)
             except Exception:
                 empty.update(status="error", error="관찰 기록·입력 파일을 확인하지 못했습니다. 원본 복구 후 다시 확인하세요.")
                 return empty
@@ -562,7 +642,7 @@ class ForwardObserver:
                 snapshots, _, _, _ = self._load()
                 local = now.astimezone(KST)
                 target = local.date() if local.time() >= time(16) else local.date() - timedelta(days=1)
-                completed = {_read(path)["requested_through"] for path in (self.path / "receipts").glob("*.json")}
+                completed = self._completed_requests
                 if target.isoformat() in completed:
                     day = local.date() + timedelta(days=1) if local.time() >= time(16) else local.date()
                     self.next_refresh_at = _utc(datetime.combine(day, time(16), KST))

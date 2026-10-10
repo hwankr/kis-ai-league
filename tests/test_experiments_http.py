@@ -50,6 +50,35 @@ class ExperimentsHttpTests(unittest.TestCase):
         self.assertEqual(self.request(path="/api/health", headers={"X-KIS-Dashboard": "0"})[0], 403)
         self.assertEqual(self.request(path="/api/health?force=1")[0], 400)
 
+    def test_mirror_feed_is_read_only_and_passes_bounded_cursor(self):
+        payload = {"status": "observing", "submission_enabled": False, "events": [], "next_cursor": 17}
+        self.experiments.mirror_snapshot.return_value = payload
+        self.assertEqual(self.request(path="/api/mirror?after=17&limit=2"), (200, payload))
+        self.experiments.mirror_snapshot.assert_called_once_with(after=17, limit=2)
+        self.experiments.command.assert_not_called()
+        self.experiments.tick.assert_not_called()
+        self.experiments.snapshot.assert_not_called()
+        self.assertEqual(self.request("POST", '{"action":"start"}', path="/api/mirror")[0], 404)
+
+    def test_mirror_feed_rejects_cross_origin_and_invalid_pagination(self):
+        for bad in ({"Origin": "https://evil.invalid"}, {"Host": "evil.invalid"},
+                    {"Sec-Fetch-Site": "cross-site"}, {"X-KIS-Dashboard": "0"}):
+            headers = {"X-KIS-Dashboard": "1", **bad}
+            self.assertEqual(self.request(path="/api/mirror", headers=headers)[0], 403)
+        for query in ("after=-1", "after=", "after=1&after=2", "after=1.5", "limit=0", "limit=201",
+                      "limit=1&limit=2", "account=paper", "after=9223372036854775808", "after=" + "1" * 20):
+            with self.subTest(query=query):
+                self.assertEqual(self.request(path="/api/mirror?" + query)[0], 400)
+        self.experiments.mirror_snapshot.assert_not_called()
+
+    def test_mirror_feed_reports_source_conflict_and_hides_unexpected_details(self):
+        self.experiments.mirror_snapshot.side_effect = KisError("연동 체결 조회 조건 또는 원장 상태를 확인하세요.")
+        self.assertEqual(self.request(path="/api/mirror")[0], 400)
+        self.experiments.mirror_snapshot.side_effect = RuntimeError("private-token")
+        status, payload = self.request(path="/api/mirror")
+        self.assertEqual(status, 503)
+        self.assertNotIn("private", json.dumps(payload))
+
     def test_question_answer_is_routed_once_and_returns_current_autonomy(self):
         monitor = Mock()
         monitor.snapshot.return_value = {"status": "attention", "issues": []}
@@ -72,6 +101,7 @@ class ExperimentsHttpTests(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertLess(len(json.dumps(payload)), 2048)
         self.assertEqual(payload["autonomy"]["open_issue_count"], 0)
+        monitor.snapshot.assert_called_once_with(include_history=False)
 
     def test_async_command_is_forwarded_exactly_once(self):
         self.assertEqual(self.request("POST", '{"action":"analyze"}')[0], 202)

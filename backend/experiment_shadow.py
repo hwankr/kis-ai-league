@@ -64,6 +64,17 @@ def _signal_key(strategy, symbol, day):
     return hashlib.sha256(json.dumps([strategy, symbol, day], separators=(",", ":")).encode()).hexdigest()
 
 
+def input_key(revision, histories, calendars, as_of):
+    """Include every observed dependency, including revisions outside today's candidates."""
+    as_of = _day(as_of)
+    value = {"version": 1, "runs": revision, "as_of": as_of,
+             "histories": {symbol: {day: _bar(bar) for day, bar in _prices(histories, symbol, as_of).items()}
+                           for symbol in histories},
+             "calendars": {board: [_day(day) for day in days if _day(day) <= as_of]
+                           for board, days in calendars.items()}}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def _new_record(run, decision):
     day = _day(decision.get("as_of") or run["as_of"])
     analysis = run.get("analysis") or {}
@@ -168,6 +179,7 @@ def update_shadow(store, runs, histories, calendars, as_of):
     histories/calendars accept date objects or ISO keys. Futures beyond ``as_of``
     are never used. The first ready decision for (strategy,symbol,signal day) wins,
     including hold/avoid; reruns cannot replace it with a more favorable decision.
+    Learned policy signals use the portfolio evaluator, not this fixed 5-day path.
     """
     as_of = _day(as_of)
     normalized = {}
@@ -185,6 +197,8 @@ def update_shadow(store, runs, histories, calendars, as_of):
     strategies = set()
     for run in sorted(runs, key=lambda row: (str(row.get("created_at", "")), str(row.get("id", "")))):
         for decision in run.get("signals", (run.get("analysis") or {}).get("decisions", [])):
+            if decision.get("policy_id"):
+                continue
             strategy = decision["strategy_id"]
             strategies.add(strategy)
             if decision.get("status") != "ready":

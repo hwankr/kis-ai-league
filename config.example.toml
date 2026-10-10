@@ -24,6 +24,10 @@ product_code = '01'  # 계좌 뒤 2자리
 [experiments]
 autonomous = false  # true: 기본 모의계좌 자동 배분·주문·재시작 복구. 사용자 중지는 유지.
 
+[experiments.learning]
+# 생략하면 experiments.autonomous를 따름. 전체 전략 운용에서 새 관측으로 평가·자동 교체.
+# enabled = true
+
 [experiments.llm]
 provider = 'codex'  # 설치된 Codex CLI와 기존 ChatGPT 로그인 사용
 enabled = true

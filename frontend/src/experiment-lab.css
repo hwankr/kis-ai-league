@@ -25,6 +25,26 @@
 .lab-issue .lab-issue-question { color: var(--muted); font-size: 12px; }
 .lab-issue-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .lab-no-issues { margin: 0 0 20px; color: var(--muted); font-size: 12px; }
+.lab-learning-strategies { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin: 0 0 20px; }
+.lab-learning-strategies dt { color: var(--muted); font-size: 12px; }
+.lab-learning-strategies dd { margin: 8px 0 0; font-size: 15px; font-weight: 500; overflow-wrap: anywhere; }
+.lab-learning-strategies dd.lab-learning-time { color: var(--muted); font-size: 11px; font-weight: 400; line-height: 1.7; }
+.lab-learning-result { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; line-height: 1.6; }
+.lab-learning-result strong { font-weight: 500; }
+.lab-learning-result span, .lab-learning-result time { color: var(--muted); }
+.lab-learning-table { display: table; min-width: 0; margin-top: 12px; table-layout: fixed; }
+.lab-learning-table thead { display: table-header-group; position: static; width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; }
+.lab-learning-table tbody { display: table-row-group; }
+.lab-learning-table tbody tr { display: table-row; }
+.lab-learning-table tbody td { display: table-cell; grid-area: auto; padding: 10px 0; border-bottom: 1px solid #f2f4f6; }
+.lab-learning-table th, .lab-learning-table td { padding: 10px 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+.lab-learning-table tbody th { font-weight: 400; }
+.lab-learning-table th:not(:first-child), .lab-learning-table td { text-align: right; }
+.lab-learning-reason { margin: 12px 0 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.lab-learning-change { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 18px; padding-top: 16px; border-top: 1px solid #edf0f3; font-size: 12px; line-height: 1.7; }
+.lab-learning-change > span, .lab-learning-change time { color: var(--muted); }
+.lab-learning-change strong { font-weight: 500; }
+.lab-learning-change p { flex-basis: 100%; margin: 0; overflow-wrap: anywhere; }
 .lab-daily-reports { padding: 0; margin: 0; list-style: none; }
 .lab-daily-reports li { display: grid; grid-template-columns: 1fr 1fr 1fr 1.5fr; gap: 12px; padding: 14px 0; border-bottom: 1px solid #edf0f3; font-size: 13px; font-variant-numeric: tabular-nums; }
 .lab-daily-reports li > :last-child { color: var(--muted); font-size: 12px; }
@@ -136,6 +156,7 @@
   .lab-events li { grid-template-columns: minmax(0, 1fr); gap: 3px; }
   .lab-account-performance dd { font-size: 19px; }
   .lab-health-times { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+  .lab-learning-strategies { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .lab-daily-reports li { grid-template-columns: repeat(2, minmax(0, 1fr)); font-size: 12px; }
   .lab-signal-heading { align-items: flex-start; gap: 8px; }
   .lab-signal-score { gap: 6px; }

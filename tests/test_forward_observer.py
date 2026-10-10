@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+import hashlib
 from http.client import HTTPConnection
 from pathlib import Path
 import tempfile
@@ -9,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from backend.forward_observer import ForwardObserver, _read, _append
+from backend.forward_observer import ForwardObserver, _read, _append, _hash, _observer_code_hash
 from backend.kis import KST
 
 
@@ -122,6 +123,133 @@ class ObserverTests(unittest.TestCase):
         after = {str(path.relative_to(self.directory)): path.read_bytes()
                  for path in self.directory.rglob("*.json")}
         self.assertEqual(before, after)
+
+    def test_holiday_requests_share_compressed_market_input(self):
+        self.observe()
+        first = self.observer.snapshot()
+        self.clock.value += timedelta(days=1)
+        self.observer.observe(**payload(self.clock, 62))
+        inputs = list((self.observer.path / "inputs").glob("*.json"))
+        data = list((self.observer.path / "data").glob("*.json.gz"))
+        self.assertEqual(len(inputs), 2)
+        self.assertEqual(len(data), 1)
+        metadata = [_read(path) for path in inputs]
+        self.assertEqual(len({item["market_data_sha256"] for item in metadata}), 1)
+        self.assertTrue(all("histories" not in item["data"] for item in metadata))
+        market = _read(data[0])
+        self.assertEqual(len(market["histories"]), 2)
+        self.assertLess(data[0].stat().st_size, len(str(market).encode()) // 4)
+        self.assertEqual(self.observer.snapshot()["observations"], first["observations"])
+
+    def test_legacy_full_inputs_remain_readable_and_unchanged(self):
+        self.observe()
+        # Recreate the pre-upgrade layout inside this isolated test directory.
+        for path in (self.observer.path / "inputs").glob("*.json"):
+            saved = _read(path)
+            market = _read(self.observer.path / "data" / f"{saved.pop('market_data_sha256')}.json.gz")
+            saved["data"].update(market)
+            path.unlink()
+            _append(path, saved)
+        for path in (self.observer.path / "data").glob("*.json.gz"):
+            path.unlink()
+        original = {path: path.read_bytes() for path in self.observer.path.rglob("*.json")}
+        frozen = self.observer.version["frozen_at"]
+        self.observer = self.make()
+        self.assertEqual(self.observer.version["frozen_at"], frozen)
+        self.assertEqual(self.observer.snapshot()["counts"]["prospective"], 2)
+        result = self.observe(68)
+        self.assertEqual(result["counts"]["closed"], 2)
+        self.assertEqual(original, {path: path.read_bytes() for path in original})
+
+    def test_unchanged_snapshot_and_tick_reuse_verified_records(self):
+        self.observe()
+        candidate = Mock()
+        with patch("backend.forward_observer._read", wraps=_read) as reader:
+            self.assertEqual(self.observer.snapshot()["status"], "ready")
+            reader.assert_not_called()
+            self.observer.tick(candidate)
+            self.assertEqual([call.args[0].name for call in reader.call_args_list], ["freeze.json"])
+            candidate.start.assert_not_called()
+        # A caller cannot mutate the cached records through the public response.
+        value = self.observer.snapshot()
+        value["observations"][0]["outcome"]["status"] = "changed by caller"
+        self.assertEqual(self.observer.snapshot()["observations"][0]["outcome"]["status"], "pending_entry")
+
+    def test_compressed_input_corruption_and_loss_invalidate_warm_cache(self):
+        self.observe()
+        path = next((self.observer.path / "data").glob("*.json.gz"))
+        original = path.read_bytes()
+        path.write_bytes(b"broken gzip")
+        self.assertEqual(self.observer.snapshot()["status"], "error")
+        with self.assertRaises(OSError):
+            self.observer.observe(**payload(self.clock))
+        self.assertEqual(path.read_bytes(), b"broken gzip")
+        path.write_bytes(original)
+        self.assertEqual(self.observer.snapshot()["status"], "ready")
+        path.unlink()
+        self.assertEqual(self.observer.snapshot()["status"], "error")
+
+    def test_receipts_reference_each_committed_file_only_once(self):
+        self.observe()
+        self.observe(64)
+        receipts = [_read(path) for path in (self.observer.path / "receipts").glob("*.json")]
+        references = [name for receipt in receipts for name in receipt["files"]]
+        self.assertEqual(len(references), len(set(references)))
+        files = {str(path.relative_to(self.observer.path)) for directory in ("records", "days", "timing", "outcomes")
+                 for path in (self.observer.path / directory).glob("*.json")}
+        self.assertEqual(set(references), files)
+        # Losing an old outcome remains detectable through its original receipt.
+        first = min((self.observer.path / "outcomes").glob("*.json"), key=lambda path: _read(path)["sequence"])
+        first.unlink()
+        self.assertEqual(self.observer.snapshot()["status"], "error")
+
+    def test_storage_change_preserves_version_but_rule_change_does_not(self):
+        import backend.forward_observer as observer_module
+        source = Path(observer_module.__file__).read_bytes()
+        legacy = "17b750f3f7c099e75e0fc139c2c371543a349d0118e5bb386c318f0c6f0eeeee"
+        self.assertEqual(_observer_code_hash(source), legacy)
+        self.assertEqual(_observer_code_hash(source + b"\n# Storage-only comment\n"), legacy)
+        changed = source.replace(b"holding_days=offset", b"holding_days=offset + 1")
+        self.assertEqual(_observer_code_hash(changed), hashlib.sha256(changed).hexdigest())
+        self.assertNotEqual(_observer_code_hash(changed), legacy)
+        changed_quality = source.replace(b"ready = (not missing", b"ready = (bool(missing)")
+        self.assertEqual(_observer_code_hash(changed_quality), hashlib.sha256(changed_quality).hexdigest())
+        changed_serialization = source.replace(b'return format(value, "f")', b'return format(value, ".1f")')
+        self.assertEqual(_observer_code_hash(changed_serialization), hashlib.sha256(changed_serialization).hexdigest())
+
+    def test_runtime_storage_source_edit_requires_restart(self):
+        import backend.forward_observer as observer_module
+        original_read = Path.read_bytes
+        source = Path(observer_module.__file__).resolve()
+        candidate = Mock()
+        with patch.object(Path, "read_bytes", autospec=True,
+                          side_effect=lambda path: original_read(path) + (b"\n# storage edit\n" if path.resolve() == source else b"")):
+            self.observer.tick(candidate)
+        candidate.start.assert_not_called()
+        self.assertIn("서버를 다시 시작", self.observer.snapshot()["error"])
+
+    def test_native_dependency_keys_reuse_a_legacy_freeze(self):
+        universe = payload(self.clock)["universe"]
+        probe = self.make(dependencies=None, universe_loader=lambda: universe)
+        dependencies = probe._fingerprint()
+        observer_key = str(Path("backend") / "forward_observer.py")
+        self.assertEqual(dependencies[observer_key],
+                         "17b750f3f7c099e75e0fc139c2c371543a349d0118e5bb386c318f0c6f0eeeee")
+        # Pre-upgrade freezes use native relative paths (backslashes on Windows).
+        legacy_dependencies = {str(Path(key)): value for key, value in dependencies.items()}
+        self.assertEqual(dependencies, legacy_dependencies)
+        legacy_id = _hash({"rule_id": probe.rule_id, "dependencies": legacy_dependencies})
+        directory = self.directory / "legacy-copy"
+        freeze_path = directory / legacy_id / "freeze.json"
+        frozen_at = datetime.combine(DAYS[61], time(9), KST).isoformat()
+        _append(freeze_path, {**probe.version, "version_id": legacy_id,
+                             "dependencies": legacy_dependencies, "frozen_at": frozen_at})
+        original = freeze_path.read_bytes()
+        restored = ForwardObserver(directory, now=self.clock, universe_loader=lambda: universe)
+        self.assertEqual(restored.path, freeze_path.parent)
+        self.assertEqual(restored.version["frozen_at"], frozen_at)
+        self.assertEqual(freeze_path.read_bytes(), original)
+        self.assertEqual([path.name for path in directory.iterdir() if path.is_dir()], [legacy_id])
 
     def test_first_ready_day_seals_membership_and_signal_inputs(self):
         self.observe()

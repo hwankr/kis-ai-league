@@ -1,16 +1,19 @@
 """Offline service scenarios: durable intent, cumulative fills and bounded exposure."""
+from contextlib import closing
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+import hashlib
 import json
 import multiprocessing
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from backend.experiment_store import ExperimentStore
+from backend.experiment_store import ExperimentStore, encode
 from backend.experiments import ExperimentService, FEE, ALL_STRATEGIES
 from backend.kis import KST, KisError
 from backend.paper_broker import BrokerUnknown, BrokerRejected
@@ -176,6 +179,45 @@ class ExperimentsTests(unittest.TestCase):
         self.submit()
         self.assertEqual(len(self.broker.submissions), 1)
         self.assertEqual(len(self.service.store.orders()), 1)
+
+    def test_verified_partial_fills_feed_survives_restart_during_user_pause(self):
+        self.submit(quantity=5)
+        self.service.command({"action": "pause"})
+        self.fill(2)
+        first = self.service.mirror_snapshot()
+        self.assertEqual([row["quantity"] for row in first["events"]], [2])
+        self.assertEqual(first["owned_quantities"], {"005930": 2})
+        self.assertFalse(first["submission_enabled"])
+        self.fill(2)
+        self.assertEqual(self.service.mirror_snapshot(after=first["next_cursor"])["events"], [])
+        self.fill(5, status="filled")
+        restarted = self.make_service()
+        following = restarted.mirror_snapshot(after=first["next_cursor"])
+        self.assertEqual([row["quantity"] for row in following["events"]], [3])
+        self.assertEqual(following["owned_quantities"], {"005930": 5})
+        from backend.mirror_plan import plan_weight_changes
+        proposal = plan_weight_changes(
+            first["events"] + following["events"], source_fingerprint=following["source_fingerprint"],
+            owned_quantities=following["owned_quantities"], source_prices={"005930": {"price": "10000", "fresh": True}},
+            source_equity="1000000", destination_positions={"005930": {"weight": "0", "sellable_weight": "0"}},
+            pending_orders=[], destination_verified=True)
+        self.assertEqual((proposal[0]["status"], proposal[0]["side"], proposal[0]["weight"]),
+                         ("proposal", "buy", "5.00"))
+        self.assertFalse(restarted.store.setting("enabled"))
+        self.assertTrue(restarted.store.setting("user_paused"))
+        self.assertEqual(len(self.broker.submissions), 1)
+        self.assertEqual(self.broker.cancellations, [])
+
+    def test_unverified_broker_fill_never_enters_mirror_feed(self):
+        self.submit(quantity=5)
+        self.fill(2)
+        original = self.service.mirror_snapshot()
+        self.broker.remote[0]["symbol"] = "000660"
+        with self.assertRaises(KisError):
+            self.fill(4)
+        after = self.service.mirror_snapshot()
+        self.assertEqual(after["events"], original["events"])
+        self.assertEqual(after["owned_quantities"], original["owned_quantities"])
 
     def test_unknown_submission_stays_quarantined_across_reconcile_and_restart(self):
         self.broker.submit_error = BrokerUnknown("response lost")
@@ -388,6 +430,89 @@ class ExperimentsTests(unittest.TestCase):
         second = self.service._analyze()
         self.assertEqual(first["id"], second["id"])
         self.analyzer.assert_called_once()
+
+    def test_unchanged_inputs_skip_full_run_reads_and_shadow_work_across_restart(self):
+        from backend.experiment_shadow import update_shadow
+        self.service.command({"action": "pause"})
+        with patch("backend.experiment_shadow.update_shadow", wraps=update_shadow) as update:
+            first = self.service._analyze()
+            self.input_data["observed_at"] = "2026-10-02T18:00:00+09:00"
+            with patch.object(self.service.store, "runs", wraps=self.service.store.runs) as reads:
+                self.assertEqual(self.service._analyze()["id"], first["id"])
+                reads.assert_not_called()
+            resumed = self.make_service()
+            with patch.object(resumed.store, "runs", wraps=resumed.store.runs) as reads:
+                self.assertEqual(resumed._analyze()["id"], first["id"])
+                self.assertTrue(all(call.kwargs.get("details") is False for call in reads.call_args_list))
+            update.assert_called_once()
+        self.analyzer.assert_called_once()
+        self.assertFalse(resumed.store.setting("enabled"))
+        self.assertTrue(resumed.store.setting("user_paused"))
+        self.assertEqual(self.broker.submissions, [])
+
+    def test_shadow_refreshes_for_revised_prices_new_signals_and_calendar(self):
+        from backend.experiment_shadow import update_shadow
+        from tests.test_experiment_shadow import fixture
+        run, histories, calendars = fixture()
+        self.service.store.add_run(run)
+        data = {"as_of": "2026-10-13", "histories": histories, "calendars": calendars}
+        with patch("backend.experiment_shadow.update_shadow", wraps=update_shadow) as update:
+            self.service._refresh_shadow(data)
+            before = deepcopy(next(iter(self.service.store.setting("shadow")["records"].values())))
+            self.service._refresh_shadow(data)
+            update.assert_called_once()
+            histories["005930"][date(2026, 10, 5)]["open"] = "100.1"
+            self.service._refresh_shadow(data)
+            revised = next(iter(self.service.store.setting("shadow")["records"].values()))
+            self.assertEqual(revised["reason"], "price_revision")
+            self.assertEqual(revised["basis"], before["basis"])
+            self.assertEqual(revised["first_closed"], before["first_closed"])
+            self.service.store.add_run({**run, "id": "run2", "created_at": "2026-10-02T09:00:00+00:00"})
+            self.service._refresh_shadow(data)
+            calendars["KOSPI"].remove(date(2026, 10, 5))
+            self.service._refresh_shadow(data)
+            self.assertEqual(update.call_count, 4)
+
+    def test_shadow_detects_cache_revision_outside_current_candidates(self):
+        from backend.candidate_history import HistoryCache
+        from backend.experiment_shadow import update_shadow
+        from tests.test_experiment_shadow import fixture
+        run, histories, calendars = fixture()
+        self.service.store.add_run(run)
+        cache = HistoryCache(self.root / ".local" / "candidates" / "history")
+        bars = {day: {key: Decimal(value) for key, value in bar.items()}
+                for day, bar in histories["005930"].items()}
+        cache._write(cache._path("stock", "005930"), "stock", "005930", bars)
+        data = {"as_of": "2026-10-13", "histories": {}, "calendars": calendars}
+        with patch("backend.experiment_shadow.update_shadow", wraps=update_shadow) as update:
+            self.service._refresh_shadow(data)
+            self.service._refresh_shadow(data)
+            update.assert_called_once()
+            bars[date(2026, 10, 5)]["open"] = Decimal("100.1")
+            cache._write(cache._path("stock", "005930"), "stock", "005930", bars)
+            self.service._refresh_shadow(data)
+            self.assertEqual(update.call_count, 2)
+        record = next(iter(self.service.store.setting("shadow")["records"].values()))
+        self.assertEqual(record["reason"], "price_revision")
+
+    def test_failed_shadow_update_is_retried_with_identical_input(self):
+        with patch("backend.experiment_shadow.update_shadow", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.service._analyze()
+        self.assertIsNone(self.service.store.setting("shadow_refresh_key"))
+        self.service._analyze()
+        self.analyzer.assert_called_once()
+        self.assertIsNotNone(self.service.store.setting("shadow_refresh_key"))
+
+    def test_dashboard_and_order_cycle_read_only_run_metadata(self):
+        self.add_run(symbols=("005930",))
+        self.enable()
+        with patch.object(self.service.store, "runs", wraps=self.service.store.runs) as reads:
+            self.assertNotIn("analysis", self.service.snapshot()["runs"][0])
+            self.service._cycle()
+            self.assertTrue(reads.called)
+            self.assertTrue(all(call.kwargs.get("details") is False for call in reads.call_args_list))
+        self.assertEqual(len(self.broker.submissions), 1)
 
     def test_changed_benchmark_calendar_or_evidence_produces_new_frozen_run(self):
         first = self.service._analyze()
@@ -856,6 +981,59 @@ class ExperimentsTests(unittest.TestCase):
         self.fill(2, index=1, status="filled")
         issue = next(item for item in self.service.store.setting("issues") if item["id"] == issue_id)
         self.assertEqual(issue["state"], "resolved")
+
+
+class ExperimentStoreTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "experiments.sqlite3"
+
+    def test_legacy_index_backfill_preserves_frozen_payload_and_pause(self):
+        frozen = {"observed_at": "2026-10-02T08:00:00+00:00", "as_of": "2026-10-02", "rows": []}
+        run = {"id": "legacy", "as_of": "2026-10-02", "created_at": "2026-10-02T09:00:00+00:00",
+               "version_id": "v1", "signals": [decision()], "analysis": {"input": frozen, "decisions": [decision()]}}
+        original = json.dumps(run, indent=2)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE runs (id TEXT PRIMARY KEY,day TEXT,created_at TEXT,payload TEXT)")
+            db.execute("INSERT INTO runs VALUES (?,?,?,?)", (run["id"], run["as_of"], run["created_at"], original))
+            db.execute("CREATE TABLE settings (key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+            db.executemany("INSERT INTO settings VALUES (?,?)", [("enabled", "false"), ("user_paused", "true")])
+        store = ExperimentStore(self.path)
+        key = hashlib.sha256(encode({"as_of": "2026-10-02", "rows": [], "analysis_version": "v1"}).encode()).hexdigest()
+        self.assertEqual(store.find_run(key)["id"], "legacy")
+        self.assertNotIn("analysis", store.find_run(key))
+        self.assertEqual(store.runs(), [run])
+        self.assertFalse(store.setting("enabled"))
+        self.assertTrue(store.setting("user_paused"))
+        # A second startup uses the existing index without rewriting source records.
+        ExperimentStore(self.path)
+        with store.connect() as db:
+            self.assertEqual(db.execute("SELECT payload FROM runs").fetchone()[0], original)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM run_index").fetchone()[0], 1)
+
+    def test_new_runs_store_decisions_once_and_hydrate_existing_shape(self):
+        store = ExperimentStore(self.path)
+        run = {"id": "new", "as_of": "2026-10-02", "created_at": "2026-10-02T09:00:00+00:00",
+               "collection_hash": "same-input", "signals": [decision()], "analysis": {"decisions": [decision()]}}
+        original = deepcopy(run)
+        store.add_run(run)
+        self.assertEqual(run, original)
+        self.assertEqual(store.runs(), [original])
+        self.assertEqual(store.find_run("same-input"), store.runs(details=False)[0])
+        with store.connect() as db:
+            stored = json.loads(db.execute("SELECT payload FROM runs").fetchone()[0])
+        self.assertNotIn("decisions", stored["analysis"])
+        self.assertEqual(stored["signals"], original["signals"])
+
+    def test_index_lookup_is_not_limited_to_recent_200_runs(self):
+        store = ExperimentStore(self.path)
+        for index in range(202):
+            store.add_run({"id": f"run-{index:03}", "as_of": "2026-10-02",
+                           "created_at": "2026-10-02T09:00:00+00:00", "signals": [],
+                           "collection_hash": f"input-{index}"})
+        self.assertEqual(store.find_run("input-0")["id"], "run-000")
+        self.assertIsNone(store.find_run("missing"))
 
 
 if __name__ == "__main__":

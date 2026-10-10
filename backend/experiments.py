@@ -94,12 +94,18 @@ class ExperimentService:
         self.error = None
         self.updated_at = None
         self._llm = None
+        self._shadow_sources = None
         self.stopping = False
         try:
             settings = tomllib.loads(self.config_path.read_text(encoding="utf-8")).get("experiments", {})
             self.autonomous = settings.get("autonomous") is True
         except (OSError, ValueError, AttributeError):
             self.autonomous = False
+            settings = {}
+        from backend.learning import LearningService
+        self.learning = LearningService(self.store,
+            enabled=settings.get("learning", {}).get("enabled", self.autonomous) is True,
+            now=self.now, llm_factory=self._get_llm, development_reader=self._development_inputs)
         # Never resubmit a mutation interrupted between durable intent and response.
         try:
             with file_lock(self.directory / "runner.lock", blocking=False):
@@ -129,9 +135,10 @@ class ExperimentService:
 
     def close(self):
         self.stopping = True
+        learning_closed = self.learning.close()
         if self.worker is not None and self.worker.is_alive():
             self.worker.join(20)
-        return self.worker is None or not self.worker.is_alive()
+        return learning_closed and (self.worker is None or not self.worker.is_alive())
 
     def _event(self, kind, message):
         self.store.event(kind, message, self._timestamp())
@@ -229,12 +236,28 @@ class ExperimentService:
 
     def _specs(self):
         from backend.experiment_analysis import strategy_specs
-        return strategy_specs()
+        from backend.learning_policy import policy_id
+        specs = strategy_specs()
+        policy = self.learning.champion()
+        for item in policy["strategies"]:
+            specs.append({"id": item["id"], "label": item["name"],
+                          "description": f"채택 전략 · {item['holding_sessions']}거래일 · 배분 {item['weight'] * 100:g}%",
+                          "version": policy_id(policy), "selectable": False})
+        return specs
+
+    def _adopted_policy(self):
+        if self.learning.enabled and self._policy().get("execution_strategy") == ALL_STRATEGIES:
+            return self.learning.champion()
+        return None
+
+    def _development_inputs(self, data):
+        from backend.learning_history import development_frames
+        return development_frames(self.config_path.parent, data)
 
     def _llm_meta(self):
         from backend.experiment_analysis import llm_metadata
         value = llm_metadata(self.config_path)
-        latest = self.store.runs(1)
+        latest = self.store.runs(1, details=False)
         state = latest[0].get("llm_status") if latest else None
         if isinstance(state, dict) and state.get("status") == "error":
             value["error"] = state.get("error")
@@ -288,7 +311,10 @@ class ExperimentService:
                 "entry_date": order["order_date"], "entry_id": order["id"]})
             if order["side"] == "buy":
                 if position["quantity"] == 0:
-                    position.update(entry_date=order["order_date"], entry_id=order["id"])
+                    position.update(entry_date=order["order_date"], entry_id=order["id"],
+                                    policy_id=order.get("policy_id"), exit_policy=order.get("exit_policy"),
+                                    learning_engine_version=order.get("learning_engine_version"),
+                                    cancel_after_minutes=order.get("cancel_after_minutes", 10))
                 position["quantity"] += quantity
                 position["cost"] += amount * (1 + FEE)
             else:
@@ -330,10 +356,16 @@ class ExperimentService:
                     "autonomy": {**self.store.setting("autonomy_status", {}), "configured": self.autonomous,
                                  "user_paused": self.store.setting("user_paused", False),
                                  "blocked": self._blocked(), "issues": self.store.setting("issues", [])},
-                    "strategies": self._specs(), "runs": [{key: value for key, value in run.items() if key != "analysis"}
-                                                          for run in self.store.runs(30)],
+                    "strategies": self._specs(), "runs": self.store.runs(30, details=False),
                     "orders": list(reversed(orders[-200:])), "positions": positions,
-                    "metrics": metrics, "events": self.store.events()}
+                    "metrics": metrics, "events": self.store.events(), "learning": self.learning.snapshot()}
+
+    def mirror_snapshot(self, *, after=0, limit=100):
+        """Read verified fill observations without fetching data or enabling orders."""
+        try:
+            return self.store.mirror_snapshot(after=after, limit=limit)
+        except ValueError:
+            raise KisError("연동 체결 조회 조건 또는 원장 상태를 확인하세요.") from None
 
     def command(self, body):
         if not isinstance(body, dict) or not isinstance(body.get("action"), str):
@@ -384,7 +416,7 @@ class ExperimentService:
         positions, _ = self._portfolio(current)
         if positions or any(item["status"] in ACTIVE for item in current):
             raise KisError("미체결 주문·전략 보유수량을 정리한 뒤 설정을 변경하세요.")
-        strategy_ids = {item["id"] for item in self._specs()} | {ALL_STRATEGIES}
+        strategy_ids = {item["id"] for item in self._specs() if item.get("selectable", True)} | {ALL_STRATEGIES}
         if policy["execution_strategy"] not in strategy_ids or not isinstance(policy["account_id"], str):
             raise KisError("등록된 계좌와 전략을 선택하세요.")
         values = {key: decimal(policy[key], positive=True) for key in ("budget", "order_cap", "daily_buy_limit")}
@@ -490,7 +522,17 @@ class ExperimentService:
         as_of = date.fromisoformat(result["as_of"])
         indices = {board: {day: value for day, value in bars.items() if day <= as_of}
                    for board, bars in indices.items()}
-        rows = [row for row in result["rows"] if row.get("selection", {}).get("status") == "selected"]
+        rows = result["rows"]
+        # The learned screener sees the full observed universe. Regulatory and
+        # current trading restrictions remain outside the tunable strategy.
+        if self.learning.enabled:
+            master = self.master_reader()
+            rows = [{**row, "learning_eligible": row.get("status") == "ok" and decimal(row.get("close") or 0) >= 1000
+                     and master.get("status") == "ok" and not master.get("stale")
+                     and assess_master(master.get("rows", {}).get(row["symbol"]), row["board"])["status"] == "pass"}
+                    for row in rows]
+        else:
+            rows = [row for row in rows if row.get("selection", {}).get("status") == "selected"]
         histories = {}
         for row in rows:
             bars = cache._read(cache._path("stock", row["symbol"]), "stock", row["symbol"])
@@ -502,45 +544,62 @@ class ExperimentService:
 
     def _analyze(self, *, retry_llm=False, automatic_retry=False):
         from backend.experiment_analysis import analyze_experiments, analysis_version, build_snapshot
+        from backend.learning_policy import build_frame, policy_id, signals
         data = self.input_reader()
         # Do not reroll LLM recommendations from the same frozen daily input.
         normalized = build_snapshot(**data)
         digestable = {key: value for key, value in normalized.items() if key != "observed_at"}
         digestable["analysis_version"] = analysis_version(self.config_path)
-        key = hashlib.sha256(encode(digestable).encode()).hexdigest()
-        for previous in self.store.runs(200):
-            original = (previous.get("analysis") or {}).get("input")
-            original_key = None
-            if original and previous.get("version_id") == digestable["analysis_version"]:
-                comparison = {field: value for field, value in original.items() if field != "observed_at"}
-                comparison["analysis_version"] = previous["version_id"]
-                original_key = hashlib.sha256(encode(comparison).encode()).hexdigest()
-            if previous.get("collection_hash") == key or original_key == key:
-                state = previous.get("llm_status")
-                failed = isinstance(state, dict) and state.get("status") in {"error", "unconfigured"}
-                retry = retry_llm or automatic_retry and self._retry_due("llm_retry")
-                if not retry or not failed:
-                    self._refresh_shadow(data)
-                    return previous
-                break
+        base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
+        adopted = self._adopted_policy()
+        learned_frame = build_frame(data) if adopted and adopted["kind"] == "rules" else None
+        key = (hashlib.sha256(encode([base_key, policy_id(adopted),
+                self.learning.version,
+                {key: value for key, value in learned_frame.items() if key != "observed_at"}]).encode()).hexdigest()
+               if learned_frame else base_key)
+        previous = self.store.find_run(key, exact=True)
+        if previous is not None:
+            state = previous.get("llm_status")
+            failed = isinstance(state, dict) and state.get("status") in {"error", "unconfigured"}
+            retry = retry_llm or automatic_retry and self._retry_due("llm_retry")
+            if not retry or not failed:
+                self._refresh_shadow(data)
+                self._learn(data, previous)
+                return previous
         # An interrupted analysis has no executable result. Keep the attempt
         # separate from immutable completed runs and retry after process recovery.
         self.store.save_setting("analysis_attempt", {"collection_hash": key, "state": "running",
                                                      "started_at": self._timestamp()})
-        result = (self.analyzer or analyze_experiments)(**data, llm=self._get_llm())
-        decisions = result["decisions"]
+        baseline = self.store.find_run(base_key)
+        if baseline and not retry_llm and not (isinstance(baseline.get("llm_status"), dict)
+                                               and baseline["llm_status"].get("status") in {"error", "unconfigured"}):
+            result = {"decisions": [item for item in baseline["signals"] if not item.get("policy_id")],
+                      "input_hash": baseline["input_hash"], "version_id": baseline["version_id"],
+                      "llm_status": baseline.get("llm_status"), "input": normalized}
+        else:
+            result = (self.analyzer or analyze_experiments)(**data, llm=self._get_llm())
+        decisions = result["decisions"] + (signals(adopted, learned_frame) if learned_frame else [])
+        result["decisions"] = decisions
         run = {"id": uuid4().hex, "as_of": str(data["as_of"]), "created_at": self._timestamp(),
                "status": "ready", "input_hash": result["input_hash"], "version_id": result["version_id"],
                "collection_hash": key, "signals": decisions,
                "error": (result.get("llm_status") or {}).get("error") if isinstance(result.get("llm_status"), dict) else None,
-               "llm_status": result.get("llm_status"), "analysis": result}
+               "llm_status": result.get("llm_status"), "analysis": result,
+               "learning_policy": adopted, "learning_engine_version": self.learning.version if adopted else None}
         self.store.add_run(run)
         self.store.save_setting("analysis_attempt", {"collection_hash": key, "state": "complete",
                                                      "completed_at": self._timestamp(), "run_id": run["id"]})
         self._llm_retry_state(run)
         self._refresh_shadow(data)
         self._event("analysis", f"{run['as_of']} 전략 분석 {len(decisions)}건 저장")
+        self._learn(data, run)
         return run
+
+    def _learn(self, data, run):
+        policy = self._policy()
+        if self.learning.enabled and policy.get("execution_strategy") == ALL_STRATEGIES:
+            baseline = [item for item in run["signals"] if not item.get("policy_id")]
+            self.learning.enqueue(data, baseline, policy, source_id=run["collection_hash"])
 
     def _llm_retry_state(self, run):
         state = run.get("llm_status")
@@ -562,21 +621,32 @@ class ExperimentService:
                     question=question, blocking=False)
 
     def _refresh_shadow(self, data):
-        from backend.experiment_shadow import update_shadow
-        runs = self.store.runs(10000)
+        from backend.experiment_shadow import input_key, update_shadow
+        revision = self.store.run_revision()
+        if self._shadow_sources is None or self._shadow_sources[0] != revision:
+            summaries = self.store.runs(10000, details=False)
+            symbols = {item["symbol"] for run in summaries for item in run["signals"]
+                       if item.get("action") == "buy" and not item.get("policy_id")}
+            # Old finalized records still need revision checks after their run rolls out of the limit.
+            symbols.update(record["symbol"] for record in self.store.setting("shadow", {}).get("records", {}).values())
+            self._shadow_sources = revision, symbols
+        symbols = self._shadow_sources[1]
         histories = dict(data["histories"])
-        symbols = {item["symbol"] for run in runs for item in run["signals"] if item.get("action") == "buy"}
         cache = HistoryCache(self.config_path.parent / ".local" / "candidates" / "history")
         for symbol in symbols - histories.keys():
             bars = cache._read(cache._path("stock", symbol), "stock", symbol)
             if bars:
                 histories[symbol] = {day: bar for day, bar in bars.items() if str(day) <= str(data["as_of"])}
+        refresh_key = input_key(revision, histories, data["calendars"], data["as_of"])
+        if self.store.setting("shadow_refresh_key") == refresh_key:
+            return
+        runs = self.store.runs(10000)
         metrics = update_shadow(self.store, runs, histories, data["calendars"], data["as_of"])
         for row in metrics:
             for key in ("shadow_net_pct", "shadow_stress_pct"):
                 if row[key] is not None:
                     row[key] = format(Decimal(str(row[key])), "f")
-        self.store.save_setting("shadow_metrics", metrics)
+        self.store.save_settings({"shadow_metrics": metrics, "shadow_refresh_key": refresh_key})
 
     def _reconcile(self, policy, broker=None):
         broker = broker or self._broker(policy)
@@ -638,7 +708,7 @@ class ExperimentService:
                      average_price=row["average_price"] if row["filled_quantity"] else None,
                      filled_amount=row["filled_amount"], remaining_quantity=row["remaining_quantity"],
                      error=None, reconciled_at=self._timestamp())
-        self.store.save_order(order)
+        self.store.save_order(order, capture_fill=True)
 
     def _resolve(self, body):
         policy = self._policy()
@@ -713,7 +783,7 @@ class ExperimentService:
         if current.weekday() < 5 and daytime(9) <= current.time() < daytime(16):
             for order in orders:
                 if (order["order_date"] == today.isoformat() and order["status"] in {"submitted", "partial"}
-                        and (self.now() - stamp(order["created_at"])).total_seconds() >= 600):
+                        and (self.now() - stamp(order["created_at"])).total_seconds() >= 60 * order.get("cancel_after_minutes", 10)):
                     self._cancel(order["id"], broker)
         if not self._market_open():
             return
@@ -739,7 +809,7 @@ class ExperimentService:
         self._resolve_issue("balance_mismatch")
         # Process exits before considering new exposure. Only system-owned shares can be sold.
         for position in positions:
-            if sum(position["entry_date"] <= day < today.isoformat() for day in days) < 5:
+            if not self._exit_due(position, days, today):
                 continue
             if any(item["symbol"] == position["symbol"] and item["status"] in ACTIVE for item in orders):
                 continue
@@ -756,7 +826,7 @@ class ExperimentService:
             self._submit(policy, broker, position, "sell", position["quantity"], price,
                          f"exit:{position['entry_id']}:{today.isoformat()}", run_id=None)
         # The latest completed analysis must have existed before this session opened.
-        runs = [run for run in self.store.runs(100) if run["as_of"] == prior_days[-1]
+        runs = [run for run in self.store.runs(100, details=False) if run["as_of"] == prior_days[-1]
                 and stamp(run["created_at"]) < datetime.combine(today, daytime(9), KST)]
         if not runs:
             self._issue("analysis_missing", "직전 거래일의 장전 완료 분석이 없어 신규 진입을 기다립니다.", blocking=False)
@@ -765,6 +835,15 @@ class ExperimentService:
         if not self.store.setting("enabled", False) or self._blocked():
             return
         run = runs[0]
+        adopted = self._adopted_policy()
+        if adopted:
+            from backend.learning_policy import BASELINE_POLICY, policy_id
+            if policy_id(run.get("learning_policy") or BASELINE_POLICY) != policy_id(adopted):
+                return  # New policy needs its own completed pre-open signals.
+            if adopted["kind"] == "rules" and run.get("learning_engine_version") != self.learning.version:
+                return
+        execution = run.get("learning_policy") if policy["execution_strategy"] == ALL_STRATEGIES else None
+        learned = execution and execution["kind"] == "rules" and self.learning.enabled
         from backend.experiment_analysis import analysis_version
         if run.get("version_id") != analysis_version(self.config_path):
             self._issue("analysis_version", "새 분석 버전의 완료 결과를 기다립니다.", blocking=False)
@@ -785,14 +864,20 @@ class ExperimentService:
             if symbol not in allowed or assess_master(master["rows"].get(symbol), allowed[symbol]["board"])["status"] != "pass":
                 continue
             orders = self._owned_orders(policy)
-            positions, _ = self._portfolio(orders)
+            positions, portfolio_results = self._portfolio(orders)
             if any(item["symbol"] == symbol for item in positions) or any(item["symbol"] == symbol and item["status"] in ACTIVE for item in orders):
                 continue
+            if learned:
+                reserved_symbols = {item["symbol"] for item in orders if item["side"] == "buy" and item["status"] in ACTIVE}
+                if len({item["symbol"] for item in positions} | reserved_symbols) >= execution["max_positions"]:
+                    continue
             account = broker.snapshot()
             if account["holdings"].get(symbol, {}).get("quantity", 0):
                 continue  # Do not mix manually-held shares with experimental positions.
             price = self._symbol_quote(broker, symbol)
             if price is None:
+                continue
+            if learned and price > decimal(decision["reference_close"], positive=True) * (1 + Decimal(str(execution["entry_slippage_bps"])) / 10000):
                 continue
             reserved = sum(decimal(item["limit_price"]) * item.get("remaining_quantity", item["quantity"])
                            * (1 + FEE) for item in orders if item["side"] == "buy" and item["status"] in ACTIVE)
@@ -809,12 +894,18 @@ class ExperimentService:
                                  (item.get("remaining_quantity", 0) if item["status"] in ACTIVE else 0)) * (1 + FEE)
                                 for item in orders if item["side"] == "buy" and item["order_date"] == today.isoformat()
                                 and item["strategy_id"] == decision["strategy_id"])
-            allocation = 4 if policy["execution_strategy"] == ALL_STRATEGIES else 1
-            available = min(caps[decision["strategy_id"]], decimal(policy["budget"]) - used,
+            weight = (Decimal(str(next(item["weight"] for item in execution["strategies"] if item["id"] == decision["strategy_id"])))
+                      if learned else Decimal(1) / (4 if policy["execution_strategy"] == ALL_STRATEGIES else 1))
+            exposure = Decimal(1) - Decimal(str(execution["cash_reserve"])) if learned else Decimal(1)
+            cash_floor = decimal(policy["budget"]) * (1 - exposure)
+            owned_cash = (decimal(policy["budget"]) + sum(Decimal(item["realized_pnl"]) for item in portfolio_results) - used
+                          if learned else decimal(account["cash"]) - reserved)
+            available = min(caps[decision["strategy_id"]], decimal(policy["budget"]) * exposure - used,
                             decimal(policy["daily_buy_limit"]) - daily,
-                            decimal(account["cash"]) - reserved, decimal(buying["cash"]),
-                            decimal(policy["budget"]) / allocation - strategy_used - strategy_reserved,
-                            decimal(policy["daily_buy_limit"]) / allocation - strategy_daily)
+                            decimal(account["cash"]) - reserved - cash_floor, decimal(buying["cash"]),
+                            owned_cash - cash_floor,
+                            decimal(policy["budget"]) * weight - strategy_used - strategy_reserved,
+                            decimal(policy["daily_buy_limit"]) * weight - strategy_daily)
             quantity = min(max(0, int(available / (price * (1 + FEE)))), buying["quantity"])
             if quantity <= 0:
                 continue
@@ -830,8 +921,45 @@ class ExperimentService:
         self._resolve_issue("symbol:" + symbol)
         return result
 
+    def _exit_due(self, position, days, today):
+        rule = position.get("exit_policy") or {"holding_sessions": 5}
+        if sum(position["entry_date"] <= day < today.isoformat() for day in days) >= rule["holding_sessions"]:
+            return True
+        if not rule.get("stop_loss_pct") and not rule.get("take_profit_pct"):
+            return False
+        prior = [day for day in days if day < today.isoformat()]
+        if not prior or position["entry_date"] > prior[-1]:
+            return False
+        # Close-based stops are executed on the following session. Reading the
+        # cached bar keeps research and LLM work out of this order path.
+        cache = HistoryCache(self.config_path.parent / ".local" / "candidates" / "history")
+        bars = cache._read(cache._path("stock", position["symbol"]), "stock", position["symbol"])
+        bar = (bars or {}).get(date.fromisoformat(prior[-1]))
+        if not bar:
+            return False
+        entry = decimal(position["average_price"], positive=True) / (1 + FEE)
+        change = (decimal(bar["close"], positive=True) / entry - 1) * 100
+        return (bool(rule.get("stop_loss_pct")) and change <= -Decimal(str(rule["stop_loss_pct"]))) or (
+                bool(rule.get("take_profit_pct")) and change >= Decimal(str(rule["take_profit_pct"])))
+
     def _entry_plan(self, policy, run, today):
-        strategies = [item["id"] for item in self._specs()] if policy["execution_strategy"] == ALL_STRATEGIES else [policy["execution_strategy"]]
+        from backend.experiment_analysis import strategy_specs
+        execution = run.get("learning_policy")
+        if (self.learning.enabled and policy["execution_strategy"] == ALL_STRATEGIES
+                and execution and execution["kind"] == "rules"):
+            from backend.learning_policy import policy_id
+            weights = {item["id"]: Decimal(str(item["weight"])) for item in execution["strategies"]}
+            groups = {key: [dict(item, cancel_after_minutes=execution["cancel_after_minutes"]) for item in run["signals"]
+                           if item["strategy_id"] == key and item.get("policy_id") == policy_id(execution)
+                           and item["action"] == "buy" and item.get("status", "ready") == "ready"] for key in weights}
+            caps = {key: min(decimal(policy["order_cap"]), decimal(policy["daily_buy_limit"]) * weights[key] / max(1, len(items)))
+                    for key, items in groups.items()}
+            ordered = [dict(item, cancel_after_minutes=execution["cancel_after_minutes"],
+                            learning_engine_version=run.get("learning_engine_version")) for item in run["signals"]
+                       if item["strategy_id"] in groups and item.get("policy_id") == policy_id(execution)
+                       and item["action"] == "buy" and item.get("status", "ready") == "ready"]
+            return ordered, caps
+        strategies = [item["id"] for item in strategy_specs()] if policy["execution_strategy"] == ALL_STRATEGIES else [policy["execution_strategy"]]
         groups = {key: [item for item in run["signals"] if item["strategy_id"] == key
                        and item["action"] == "buy" and item.get("status", "ready") == "ready"] for key in strategies}
         if policy["execution_strategy"] == ALL_STRATEGIES:
@@ -858,6 +986,11 @@ class ExperimentService:
                  "remaining_quantity": quantity, "status": "submitting", "order_id": None, "branch_id": None,
                  "order_date": self.now().astimezone(KST).date().isoformat(), "created_at": self._timestamp(),
                  "error": None, "fingerprint": policy["fingerprint"], "run_id": run_id}
+        if decision.get("policy_id"):
+            order.update(policy_id=decision["policy_id"], exit_policy=decision.get("exit_policy"),
+                         cancel_after_minutes=decision.get("cancel_after_minutes", 10),
+                         learning_engine_version=decision.get("learning_engine_version"),
+                         reference_close=decision.get("reference_close"))
         if not self.store.reserve_order(order, intent_key):
             return
         from backend.paper_broker import BrokerRejected

@@ -85,8 +85,10 @@ class AutonomousMonitor:
                             state="open", last_seen=self._stamp())
                 if not question and self.now() - datetime.fromisoformat(item["first_seen"]) >= timedelta(minutes=30):
                     item["question"] = "30분 이상 복구되지 않았습니다. 연결·설정 확인 후 다시 시도할까요?"
-            elif item is not None:
+            elif item is not None and item["state"] != "resolved":
                 item.update(state="resolved", last_seen=self._stamp())
+            else:
+                return
             self.store.save_setting("monitor_issues", items)
 
     def _work(self):
@@ -214,7 +216,7 @@ class AutonomousMonitor:
             db.execute("INSERT INTO autonomous_reports VALUES (?,?,?) ON CONFLICT(fingerprint,day) "
                        "DO UPDATE SET payload=excluded.payload", (fingerprint, day, json.dumps(value, ensure_ascii=False)))
 
-    def snapshot(self):
+    def snapshot(self, *, include_history=True):
         policy = self.store.setting("policy", {})
         fingerprint = policy.get("fingerprint")
         issues = self.issues()
@@ -228,14 +230,16 @@ class AutonomousMonitor:
         if self.stalled():
             status = "degraded"
         engine = self.store.setting("autonomy_status", {})
-        with self.store.connect() as db:
-            reports = [json.loads(row[0]) for row in db.execute(
-                "SELECT payload FROM autonomous_reports WHERE fingerprint=? ORDER BY day DESC LIMIT 30", (fingerprint,))]
+        reports = []
+        if include_history:
+            with self.store.connect() as db:
+                reports = [json.loads(row[0]) for row in db.execute(
+                    "SELECT payload FROM autonomous_reports WHERE fingerprint=? ORDER BY day DESC LIMIT 30", (fingerprint,))]
         return {"status": status, "last_heartbeat_at": self.store.setting("monitor_heartbeat"),
                 "last_account_at": self.store.setting("monitor_account_at"),
                 "next_retry_at": engine.get("next_retry_at"),
                 "error": opened[0]["message"] if opened else None, "issues": issues,
-                "performance": self.performance(fingerprint), "daily_reports": reports,
+                "performance": self.performance(fingerprint) if include_history else None, "daily_reports": reports,
                 "last_cycle_at": engine.get("last_success_at"),
                 "last_monitor_at": self.store.setting("monitor_completed_at")}
 

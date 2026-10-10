@@ -1,0 +1,2 @@
+# Optional: the existing dashboard does not require this package.
+playwright==1.63.0

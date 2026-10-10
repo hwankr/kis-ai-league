@@ -1,4 +1,4 @@
-import type { AutonomyData, ExperimentData, ExperimentOrder, ExperimentRun } from '../experiments';
+import type { AutonomyData, ExperimentData, ExperimentOrder, ExperimentRun, LearningData } from '../experiments';
 
 export function experimentRun(overrides: Partial<ExperimentRun> = {}): ExperimentRun {
   return { id: 'run-1', as_of: '2026-10-02', created_at: '2026-10-05T00:00:00Z', status: 'complete', input_hash: 'fixture-input-hash',
@@ -24,4 +24,12 @@ export function autonomy(overrides: Partial<AutonomyData> = {}): AutonomyData {
     next_retry_at: null, error: null, issues: [], performance: { as_of: '2026-10-05T00:59:00Z', baseline: '10000000',
       total_value: '10125000', cash: '8000000', return_pct: '1.25', max_drawdown_pct: '-0.5', observations: 12 },
     daily_reports: [{ date: '2026-10-05', created_at: '2026-10-05T01:00:00Z', total_value: '10125000', return_pct: '1.25', orders: 5, filled_orders: 3, issues: 0 }], ...overrides };
+}
+export function learning(overrides: Partial<LearningData> = {}): LearningData {
+  return { enabled: true, status: 'evaluating', champion: { id: 'rules', name: '추세 규칙', adopted_at: null },
+    challenger: { id: 'learned-1', name: '거래량 회복 후보', started_at: '2026-10-05T00:00:00Z', sessions: 4 },
+    last_evaluation: { as_of: '2026-10-08', sessions: 4, required_sessions: 20, champion_return_pct: 1.25,
+      challenger_return_pct: 1.75, champion_drawdown_pct: -0.5, challenger_drawdown_pct: -0.25,
+      closed_trades: 3, decision: 'keep', reason: '평가 기간 부족' },
+    last_change: null, error: null, ...overrides };
 }

@@ -13,7 +13,7 @@ NOW = datetime(2026, 10, 5, 1, 0, 20, tzinfo=timezone.utc)
 def order(**changes):
     return {"ord_dt": "20261005", "ord_gno_brno": "01234", "odno": "0000000123",
             "orgn_odno": "0000000000", "pdno": "005930", "sll_buy_dvsn_cd": "02",
-            "ord_qty": "5", "tot_ccld_qty": "0", "rmn_qty": "5", "cnc_cfrm_qty": "0",
+            "ord_qty": "5", "tot_ccld_qty": "0", "rmn_qty": "5", "cncl_cfrm_qty": "0",
             "rjct_qty": "0", "ord_unpr": "70000", "avg_prvs": "0", "tot_ccld_amt": "0",
             "ord_tmd": "095900", "cncl_yn": "N", **changes}
 
@@ -137,9 +137,9 @@ class PaperBrokerTests(unittest.TestCase):
     def test_all_order_states_and_cumulative_fills_preserved(self):
         rows = [order(), order(odno="124", tot_ccld_qty="2", rmn_qty="3", avg_prvs="69900", tot_ccld_amt="139800"),
                 order(odno="125", tot_ccld_qty="5", rmn_qty="0", avg_prvs="69900", tot_ccld_amt="349500"),
-                order(odno="126", cncl_yn="Y", cnc_cfrm_qty="5", rmn_qty="0"),
+                order(odno="126", cncl_yn="Y", cncl_cfrm_qty="5", rmn_qty="0"),
                 order(odno="127", rjct_qty="5", rmn_qty="0"),
-                order(odno="128", cncl_yn="Y", cnc_cfrm_qty="3", rmn_qty="0", tot_ccld_qty="2",
+                order(odno="128", cncl_yn="Y", cncl_cfrm_qty="3", rmn_qty="0", tot_ccld_qty="2",
                       avg_prvs="69900", tot_ccld_amt="139800")]
         self.client._get.return_value = page(rows)
         result = self.broker.orders("2026-10-05", "2026-10-05")
@@ -189,6 +189,36 @@ class PaperBrokerTests(unittest.TestCase):
             self.client._get.return_value = page([order(**changes)])
             with self.subTest(changes=changes), self.assertRaises(KisError):
                 self.broker.orders("2026-10-05", "2026-10-05")
+
+    def test_missing_cancellation_quantity_never_defaults_or_uses_misspelled_field(self):
+        for filled in (False, True):
+            for legacy_value in (None, "0"):
+                raw = order()
+                del raw["cncl_cfrm_qty"]
+                if legacy_value is not None:
+                    raw["cnc_cfrm_qty"] = legacy_value
+                if filled:
+                    raw.update(tot_ccld_qty="5", rmn_qty="0", avg_prvs="69900", tot_ccld_amt="349500")
+                self.client._get.return_value = page([raw])
+                with self.subTest(filled=filled, legacy_value=legacy_value), self.assertRaises(KisError):
+                    self.broker.orders("2026-10-05", "2026-10-05")
+        self.client._request.assert_not_called()
+
+    def test_invalid_cancellation_quantity_never_falls_back_to_misspelled_field(self):
+        for value in (None, "", "-1", "1.5", "NaN", "1e0", "inf", 0, False, []):
+            self.client._get.return_value = page([order(cncl_cfrm_qty=value, cnc_cfrm_qty="0")])
+            with self.subTest(value=value), self.assertRaises(KisError):
+                self.broker.orders("2026-10-05", "2026-10-05")
+        self.client._request.assert_not_called()
+
+    def test_cancellation_quantity_must_reconcile_with_fills_and_order_quantity(self):
+        for cancelled in ("2", "4"):
+            self.client._get.return_value = page([order(
+                cncl_yn="Y", cncl_cfrm_qty=cancelled, rmn_qty="0", tot_ccld_qty="2",
+                avg_prvs="69900", tot_ccld_amt="139800")])
+            with self.subTest(cancelled=cancelled), self.assertRaises(KisError):
+                self.broker.orders("2026-10-05", "2026-10-05")
+        self.client._request.assert_not_called()
 
     def test_snapshot_preserves_cash_holdings_and_actual_sellable_quantity(self):
         self.client._get.side_effect = [page([balance_row()], summary=[{"dnca_tot_amt": "1000000", "tot_evlu_amt": "2000000"}],

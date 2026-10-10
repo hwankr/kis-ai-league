@@ -417,7 +417,7 @@ class DashboardServer(ThreadingHTTPServer):
             stalled = True
         autonomy = None
         if self.autonomous_monitor is not None:
-            snapshot = self.autonomous_monitor.snapshot()
+            snapshot = self.autonomous_monitor.snapshot(include_history=False)
             # Health must stay bounded as order issues and daily reports accumulate.
             autonomy = {key: snapshot.get(key) for key in (
                 "status", "last_heartbeat_at", "last_cycle_at", "last_account_at", "last_monitor_at")}
@@ -461,7 +461,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         path = url.path
-        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates", "/api/research", "/api/experiments", "/api/health"):
+        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates", "/api/research", "/api/experiments", "/api/mirror", "/api/health"):
             origin = self.headers.get("Origin")
             if (self.headers.get("X-KIS-Dashboard") != "1"
                     or (origin is not None and origin not in self.server.origins)
@@ -485,6 +485,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         self.json_response(200, self.server.experiment_snapshot())
                     except Exception:
                         self.json_response(503, {"error": "실험 기록을 읽지 못했습니다."})
+                return
+            if path == "/api/mirror":
+                values = {"after": "0", "limit": "100"}
+                if (set(params) - set(values)
+                        or any(len(items) != 1 or not items[0].isascii() or not items[0].isdigit()
+                               or len(items[0]) > 19 for items in params.values())):
+                    self.json_response(400, {"error": "연동 체결 조회 조건이 올바르지 않습니다."})
+                    return
+                values.update({key: items[0] for key, items in params.items()})
+                after, limit = int(values["after"]), int(values["limit"])
+                if not 0 <= after <= 9223372036854775807 or not 1 <= limit <= 200:
+                    self.json_response(400, {"error": "연동 체결 조회 조건이 올바르지 않습니다."})
+                elif self.server.experiment_service is None:
+                    self.json_response(503, {"error": "실험실이 시작되지 않았습니다."})
+                else:
+                    try:
+                        self.json_response(200, self.server.experiment_service.mirror_snapshot(after=after, limit=limit))
+                    except KisError as error:
+                        self.json_response(400, {"error": str(error)})
+                    except Exception:
+                        self.json_response(503, {"error": "연동 체결 기록을 읽지 못했습니다."})
                 return
             if path == "/api/research":
                 if params:

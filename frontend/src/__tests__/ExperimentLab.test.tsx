@@ -6,7 +6,7 @@ import { ExperimentLabPanel } from '../components/ExperimentLab';
 import { readExperiments } from '../experiments';
 import useExperiments from '../useExperiments';
 import { catalog, deferred, response } from './fixtures';
-import { autonomy, configuredPolicy, experimentOrder, experimentRun, experiments } from './experiment-fixtures';
+import { autonomy, configuredPolicy, experimentOrder, experimentRun, experiments, learning } from './experiment-fixtures';
 
 const props = { loading: false, pending: null, error: null, accounts: catalog.accounts, onRefresh: () => {},
   onExecute: async () => true, onSelectSymbol: () => {} };
@@ -181,6 +181,66 @@ describe('experiment lab', () => {
     expect(screen.getByRole('alert').textContent).toBe('계좌 응답 지연');
     expect(screen.getByLabelText('모의계좌 성과').querySelectorAll('dd')[1].textContent).toBe('—');
   });
+
+  it('keeps learning absent for legacy data and shows only supplied candidate evaluation facts', () => {
+    const data = experiments({ policy: { ...configuredPolicy, execution_strategy: 'all-strategies-v1' } });
+    const { rerender } = render(<ExperimentLabPanel {...props} data={data}/>);
+    expect(screen.queryByRole('region', { name: '학습·전략 교체' })).toBeNull();
+    expect(document.querySelector('.lab-status-line')?.textContent).toContain('전체 전략 균등');
+    rerender(<ExperimentLabPanel {...props} data={{ ...data, learning: learning() }}/>);
+    const panel = screen.getByRole('region', { name: '학습·전략 교체' });
+    expect(within(panel).getByText('후보 평가 중')).toBeTruthy();
+    expect(within(panel).getByText('거래량 회복 후보')).toBeTruthy();
+    expect(within(panel).getByText('4 / 20거래일 · 완결 3건')).toBeTruthy();
+    expect(within(panel).getByText('평가 기간 부족')).toBeTruthy();
+    expect(within(panel).getByText('+1.75%')).toBeTruthy();
+    expect(within(panel).getByText('-0.25%')).toBeTruthy();
+    expect(document.querySelector('.lab-status-line')?.textContent).toContain('자동 전략 운용');
+  });
+
+  it('shows missing evaluation values as unavailable and keeps errors and last adoption visible', () => {
+    const current = learning();
+    render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ status: 'error',
+      champion: { id: 'rules', name: '추세 규칙', adopted_at: '2026-10-08T06:40:00Z' },
+      challenger: null, last_evaluation: { ...current.last_evaluation!, champion_return_pct: null,
+        challenger_return_pct: 0, champion_drawdown_pct: null, challenger_drawdown_pct: 0 },
+      last_change: { at: '2026-10-08T06:40:00Z', from: 'llm', to: 'rules', reason: '후보 평가 통과' },
+      error: '후보 자료 조회 실패' }) })}/>);
+    const panel = screen.getByRole('region', { name: '학습·전략 교체' });
+    expect(within(panel).getByText('없음')).toBeTruthy();
+    expect(within(panel).getAllByText('—')).toHaveLength(2);
+    expect(within(panel).getAllByText('0.00%')).toHaveLength(2);
+    expect(within(panel).getByText('LLM 판단 → 추세 규칙')).toBeTruthy();
+    expect(within(panel).getByText('후보 평가 통과')).toBeTruthy();
+    expect(within(panel).getByRole('alert').textContent).toBe('후보 자료 조회 실패');
+  });
+
+  it.each([['disabled', '중지'], ['waiting', '대기'], ['researching', '후보 연구 중']] as const)('shows learning status %s without inventing a candidate', (status, label) => {
+    render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ enabled: status !== 'disabled', status,
+      challenger: null, last_evaluation: null }) })}/>);
+    const panel = screen.getByRole('region', { name: '학습·전략 교체' });
+    expect(within(panel).getByText(label)).toBeTruthy();
+    expect(within(panel).getByText('평가 기록 없음')).toBeTruthy();
+    expect(within(panel).queryByRole('table')).toBeNull();
+  });
+
+  it.each([['invalid', '평가 무효'], ['rollback', '이전 전략 복귀']] as const)('labels backend evaluation decision %s', (decision, label) => {
+    render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({
+      last_evaluation: { ...learning().last_evaluation!, decision } }) })}/>);
+    expect(within(screen.getByRole('region', { name: '학습·전략 교체' })).getByText(label)).toBeTruthy();
+  });
+
+  it('keeps learned strategies available for analysis filtering but not standalone execution', async () => {
+    const data = experiments({ runs: [experimentRun()] });
+    data.strategies.push({ id: 'learned-1', label: '학습 후보', description: '', version: 'policy-1', selectable: false });
+    render(<ExperimentLabPanel {...props} data={data}/>);
+    await userEvent.click(screen.getByText('고급 운용 설정'));
+    await userEvent.click(screen.getByRole('combobox', { name: '주문 실행 전략' }));
+    expect(screen.queryByRole('option', { name: '학습 후보' })).toBeNull();
+    await userEvent.keyboard('{Escape}');
+    await userEvent.click(screen.getByRole('combobox', { name: '분석 전략' }));
+    expect(screen.getByRole('option', { name: '학습 후보' })).toBeTruthy();
+  });
 });
 
 describe('experiment requests', () => {
@@ -308,13 +368,14 @@ describe('experiment requests', () => {
 
 describe('experiment response validation', () => {
   it('accepts the paper response and extra backend fields', () => {
-    const data = { ...experiments({ runs: [experimentRun()], orders: [experimentOrder()], autonomy: autonomy() }), additional: 'allowed' };
+    const data = { ...experiments({ runs: [experimentRun()], orders: [experimentOrder()], autonomy: autonomy(), learning: learning() }), additional: 'allowed' };
     expect(readExperiments(data)).toBe(data);
   });
   it.each([
     { ...experiments(), environment: 'real' },
     { ...experiments(), llm: null },
     { ...experiments(), updated_at: 'invalid' },
+    { ...experiments(), strategies: [{ ...experiments().strategies[0], selectable: 'false' }] },
     { ...experiments(), runs: [experimentRun({ signals: [{ ...experimentRun().signals[0], score: NaN }] })] },
     { ...experiments(), orders: [experimentOrder({ filled_quantity: 4 })] },
     { ...experiments(), orders: [experimentOrder({ average_price: 'NaN' })] },
@@ -325,4 +386,21 @@ describe('experiment response validation', () => {
     { ...experiments(), autonomy: { ...autonomy(), performance: { ...autonomy().performance, observations: -1 } } },
     { ...experiments(), autonomy: { ...autonomy(), daily_reports: [{ ...autonomy().daily_reports[0], orders: '5' }] } },
   ])('rejects malformed or non-paper responses', value => { expect(() => readExperiments(value)).toThrow(); });
+
+  it.each([
+    null, { ...learning(), enabled: 'yes' }, { ...learning(), status: 'ready' },
+    { ...learning(), champion: { ...learning().champion, adopted_at: 'invalid' } },
+    { ...learning(), challenger: { ...learning().challenger, sessions: -1 } },
+    { ...learning(), challenger: { ...learning().challenger, sessions: 1.5 } },
+    { ...learning(), challenger: { ...learning().challenger, started_at: 'invalid' } },
+    { ...learning(), last_evaluation: { ...learning().last_evaluation, as_of: '2026-02-31' } },
+    { ...learning(), last_evaluation: { ...learning().last_evaluation, required_sessions: 0 } },
+    { ...learning(), last_evaluation: { ...learning().last_evaluation, champion_return_pct: Infinity } },
+    { ...learning(), last_evaluation: { ...learning().last_evaluation, challenger_return_pct: '1.25' } },
+    { ...learning(), last_evaluation: { ...learning().last_evaluation, champion_drawdown_pct: NaN } },
+    { ...learning(), last_evaluation: { ...learning().last_evaluation, closed_trades: '3' } },
+    { ...learning(), last_change: { at: 'invalid', from: 'rules', to: 'llm', reason: '' } },
+  ])('rejects malformed learning facts without coercing numbers', value => {
+    expect(() => readExperiments({ ...experiments(), learning: value })).toThrow('학습 운용 응답 형식 확인 필요');
+  });
 });

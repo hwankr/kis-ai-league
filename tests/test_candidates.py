@@ -549,7 +549,7 @@ class CandidateSelectionIntegrationTests(unittest.TestCase):
         history_start = END - timedelta(days=600)
         self.assertTrue(all(call[0] == history_start for call in self.client.index_calls if call[1] < END))
         self.assertTrue(all(call[1] == history_start for call in self.client.stock_calls if call[2] < END))
-        saved = json.loads((self.service.directory / "history" / "stock-005930.json").read_text())
+        saved = json.loads((self.service.directory / "history" / "stock-005930.json").read_text(encoding="utf-8"))
         self.assertEqual(len(saved["rows"]), 253)
         self.assertEqual(set(saved["rows"][END.isoformat()]), {"open", "high", "low", "close", "volume", "turnover"})
         self.assertEqual(self.finish()["rows"], result["rows"])
@@ -652,7 +652,7 @@ class CandidateSelectionIntegrationTests(unittest.TestCase):
             self.assertIn("전체 조회", result["error"])
         self.selector.policy_id = "test-policy-v1"
         path = self.service.directory / "latest.json"
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
         del payload["state"]["screening"]
         path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertTrue(self.make_service().snapshot()["stale"])
@@ -661,7 +661,7 @@ class CandidateSelectionIntegrationTests(unittest.TestCase):
     def test_corrupt_screening_is_discarded_without_losing_prices_or_disabling_retry(self):
         first = self.finish()
         path = self.service.directory / "latest.json"
-        original = json.loads(path.read_text())
+        original = json.loads(path.read_text(encoding="utf-8"))
         expected_rows = [{key: value for key, value in row.items() if key != "selection"} for row in first["rows"]]
         mutations = [
             ("screening-type", lambda state: state.update(screening=[])),
@@ -729,7 +729,7 @@ class CandidateSelectionIntegrationTests(unittest.TestCase):
     def test_fresh_summary_does_not_extend_the_age_of_master_or_quote_observations(self):
         self.finish()
         path = self.service.directory / "latest.json"
-        original = json.loads(path.read_text())
+        original = json.loads(path.read_text(encoding="utf-8"))
         initial_now = self.now
         for source in ("master", "quote"):
             payload = deepcopy(original)

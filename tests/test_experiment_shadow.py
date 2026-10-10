@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 import unittest
 
-from backend.experiment_shadow import update_shadow
+from backend.experiment_shadow import input_key, update_shadow
 
 
 class Store:
@@ -35,6 +35,17 @@ def fixture(created_at="2026-10-02T08:00:00+00:00"):
 
 
 class ShadowTests(unittest.TestCase):
+    def test_refresh_key_ignores_equivalent_numbers_and_future_prices(self):
+        _, bars, calendar = fixture()
+        original = input_key((1, 1), bars, calendar, "2026-10-02")
+        for bar in bars["005930"].values():
+            for key in bar:
+                bar[key] += ".0"
+        bars["005930"][date(2026, 10, 5)]["open"] = "100.1"
+        self.assertEqual(input_key((1, 1), bars, calendar, "2026-10-02"), original)
+        self.assertNotEqual(input_key((2, 2), bars, calendar, "2026-10-02"), original)
+        self.assertNotEqual(input_key((1, 1), bars, calendar, "2026-10-05"), original)
+
     def test_first_ready_hold_cannot_be_replaced_by_later_buy(self):
         run, bars, calendar = fixture()
         run["signals"][0]["action"] = "hold"
@@ -168,6 +179,24 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(result["relative-strength-v1"]["shadow_closed"], 1)
         self.assertEqual(result["llm-evidence-v1"]["shadow_signals"], 0)
         self.assertEqual(result["pullback-recovery-v1"]["shadow_signals"], 0)
+
+    def test_learned_policy_signals_neither_receive_five_day_results_nor_claim_legacy_keys(self):
+        run, bars, calendar = fixture()
+        learned = {**deepcopy(run), "id": "learned-run", "created_at": "2026-10-02T07:30:00+00:00",
+                   "analysis": {"input": {}}}
+        learned["signals"] = [
+            {**run["signals"][0], "policy_id": "learned-policy", "action": "hold"},
+            {**run["signals"][0], "policy_id": "learned-policy", "strategy_id": "learned-short",
+             "symbol": "000660", "exit_policy": {"holding_sessions": 1}}]
+        store = Store()
+        result = update_shadow(store, [learned, run], bars, calendar, "2026-10-13")
+        self.assertEqual([item["strategy_id"] for item in result], ["trend-breakout-v1"])
+        self.assertEqual(result[0]["shadow_closed"], 1)
+        self.assertEqual(len(store.saved["shadow"]["decisions"]), 1)
+        self.assertEqual([record["run_id"] for record in store.saved["shadow"]["records"].values()], ["run1"])
+        writes = store.writes
+        self.assertEqual(update_shadow(store, [learned], bars, calendar, "2026-10-13"), result)
+        self.assertEqual(store.writes, writes)
 
     def test_invalid_timestamp_cannot_become_trade(self):
         for timestamp in (None, "2026-10-02T08:00:00", "not-time"):

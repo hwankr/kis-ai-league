@@ -28,12 +28,23 @@ export interface AutonomyData {
   daily_reports: { date: string; created_at: string; total_value: string | null; return_pct: string | null;
     orders: number; filled_orders: number; issues: number }[];
 }
+export interface LearningData {
+  enabled: boolean; status: 'disabled' | 'waiting' | 'researching' | 'evaluating' | 'error';
+  champion: { id: string; name: string; adopted_at: string | null };
+  challenger: { id: string; name: string; started_at: string; sessions: number } | null;
+  last_evaluation: { as_of: string; sessions: number; required_sessions: number;
+    champion_return_pct: number | null; challenger_return_pct: number | null;
+    champion_drawdown_pct: number | null; challenger_drawdown_pct: number | null;
+    closed_trades: number; decision: string; reason: string } | null;
+  last_change: { at: string; from: string; to: string; reason: string } | null;
+  error: string | null;
+}
 export interface ExperimentData {
   status: 'idle' | 'running' | 'error'; busy: boolean; environment: 'paper'; updated_at: string | null; error: string | null;
   llm: { configured: boolean; provider: string | null; model: string | null; error: string | null };
   policy: ExperimentPolicy;
   automation: { enabled: boolean; state: string; pause_reason: string | null };
-  strategies: { id: string; label: string; description: string; version: string }[];
+  strategies: { id: string; label: string; description: string; version: string; selectable?: boolean }[];
   runs: ExperimentRun[];
   orders: ExperimentOrder[];
   positions: { strategy_id: string; symbol: string; name: string; quantity: number; average_price: string }[];
@@ -42,6 +53,7 @@ export interface ExperimentData {
     shadow_net_pct?: string | null; shadow_stress_pct?: string | null }[];
   events: { at: string; kind: string; message: string }[];
   autonomy?: AutonomyData;
+  learning?: LearningData;
 }
 export type ExperimentCommand = { action: 'analyze' | 'start' | 'pause' | 'reconcile' }
   | { action: 'configure'; policy: ExperimentPolicy }
@@ -60,6 +72,9 @@ const nullableTime = (value: unknown) => value === null || time(value);
 const list = (value: unknown, valid: (row: Record<string, unknown>) => boolean) => Array.isArray(value) && value.every(row => object(row) && valid(row));
 const strings = (value: unknown) => Array.isArray(value) && value.every(text);
 const symbol = (value: unknown) => text(value) && /^[0-9A-Z]{6}$/.test(value);
+const nullableNumber = (value: unknown) => value === null || typeof value === 'number' && Number.isFinite(value);
+const dateOrTime = (value: unknown) => time(value) || text(value) && /^\d{4}-\d{2}-\d{2}$/.test(value)
+  && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
 
 export function readExperiments(value: unknown): ExperimentData {
   if (!object(value) || !['idle', 'running', 'error'].includes(String(value.status)) || typeof value.busy !== 'boolean'
@@ -68,7 +83,8 @@ export function readExperiments(value: unknown): ExperimentData {
   if (!object(llm) || typeof llm.configured !== 'boolean' || !nullableText(llm.provider) || !nullableText(llm.model) || !nullableText(llm.error)
     || !object(policy) || !['account_id', 'budget', 'order_cap', 'daily_buy_limit', 'execution_strategy'].every(key => nullableText(policy[key]))
     || !object(automation) || typeof automation.enabled !== 'boolean' || !text(automation.state) || !nullableText(automation.pause_reason)
-    || !list(value.strategies, row => ['id', 'label', 'description', 'version'].every(key => text(row[key])))
+    || !list(value.strategies, row => ['id', 'label', 'description', 'version'].every(key => text(row[key]))
+      && (row.selectable === undefined || typeof row.selectable === 'boolean'))
     || !list(value.runs, row => text(row.id) && nullableText(row.as_of) && time(row.created_at) && text(row.status) && text(row.input_hash)
       && nullableText(row.error) && list(row.signals, signal => text(signal.strategy_id) && symbol(signal.symbol) && text(signal.name)
         && ['buy', 'hold', 'avoid'].includes(String(signal.action)) && (signal.score === null || typeof signal.score === 'number' && Number.isFinite(signal.score))
@@ -93,6 +109,22 @@ export function readExperiments(value: unknown): ExperimentData {
       || !['baseline', 'total_value', 'cash', 'return_pct', 'max_drawdown_pct'].every(key => nullableMoney((autonomy.performance as Record<string, unknown>)[key]))
       || !list(autonomy.daily_reports, report => text(report.date) && time(report.created_at) && nullableMoney(report.total_value)
         && nullableMoney(report.return_pct) && ['orders', 'filled_orders', 'issues'].every(key => count(report[key])))) throw new Error('자동 운용 응답 형식 확인 필요');
+  }
+  if (value.learning !== undefined) {
+    const learning = value.learning;
+    if (!object(learning) || typeof learning.enabled !== 'boolean'
+      || !['disabled', 'waiting', 'researching', 'evaluating', 'error'].includes(String(learning.status))
+      || !object(learning.champion) || !text(learning.champion.id) || !text(learning.champion.name) || !nullableTime(learning.champion.adopted_at)
+      || !(learning.challenger === null || object(learning.challenger) && text(learning.challenger.id) && text(learning.challenger.name)
+        && time(learning.challenger.started_at) && count(learning.challenger.sessions))
+      || !(learning.last_evaluation === null || object(learning.last_evaluation) && dateOrTime(learning.last_evaluation.as_of)
+        && count(learning.last_evaluation.sessions) && count(learning.last_evaluation.required_sessions) && Number(learning.last_evaluation.required_sessions) > 0
+        && ['champion_return_pct', 'challenger_return_pct', 'champion_drawdown_pct', 'challenger_drawdown_pct']
+          .every(key => nullableNumber((learning.last_evaluation as Record<string, unknown>)[key]))
+        && count(learning.last_evaluation.closed_trades) && text(learning.last_evaluation.decision) && text(learning.last_evaluation.reason))
+      || !(learning.last_change === null || object(learning.last_change) && time(learning.last_change.at)
+        && ['from', 'to', 'reason'].every(key => text((learning.last_change as Record<string, unknown>)[key])))
+      || !nullableText(learning.error)) throw new Error('학습 운용 응답 형식 확인 필요');
   }
   return value as unknown as ExperimentData;
 }

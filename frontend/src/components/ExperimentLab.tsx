@@ -19,7 +19,7 @@ const reasons: Record<string, string> = {
   no_relative_strength: '시장 대비 강세 조건 미충족', missing_benchmark: '비교 지수 자료 확인 필요',
   insufficient_history: '과거 일봉 부족', invalid_calendar: '거래일 확인 필요',
   invalid_or_missing_bar: '일봉 누락·오류 확인 필요', llm_unconfigured: 'LLM 연결 확인 필요',
-  llm_pending: 'LLM 분석 대기',
+  llm_pending: 'LLM 분석 대기', learned_policy_conditions: '채택 정책의 종목 조건·순위 충족',
 };
 const states: Record<string, string> = {
   starting: '시작 중', healthy: '정상 운용', degraded: '자동 복구 중', attention: '확인 필요',
@@ -31,6 +31,10 @@ const states: Record<string, string> = {
   complete: '완료', completed: '완료', ready: '완료', failed: '실패', skipped: '건너뜀',
 };
 const statusLabel = (state: string) => states[state] ?? state;
+const learningStates = { disabled: '중지', waiting: '대기', researching: '후보 연구 중', evaluating: '후보 평가 중', error: '확인 필요' };
+const learningDecisions: Record<string, string> = { promote: '후보 채택', promoted: '후보 채택', keep: '현재 전략 유지',
+  retained: '현재 전략 유지', waiting: '평가 중', wait: '평가 중', reject: '후보 제외', rejected: '후보 제외',
+  invalid: '평가 무효', rollback: '이전 전략 복귀' };
 const PAGE_SIZE = 10;
 
 function Pager({ page, pages, count, label, onChange }: { page: number; pages: number; count: number; label: string; onChange: (page: number) => void }) {
@@ -66,7 +70,8 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
   const orders = useMemo(() => [...(data?.orders ?? [])].sort((left, right) => right.created_at.localeCompare(left.created_at)), [data?.orders]);
   const orderPages = Math.max(1, Math.ceil(orders.length / PAGE_SIZE));
   const currentOrderPage = Math.min(orderPage, orderPages);
-  const label = (id: string) => id === 'all-strategies-v1' ? '전체 전략 균등' : data?.strategies.find(strategy => strategy.id === id)?.label ?? id;
+  const learning = data?.learning;
+  const label = (id: string) => id === 'all-strategies-v1' ? learning?.enabled ? '자동 전략 운용' : '전체 전략 균등' : data?.strategies.find(strategy => strategy.id === id)?.label ?? id;
   const locked = !!pending || !data;
   const positive = (value: string | null) => value !== null && /^\d+(?:\.\d+)?$/.test(value) && Number(value) > 0;
   const configured = !!data?.policy.account_id && !!data?.policy.execution_strategy
@@ -133,7 +138,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
               options={[{ value: '', label: '계좌 선택' }, ...accounts.map(account => ({ value: account.id, label: account.name, disabled: !account.configured }))]}
               onChange={value => change('account_id', value)}/>
             <StyledSelect label="주문 실행 전략" value={policy.execution_strategy ?? ''} disabled={locked || data?.automation.enabled}
-              options={[{ value: '', label: '전략 선택' }, ...(autonomy || policy.execution_strategy === 'all-strategies-v1' ? [{ value: 'all-strategies-v1', label: '전체 전략 균등' }] : []), ...(data?.strategies ?? []).map(strategy => ({ value: strategy.id, label: strategy.label }))]}
+              options={[{ value: '', label: '전략 선택' }, ...(autonomy || policy.execution_strategy === 'all-strategies-v1' ? [{ value: 'all-strategies-v1', label: label('all-strategies-v1') }] : []), ...(data?.strategies ?? []).filter(strategy => strategy.selectable !== false).map(strategy => ({ value: strategy.id, label: strategy.label }))]}
               onChange={value => change('execution_strategy', value)}/>
             {([['budget', '실험 예산'], ['order_cap', '건당 매수 한도'], ['daily_buy_limit', '일일 매수 한도']] as const).map(([key, title]) => <label key={key} className="lab-money-field">
               <span>{title}</span><div><input aria-label={title} inputMode="decimal" type="text" pattern="[0-9]+([.][0-9]+)?" required value={policy[key] ?? ''}
@@ -145,6 +150,28 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
         </form>
       </details>
     </section>
+
+    {learning ? <section className="lab-learning" aria-labelledby="lab-learning-title">
+      <div className="panel-heading lab-heading"><h2 id="lab-learning-title">학습·전략 교체</h2>
+        <span className={`lab-badge ${learning.enabled ? 'lab-badge-active' : ''}`}>{learningStates[learning.status]}</span></div>
+      <dl className="lab-learning-strategies"><div><dt>현재 전략</dt><dd>{learning.champion.name}</dd>
+        {learning.champion.adopted_at ? <dd className="lab-learning-time">채택 <time dateTime={learning.champion.adopted_at}>{timestamp(learning.champion.adopted_at).text}</time></dd> : null}</div>
+        <div><dt>평가 후보</dt><dd>{learning.challenger?.name ?? '없음'}</dd>{learning.challenger ? <dd className="lab-learning-time">
+          <time dateTime={learning.challenger.started_at}>{timestamp(learning.challenger.started_at).text}</time> · {number(learning.challenger.sessions)}거래일</dd> : null}</div></dl>
+      {learning.last_evaluation ? <div className="lab-learning-evaluation">
+        <div className="lab-learning-result"><strong>{learningDecisions[learning.last_evaluation.decision] ?? learning.last_evaluation.decision}</strong>
+          <span>{number(learning.last_evaluation.sessions)} / {number(learning.last_evaluation.required_sessions)}거래일 · 완결 {number(learning.last_evaluation.closed_trades)}건</span>
+          <time dateTime={learning.last_evaluation.as_of}>{learning.last_evaluation.as_of.length === 10 ? learning.last_evaluation.as_of : timestamp(learning.last_evaluation.as_of).text}</time></div>
+        <table className="lab-learning-table" aria-label="현재 전략과 후보의 평가 결과"><thead><tr><th scope="col">평가 지표</th><th scope="col">현재</th><th scope="col">후보</th></tr></thead>
+          <tbody><tr><th scope="row">수익률</th><td className={signClass(learning.last_evaluation.champion_return_pct)}>{percent(learning.last_evaluation.champion_return_pct)}</td>
+            <td className={signClass(learning.last_evaluation.challenger_return_pct)}>{percent(learning.last_evaluation.challenger_return_pct)}</td></tr>
+            <tr><th scope="row">최대 낙폭</th><td>{percent(learning.last_evaluation.champion_drawdown_pct)}</td><td>{percent(learning.last_evaluation.challenger_drawdown_pct)}</td></tr></tbody></table>
+        <p className="lab-learning-reason">{learning.last_evaluation.reason}</p>
+      </div> : <p className="lab-learning-reason lab-subtle">평가 기록 없음</p>}
+      {learning.last_change ? <div className="lab-learning-change"><span>최근 교체</span><time dateTime={learning.last_change.at}>{timestamp(learning.last_change.at).text}</time>
+        <strong>{label(learning.last_change.from)} → {label(learning.last_change.to)}</strong><p>{learning.last_change.reason}</p></div> : null}
+      {learning.error ? <p className="lab-error" role="alert">{learning.error}</p> : null}
+    </section> : null}
 
     {autonomy?.daily_reports.length ? <section aria-labelledby="lab-daily-title"><div className="panel-heading lab-heading"><h2 id="lab-daily-title">일별 운용</h2></div>
       <ul className="lab-daily-reports">{[...autonomy.daily_reports].sort((left, right) => right.date.localeCompare(left.date)).slice(0, 7).map(report => <li key={report.date}>
