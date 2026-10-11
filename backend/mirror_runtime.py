@@ -11,6 +11,7 @@ import re
 from uuid import uuid4
 
 from backend.experiment_store import encode
+from backend.competition_deadline import TIMEFOLIO_LAST_DAY, ended
 from backend.mirror_plan import plan_weight_changes
 
 
@@ -289,7 +290,7 @@ class MirrorRuntime:
                 if job["status"] in {"pending", "blocked"} and not job["net_quantity"]:
                     job.update(status="unchanged", reason="net_fills_zero")
                     self._save_job(job)
-            executable = source["orders_enabled"] and source["market_open"]
+            executable = source["orders_enabled"] and source["market_open"] and not ended(self.now(), TIMEFOLIO_LAST_DAY)
             candidates = [job for job in jobs if job["status"] in {"pending", "blocked"}]
             observing = any(job["status"] in {"unknown", "working"} for job in jobs)
             destination = None
@@ -301,6 +302,8 @@ class MirrorRuntime:
                 self._validate_destination(destination, state)
             if destination is not None:
                 self._reconcile(destination, jobs)
+            if ended(self.now(), TIMEFOLIO_LAST_DAY):
+                return {"status": "blocked", "reason": "competition_ended", "cursor": state["cursor"]}
             if not source["orders_enabled"]:
                 return {"status": "paused", "cursor": state["cursor"]}
             if not source["market_open"]:
@@ -369,6 +372,8 @@ class MirrorRuntime:
                 job.update(status="submitting", proposal=proposal, reason=None, submitted_at=self._stamp())
                 self._save_job(job)  # Must commit BEFORE the irreversible click.
                 try:
+                    if ended(self.now(), TIMEFOLIO_LAST_DAY):
+                        raise MirrorBlocked("competition_ended")
                     receipt = self.destination.submit(proposal)
                 except MirrorBlocked as error:
                     # Adapter guarantees this failure happened before clicking.

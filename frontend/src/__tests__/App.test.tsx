@@ -1,7 +1,7 @@
 import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../App';
 import { catalog, deferred, element, history, marketData, response, snapshot, tradeHistory } from './fixtures';
 
@@ -27,6 +27,7 @@ async function refresh() {
 }
 
 describe('account dashboard', () => {
+  beforeEach(() => window.history.replaceState(null, '', '/#/account'));
   it('loads the default account, formats balances and displays an empty portfolio with its saved history', async () => {
     const fetchMock = mockFetch(() => response(snapshot()));
     render(<App />);

@@ -1,4 +1,10 @@
-.experiment-lab { display: grid; gap: 32px; min-width: 0; }
+.operations-room, .experiment-lab { display: grid; gap: 32px; min-width: 0; }
+.operations-panel { padding-bottom: 28px; border-bottom: 1px solid #edf0f3; min-width: 0; }
+.operations-services { display: flex; flex-wrap: wrap; gap: 18px 40px; margin: 0; }
+.operations-services dt { color: var(--secondary); font-size: 12px; }
+.operations-services dd { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin: 9px 0 0; }
+.operations-services time { color: var(--muted); font-size: 11px; }
+.operations-actions { margin-top: 18px; }
 .experiment-lab section { min-width: 0; }
 .lab-heading { gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
 .lab-heading .panel-title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }

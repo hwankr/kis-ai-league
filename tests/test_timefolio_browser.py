@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import textwrap
 from types import SimpleNamespace
 import unittest
@@ -221,6 +222,22 @@ class FakePage:
 
 
 class TimefolioBrowserTests(unittest.TestCase):
+    def test_liveness_detects_closed_page_or_disconnected_browser_without_navigation(self):
+        browser = TimefolioBrowser(Path("unused-profile"))
+        self.assertFalse(browser.is_alive())
+        browser.context, browser.page = Mock(), Mock()
+        browser.page.is_closed.return_value = False
+        browser.context.browser.is_connected.return_value = True
+        self.assertTrue(browser.is_alive())
+        browser.page.is_closed.return_value = True
+        self.assertFalse(browser.is_alive())
+        browser.page.is_closed.return_value = False
+        browser.context.browser.is_connected.return_value = False
+        self.assertFalse(browser.is_alive())
+        browser.context.browser = None
+        self.assertFalse(browser.is_alive())
+        browser.page.goto.assert_not_called()
+
     def setUp(self):
         prevent_open = patch.object(TimefolioBrowser, "open", side_effect=AssertionError("No browser may open in tests"))
         self.addCleanup(prevent_open.stop)
@@ -379,6 +396,18 @@ class TimefolioBrowserTests(unittest.TestCase):
                 self.browser._prepared = current
                 with self.assertRaisesRegex(MirrorBlocked, "outside_order_session"):
                     self.browser.submit(current)
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_resume_after_contest_end_during_form_verification_never_clicks(self):
+        current = proposal(session_date="2026-11-30")
+        self.browser._prepared = current
+        self.browser.now = lambda: NOW.replace(month=11, day=30)
+        def verify(_proposal):
+            self.browser.now = lambda: NOW.replace(month=12, day=1)
+        self.browser._verify_form = Mock(side_effect=verify)
+        with self.assertRaisesRegex(MirrorBlocked, "outside_order_session"):
+            self.browser.submit(current)
+        self.browser._verify_form.assert_called_once_with(current)
         self.assertEqual(self.submit_clicks(), 0)
 
     def test_lookup_checks_account_and_contest_before_matching(self):
@@ -661,6 +690,20 @@ class TimefolioGridDOMBrowserTests(unittest.TestCase):
         result = self.page.locator("#outer").evaluate(GRID_DOM)
         self.assertFalse(result["filtered"])
         self.assertEqual(result["headers"], [{"id": "prodId", "text": "코드"}])
+
+    def test_lost_persistent_browser_is_detected_and_cleanup_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as profile:
+            context = self.playwright.chromium.launch_persistent_context(profile, channel="chrome", headless=True)
+            context.route("**/*", lambda route: route.abort())
+            adapter = TimefolioBrowser(profile)
+            adapter.context, adapter.page = context, context.pages[0]
+            try:
+                self.assertTrue(adapter.is_alive())
+                context.browser.close()
+                self.assertFalse(adapter.is_alive())
+            finally:
+                adapter.close()
+            adapter.close()
 
     def test_nonempty_yellow_filter_badge_is_filtered(self):
         self.page.locator("#filter").evaluate("e => e.textContent = '005930'")

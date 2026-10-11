@@ -9,6 +9,7 @@ from decimal import Decimal
 import re
 
 from backend import kis
+from backend.competition_deadline import KIS_LAST_DAY, KIS_ENDED_MESSAGE, ended
 from backend.kis import AccountProfile, KisError, KST, client_for_profile
 
 
@@ -359,9 +360,11 @@ class PaperBroker:
                     orders[key] = row
         return sorted(orders.values(), key=lambda row: (row["order_date"], row["order_time"], row["order_id"]))
 
-    def _mutate(self, path, tr_id, body):
+    def _mutate(self, path, tr_id, body, *, before_send=None):
         # 인증 실패는 주문 전이다. 네트워크 요청을 시작한 뒤의 실패는 보수적으로 불명 처리한다.
         self._check_client()
+        if before_send is not None:
+            before_send()
         try:
             token = self.client.token()
         except Exception:
@@ -369,7 +372,11 @@ class PaperBroker:
         headers = {"authorization": "Bearer " + token, "appkey": self.profile.settings.app_key,
                    "appsecret": self.profile.settings.app_secret, "tr_id": tr_id, "custtype": "P"}
         try:
-            data, _ = self.client._request(path, headers=headers, body=body)
+            guard = {"before_send": before_send} if before_send is not None else {}
+            data, _ = self.client._request(path, headers=headers, body=body, **guard)
+        except BrokerRejected:
+            # The transport callback runs after token/lock waits, before urlopen.
+            raise
         except KisError as error:
             # PaperClient의 검증된 업무 오류만 확정 거절로 분류한다. HTTP 오류·타임아웃은 불명이다.
             match = re.fullmatch(r"KIS 업무 응답 오류(?: \(([A-Z]{3}[0-9]{5})\))?", str(error))
@@ -395,6 +402,10 @@ class PaperBroker:
         except Exception:
             raise BrokerUnknown("모의 주문 응답의 식별값을 확인할 수 없습니다. 주문 내역을 대조해야 합니다.") from None
 
+    def _require_competition_open(self):
+        if ended(self.now(), KIS_LAST_DAY):
+            raise BrokerRejected(KIS_ENDED_MESSAGE, request_sent=False)
+
     def submit(self, symbol, side, quantity, limit_price):
         symbol, quantity, limit_price = _symbol(symbol), _quantity(quantity), _price(limit_price)
         if side not in ("buy", "sell"):
@@ -402,7 +413,8 @@ class PaperBroker:
         body = {**self._account(), "PDNO": symbol, "ORD_DVSN": "00", "ORD_QTY": str(quantity),
                 "ORD_UNPR": limit_price, "EXCG_ID_DVSN_CD": "KRX", "SLL_TYPE": "01" if side == "sell" else "",
                 "CNDT_PRIC": ""}
-        return self._mutate("/uapi/domestic-stock/v1/trading/order-cash", "VTTC0012U" if side == "buy" else "VTTC0011U", body)
+        return self._mutate("/uapi/domestic-stock/v1/trading/order-cash", "VTTC0012U" if side == "buy" else "VTTC0011U", body,
+                            before_send=self._require_competition_open)
 
     def cancel(self, order_id, branch_id, symbol, quantity):
         symbol, quantity = _symbol(symbol), _quantity(quantity)

@@ -14,6 +14,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 from backend.kis import KST
+from backend.competition_deadline import TIMEFOLIO_LAST_DAY, ended
 from backend.mirror_runtime import MirrorBlocked, MirrorRejected, MirrorUnknown
 from backend.timefolio_dom import rejection_reason
 
@@ -129,6 +130,12 @@ class TimefolioBrowser:
             self.playwright.stop()
             self.playwright = None
         self._account_key = self._portfolio_id = self._prepared = None
+
+    def is_alive(self):
+        """Only a confirmed closed/disconnected browser should trigger recovery."""
+        return bool(self.context is not None and self.page is not None
+                    and not self.page.is_closed() and self.context.browser is not None
+                    and self.context.browser.is_connected())
 
     def _origin(self):
         url = urlsplit(self.page.url)
@@ -454,7 +461,7 @@ class TimefolioBrowser:
         now = self.now().astimezone(KST)
         if (proposal["session_date"] != now.date().isoformat() or now.weekday() > 4
                 or not daytime(9, 0) <= now.time().replace(tzinfo=None) < daytime(15, 19)
-                or not "2026-10-01" <= proposal["session_date"] <= "2026-11-30"):
+                or proposal["session_date"] < "2026-10-01" or ended(now, TIMEFOLIO_LAST_DAY)):
             raise MirrorBlocked("destination_outside_order_session")
 
     def _verify_form(self, proposal):
@@ -507,6 +514,7 @@ class TimefolioBrowser:
             raise MirrorBlocked("destination_not_prepared")
         self._session(proposal)
         self._verify_form(proposal)
+        self._session(proposal)
         self._prepared = None
         try:
             self.page.get_by_role("dialog", name="신규 주문", exact=True).locator('button[type="submit"]').click()

@@ -1,13 +1,17 @@
-"""Explicit user-run entry point; no daemon, autostart, or implicit order enable."""
+"""Headless mirror entry point; never enables KIS orders."""
 import argparse
 from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import time
+from uuid import uuid4
 
 from backend.kis import ROOT
+from backend.supervisor import _read, _write
 
 
 @contextmanager
@@ -76,6 +80,14 @@ def display_status(value):
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
+def _wait_for_stop(seconds, requested):
+    for _ in range(seconds):
+        if requested():
+            return True
+        time.sleep(1)
+    return requested()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="KIS AI 체결 → 타임폴리오 자동 주문 (직접 실행용)")
     parser.add_argument("command", nargs="?", choices=("status", "login", "run"), default="status")
@@ -98,14 +110,47 @@ def main(argv=None):
             return 1
     # Lazy import: status and module imports do not require Playwright.
     from backend.experiment_store import ExperimentStore
-    from backend.mirror_runtime import MirrorRuntime
+    from backend.mirror_runtime import MirrorBlocked, MirrorRuntime
     from backend.mirror_source import TimefolioMirrorSource
     from backend.timefolio_browser import TimefolioBrowser
     browser = TimefolioBrowser(directory / "timefolio-browser",
                               executable_path=args.browser_executable, headless=args.headless)
+    state = None
+
+    def publish(result):
+        nonlocal state
+        if state is None:
+            return
+        status = result.get("status")
+        if status not in {"starting", "initialized", "paused", "waiting_market", "source_changed",
+                          "working", "idle", "blocked", "stopping", "stopped", "error"}:
+            status = "error"
+        state = {**state, "status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
+        state.pop("reason", None)
+        if result.get("reason") is not None:
+            reason = result["reason"]
+            state["reason"] = reason if isinstance(reason, str) and re.fullmatch(
+                r"[a-z][a-z0-9_]{0,120}", reason) else "mirror_error"
+        if type(result.get("cursor")) is int and 0 <= result["cursor"] <= 2**63 - 1:
+            state["cursor"] = result["cursor"]
+        _write(directory / "timefolio-mirror-state.json", state)
+
+    def stop_requested():
+        request = _read(directory / "timefolio-mirror-stop.json")
+        return bool(state and request.get("action") == "stop"
+                    and type(request.get("pid")) is int
+                    and all(request.get(key) == state[key] for key in ("instance", "pid", "started_at")))
+
     try:
         with process_lock(directory / "timefolio-mirror.lock"):
+            if args.command == "run":
+                instance = os.environ.get("KIS_MIRROR_INSTANCE", "")
+                state = {"instance": instance if re.fullmatch(r"[0-9a-fA-F]{32}", instance) else uuid4().hex,
+                         "pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat(),
+                         "control_version": 1}
+            terminal = {"status": "stopped"}
             try:
+                publish({"status": "starting"})
                 if args.command == "run" and not db_path.exists():
                     raise ValueError("먼저 기존 프로젝트 대시보드를 실행하세요.")
                 browser.open()
@@ -123,18 +168,39 @@ def main(argv=None):
                 browser.jobs_reader = lambda: runtime.snapshot()["jobs"]
                 print("AI 체결 자동 연동 실행. KIS 주문 중지 상태를 따릅니다. 종료 Ctrl+C.", flush=True)
                 previous = None
-                while True:
+                while not stop_requested():
                     result = runtime.tick()
+                    # Runtime turns adapter errors into blocked jobs. A lost
+                    # browser must exit so supervision can reconnect it; the
+                    # durable job state still prevents uncertain resubmission.
+                    if not browser.is_alive():
+                        raise RuntimeError("mirror_browser_disconnected")
+                    publish(result)
                     # Print only changes, including terminal/rejected results.
                     current = display_status({**result, "jobs": runtime.snapshot()["jobs"][-10:]})
                     if current != previous:
                         print(current, flush=True)
                         previous = current
-                    time.sleep(args.interval)
+                    if _wait_for_stop(args.interval, stop_requested):
+                        break
+                publish({"status": "stopping"})
+                return 0
+            except BaseException as error:
+                if not isinstance(error, KeyboardInterrupt):
+                    terminal = {"status": "error", "reason": "mirror_run_failed"}
+                    if isinstance(error, MirrorBlocked) and str(error) == "timefolio_login_required":
+                        terminal["reason"] = "timefolio_login_required"
+                raise
             finally:
                 # Keep the process lock until this browser has released its
                 # persistent profile, even after Ctrl+C or startup failure.
-                browser.close()
+                try:
+                    browser.close()
+                except BaseException:
+                    terminal = {"status": "error", "reason": "browser_close_failed"}
+                    raise
+                finally:
+                    publish(terminal)
     except KeyboardInterrupt:
         print("연동 종료. 이미 접수된 주문은 사이트에 남습니다.")
         return 0

@@ -155,6 +155,118 @@ class ExperimentsTests(unittest.TestCase):
             other.command({"action": "start"})
         self.assertFalse(other.store.setting("enabled", False))
 
+    def test_competition_expiry_preserves_user_pause_and_cannot_be_started(self):
+        self.current = datetime(2026, 11, 21, tzinfo=KST)
+        for user_paused in (False, True):
+            with self.subTest(user_paused=user_paused):
+                self.service.store.save_settings({"enabled": True, "user_paused": user_paused,
+                                                  "pause_reason": "사용자 중지" if user_paused else None})
+                with patch.object(self.service, "_profile") as profile, patch.object(self.service, "_launch") as launch:
+                    with self.assertRaisesRegex(KisError, "대회가 종료"):
+                        self.service.command({"action": "start"})
+                profile.assert_not_called()
+                launch.assert_not_called()
+                self.assertFalse(self.service.store.setting("enabled"))
+                self.assertIs(self.service.store.setting("user_paused"), user_paused)
+                if user_paused:
+                    self.assertEqual(self.service.store.setting("pause_reason"), "사용자 중지")
+
+    def test_start_rechecks_expiry_after_credentials(self):
+        self.current = datetime(2026, 11, 20, 23, 59, 59, tzinfo=KST)
+        self.service.store.save_settings({"enabled": False, "user_paused": True})
+        def after_profile(policy):
+            self.current += timedelta(seconds=1)
+        with patch.object(self.service, "_profile", side_effect=after_profile), patch.object(self.service, "_launch") as launch:
+            with self.assertRaisesRegex(KisError, "대회가 종료"):
+                self.service.command({"action": "start"})
+        self.assertTrue(self.service.store.setting("user_paused"))
+        self.assertFalse(self.service.store.setting("enabled"))
+        launch.assert_not_called()
+
+    def test_competition_expiry_applies_on_restart_and_busy_tick(self):
+        self.enable()
+        self.service.store.save_setting("user_paused", False)
+        self.current = datetime(2026, 11, 21, tzinfo=KST)
+        restarted = self.make_service()
+        self.assertFalse(restarted.store.setting("enabled"))
+        self.assertFalse(restarted.store.setting("user_paused"))
+        self.enable()
+        self.service.store.save_setting("autonomy_status", {"next_retry_at": "2026-12-01T00:00:00+09:00"})
+        with patch.object(self.service, "worker", Mock(is_alive=Mock(return_value=True))), patch.object(self.service, "_launch") as launch:
+            self.service.tick()
+        self.assertFalse(self.service.store.setting("enabled"))
+        launch.assert_not_called()
+
+    def test_first_autonomous_boot_does_not_enable_orders_after_competition(self):
+        self.config.write_text(self.config.read_text(encoding="utf-8") + "\n[experiments]\nautonomous=true\n", encoding="utf-8")
+        self.current = datetime(2026, 11, 21, tzinfo=KST)
+        restarted = self.make_service()
+        self.assertFalse(restarted.store.setting("enabled"))
+        self.assertFalse(restarted.store.setting("user_paused", False))
+        self.assertTrue(restarted.store.setting("autonomous_initialized"))
+        self.assertEqual(self.broker.submissions, [])
+
+    def test_competition_expiry_keeps_reconciliation_and_analysis_available(self):
+        self.current = datetime(2026, 11, 20, 10, tzinfo=KST)
+        self.submit(quantity=2)
+        self.broker.remote[0].update(filled_quantity=2, remaining_quantity=0, filled_amount="20000",
+                                     average_price="10000", status="filled")
+        self.current = datetime(2026, 11, 21, tzinfo=KST)
+        with patch.object(self.service, "_analyze") as analyze:
+            self.service._automatic()
+        analyze.assert_called_once_with(automatic_retry=True)
+        self.assertFalse(self.service.store.setting("enabled"))
+        self.assertEqual(self.service.store.orders()[0]["filled_quantity"], 2)
+        self.assertEqual(len(self.broker.submissions), 1)
+        self.assertEqual(self.broker.cancellations, [])
+
+    def test_expired_feed_is_disabled_before_scheduler_without_mutating_controls(self):
+        self.enable()
+        self.current = datetime(2026, 11, 21, tzinfo=KST)
+        self.assertFalse(self.service.mirror_snapshot()["orders_enabled"])
+        self.assertTrue(self.service.store.setting("enabled"))
+
+    def test_expiry_during_durable_intent_blocks_buy_and_sell_without_unknown_order(self):
+        for side in ("buy", "sell"):
+            with self.subTest(side=side):
+                self.current = datetime(2026, 11, 20, 23, 59, 59, tzinfo=KST)
+                reserve = self.service.store.reserve_order
+                def cross_boundary(*args):
+                    saved = reserve(*args)
+                    self.current += timedelta(seconds=1)
+                    return saved
+                with patch.object(self.service, "_market_open", return_value=True), \
+                        patch.object(self.service.store, "reserve_order", side_effect=cross_boundary):
+                    order = self.submit(side=side, key=side)
+                self.assertEqual(order["status"], "cancelled")
+                self.assertTrue(order["submission_skipped"])
+                self.assertNotIn("submission_attempted_at", order)
+                self.assertIn("대회가 종료", order["error"])
+                self.assertFalse(self.service.store.setting("enabled"))
+        self.assertEqual(self.broker.submissions, [])
+
+    def test_expired_submit_blocks_before_reserving_even_if_market_is_reported_open(self):
+        self.current = datetime(2026, 11, 21, tzinfo=KST)
+        self.enable()
+        with patch.object(self.service, "_market_open", return_value=True):
+            self.service._submit(self.service._policy(), self.broker, decision(), "buy", 1, Decimal("10000"), "expired", run_id=None)
+        self.assertEqual(self.service.store.orders(), [])
+        self.assertEqual(self.broker.submissions, [])
+        self.assertFalse(self.service.store.setting("enabled"))
+
+    def test_broker_deadline_rejection_is_unsent_and_disables_engine(self):
+        self.current = datetime(2026, 11, 20, 23, 59, 59, tzinfo=KST)
+        def delayed_broker(*args):
+            self.current += timedelta(seconds=1)
+            raise BrokerRejected("KIS 대회가 종료되어 새 주문을 중지했습니다.", request_sent=False)
+        with patch.object(self.service, "_market_open", return_value=True), \
+                patch.object(self.broker, "submit", side_effect=delayed_broker):
+            order = self.submit()
+        self.assertEqual(order["status"], "rejected")
+        self.assertTrue(order["submission_skipped"])
+        self.assertFalse(order["request_sent"])
+        self.assertFalse(self.service.store.setting("enabled"))
+
     def test_policy_requires_exact_keys_ordered_integer_limits_and_existing_strategy(self):
         cases = [{**self.policy, "budget": "NaN"}, {**self.policy, "budget": True},
                  {**self.policy, "budget": "1.5"}, {**self.policy, "budget": "1000000001"},

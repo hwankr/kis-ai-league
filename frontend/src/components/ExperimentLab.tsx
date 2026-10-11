@@ -95,7 +95,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
 
   return <div className="experiment-lab" aria-busy={loading && !data}>
     <section className="lab-control" aria-labelledby="lab-control-title">
-      <div className="panel-heading lab-heading"><div className="panel-title"><h2 id="lab-control-title">모의 운용</h2>
+      <div className="panel-heading lab-heading"><div className="panel-title"><h2 id="lab-control-title">AI 운용</h2>
         <span className={`lab-badge ${data?.automation.enabled ? 'lab-badge-active' : ''}`} role="status">{data ? data.automation.enabled ? '자동 주문 켜짐' : '자동 주문 꺼짐' : loading ? '조회 중' : '확인 필요'}</span></div>
         <button type="button" className="lab-button" disabled={loading || !!pending} onClick={onRefresh}>상태 새로고침</button></div>
       <div className="lab-status-line"><span>{data ? statusLabel(autonomy?.status ?? data.automation.state) : '—'}</span><span>{executionLabel}</span>
@@ -109,6 +109,12 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
         {issue.question ? <div className="lab-issue-actions"><button type="button" className="lab-button" disabled={locked} onClick={() => { void onExecute({ action: 'answer', id: issue.id, answer: 'retry' }); }}>다시 시도</button>
           <button type="button" className="lab-button" disabled={locked} onClick={() => { void onExecute({ action: 'answer', id: issue.id, answer: 'keep_paused' }); }}>중지 유지</button></div> : null}
       </article>)}</div> : null}
+      <div className="lab-actions">
+        <button type="button" className="lab-button lab-primary" disabled={locked || data?.busy} onClick={() => { void onExecute({ action: 'analyze' }); }}>{pending === 'analyze' || data?.busy ? '분석 중' : '지금 분석'}</button>
+        {data?.automation.enabled ? <button type="button" className="lab-button lab-pause" disabled={locked} onClick={() => { void onExecute({ action: 'pause' }); }}>{pending === 'pause' ? '정지 중' : '신규 주문 정지'}</button>
+          : <button type="button" className="lab-button" disabled={locked || (!autonomy && !configured) || dirty || !!warning} onClick={() => { void onExecute({ action: 'start' }); }}>{pending === 'start' ? '시작 중' : ownedAccount?.risk.active ? '보호 청산 재개' : '모의 자동 주문 시작'}</button>}
+        <button type="button" className="lab-button" disabled={locked} onClick={() => { void onExecute({ action: 'reconcile' }); }}>{pending === 'reconcile' ? '확인 중' : '체결 확인'}</button>
+      </div>
       {autonomy ? <>
         <dl className="lab-stats lab-account-performance" aria-label="모의계좌 성과">
           <div><dt>총 평가금액</dt><dd>{number(performance?.total_value)}<span>원</span></dd></div>
@@ -123,19 +129,13 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
             ['최근 주문', orders[0]?.created_at ?? null], ...(autonomy.next_retry_at ? [['다음 재시도', autonomy.next_retry_at]] : [])] as [string, string | null][])
             .map(([title, value]) => <div key={title}><dt>{title}</dt><dd><time dateTime={value ?? undefined}>{timestamp(value).text}</time></dd></div>)}
         </dl>
-      </> : <dl className="lab-stats" aria-label="실험 집계">
+      </> : <dl className="lab-stats" aria-label="운용 집계">
         <div><dt>전략</dt><dd>{number(data?.strategies.length)}</dd></div>
         <div><dt>분석 실행</dt><dd>{number(data?.runs.length)}</dd></div>
         <div><dt>보유 종목</dt><dd>{number(data?.positions.length)}</dd></div>
         <div><dt>진행 주문</dt><dd>{data ? number(openOrderCount) : '—'}</dd></div>
       </dl>}
       {autonomy && !issues.length ? <p className="lab-no-issues">확인할 사항 없음</p> : null}
-      <div className="lab-actions">
-        <button type="button" className="lab-button lab-primary" disabled={locked || data?.busy} onClick={() => { void onExecute({ action: 'analyze' }); }}>{pending === 'analyze' || data?.busy ? '분석 중' : '지금 분석'}</button>
-        {data?.automation.enabled ? <button type="button" className="lab-button lab-pause" disabled={locked} onClick={() => { void onExecute({ action: 'pause' }); }}>{pending === 'pause' ? '정지 중' : '신규 주문 정지'}</button>
-          : <button type="button" className="lab-button" disabled={locked || (!autonomy && !configured) || dirty || !!warning} onClick={() => { void onExecute({ action: 'start' }); }}>{pending === 'start' ? '시작 중' : ownedAccount?.risk.active ? '보호 청산 재개' : '모의 자동 주문 시작'}</button>}
-        <button type="button" className="lab-button" disabled={locked} onClick={() => { void onExecute({ action: 'reconcile' }); }}>{pending === 'reconcile' ? '확인 중' : '체결 확인'}</button>
-      </div>
       <details className="lab-policy">
         <summary>고급 운용 설정{dirty ? <span className="lab-unsaved">저장 전</span> : null}</summary>
         <form onSubmit={event => { event.preventDefault(); if (complete && dirty && !locked && !data?.automation.enabled) void onExecute({ action: 'configure', policy }); }}>
@@ -146,7 +146,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
             <StyledSelect label="주문 실행 전략" value={policy.execution_strategy ?? ''} disabled={locked || data?.automation.enabled}
               options={[{ value: '', label: '전략 선택' }, ...(autonomy || policy.execution_strategy === 'all-strategies-v1' ? [{ value: 'all-strategies-v1', label: label('all-strategies-v1') }] : []), ...(data?.strategies ?? []).filter(strategy => strategy.selectable !== false).map(strategy => ({ value: strategy.id, label: strategy.label }))]}
               onChange={value => change('execution_strategy', value)}/>
-            {([['budget', '실험 예산'], ['order_cap', '건당 매수 한도'], ['daily_buy_limit', '일일 매수 한도']] as const).map(([key, title]) => <label key={key} className="lab-money-field">
+            {([['budget', '운용 예산'], ['order_cap', '건당 매수 한도'], ['daily_buy_limit', '일일 매수 한도']] as const).map(([key, title]) => <label key={key} className="lab-money-field">
               <span>{title}</span><div><input aria-label={title} inputMode="decimal" type="text" pattern="[0-9]+([.][0-9]+)?" required value={policy[key] ?? ''}
                 disabled={locked || data?.automation.enabled} onChange={event => change(key, event.target.value)}/><span>원</span></div>
             </label>)}
@@ -251,7 +251,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
 
     <section aria-labelledby="lab-orders-title">
       <div className="panel-heading lab-heading"><h2 id="lab-orders-title">주문·체결</h2><span className="lab-subtle">{data ? `${number(orders.length)}건` : '—'}</span></div>
-      {orders.length ? <table className="lab-table" aria-label="실험 주문과 체결"><thead><tr><th scope="col">종목 / 전략</th><th scope="col">주문</th><th scope="col">체결</th><th scope="col">상태</th></tr></thead>
+      {orders.length ? <table className="lab-table" aria-label="AI 주문과 체결"><thead><tr><th scope="col">종목 / 전략</th><th scope="col">주문</th><th scope="col">체결</th><th scope="col">상태</th></tr></thead>
         <tbody>{orders.slice((currentOrderPage - 1) * PAGE_SIZE, currentOrderPage * PAGE_SIZE).map(order => {
           const cancelable = !!order.order_id && order.filled_quantity < order.quantity && ['submitted', 'partial'].includes(order.status);
           return <tr key={order.id}><td><button type="button" className="market-stock-link stock-name" aria-label={`${order.name || order.symbol} 주문 종목 차트 보기`}
@@ -268,7 +268,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
       <Pager page={currentOrderPage} pages={orderPages} count={orders.length} label="주문 기록 페이지" onChange={setOrderPage}/>
     </section>
 
-    {data?.positions.length ? <section aria-labelledby="lab-positions-title"><div className="panel-heading"><h2 id="lab-positions-title">실험 보유</h2></div>
+    {data?.positions.length ? <section aria-labelledby="lab-positions-title"><div className="panel-heading"><h2 id="lab-positions-title">전략 보유</h2></div>
       <ul className="lab-position-list">{data.positions.map(position => <li key={`${position.strategy_id}-${position.symbol}`}><div><strong>{position.name || position.symbol}</strong>
         <span className="stock-symbol">{position.symbol} · {label(position.strategy_id)}</span></div><div>{number(position.quantity)}주<span className="lab-cell-sub">평균 {number(position.average_price)}원</span></div></li>)}</ul></section> : null}
     {data?.events.length ? <section aria-labelledby="lab-events-title"><div className="panel-heading"><h2 id="lab-events-title">최근 활동</h2></div><ol className="lab-events">

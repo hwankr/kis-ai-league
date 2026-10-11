@@ -8,6 +8,7 @@ import StockChart from './components/StockChart';
 import CandidateComparison from './components/CandidateComparison';
 import ResearchObservation from './components/ResearchObservation';
 import ExperimentLab from './components/ExperimentLab';
+import OperationsPanel from './components/OperationsPanel';
 import { number, percent, signClass, timestamp } from './format';
 import useAccountDashboard from './useAccountDashboard';
 import useMarketData from './useMarketData';
@@ -76,7 +77,7 @@ export default function App() {
     }}>본문으로 바로가기</a>
     <header className="app-header">
       <div className="header-inner">
-        <a className="brand" href="#/account" aria-label="KIS AI League 홈">
+        <a className="brand" href="#/experiments" aria-label="KIS AI League 홈">
           <svg className="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M5 24V14M16 24V6M27 24V11" stroke="currentColor" strokeWidth="6" strokeLinecap="round"/></svg>
           <span>KIS <span className="brand-light">AI League</span></span>
         </a>
@@ -159,7 +160,8 @@ export default function App() {
         <MarketQuotes data={market.data} loading={market.loading} error={market.error} onSelectSymbol={selectSymbol}/>
       </div>
       <div className="app-page page-content" hidden={route.page !== 'experiments'}>
-        {route.page === 'experiments' ? <ExperimentLab accounts={dashboard.accounts} onSelectSymbol={symbol => { void queryChart(symbol, 'day'); }}/> : null}
+        {route.page === 'experiments' ? <div className="operations-room"><OperationsPanel/>
+          <ExperimentLab accounts={dashboard.accounts} onSelectSymbol={symbol => { void queryChart(symbol, 'day'); }}/></div> : null}
       </div>
       <footer className="page-footer"><span>KIS AI League</span>{accountPage ? <span id="account-label">{account?.name ?? '계좌 선택 필요'}</span> : null}</footer>
     </main>

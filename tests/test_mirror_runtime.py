@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from backend.experiment_store import ExperimentStore
 from backend.mirror_runtime import MirrorRuntime, MirrorBlocked, MirrorUnknown, MirrorRejected
@@ -132,6 +133,44 @@ class MirrorRuntimeTests(unittest.TestCase):
 
     def initialize(self):
         self.assertEqual(self.runtime.tick()["status"], "initialized")
+
+    def competition_clock(self, current):
+        self.runtime.now = lambda: current
+        self.source.data["as_of"] = current.isoformat()
+        self.destination.session_date = current.astimezone(timezone(timedelta(hours=9))).date().isoformat()
+
+    def test_expired_competition_observes_fills_and_receipts_but_never_submits(self):
+        self.competition_clock(datetime(2026, 11, 30, 1, tzinfo=timezone.utc))
+        self.initialize()
+        self.source.fill(2)
+        self.runtime.tick()
+        self.destination.fill("1", "2")
+        self.source.fill(1)
+        # Midnight in Korea, although the UTC date is still November 30.
+        self.competition_clock(datetime(2026, 11, 30, 15, tzinfo=timezone.utc))
+        result = self.runtime.tick()
+        self.assertEqual(result["reason"], "competition_ended")
+        self.assertEqual(result["cursor"], 2)
+        self.assertEqual(len(self.destination.submissions), 1)
+        self.assertIn("receipt_snapshot", self.destination.calls)
+        self.assertEqual(self.runtime.snapshot()["jobs"][0]["status"], "filled")
+        self.assertEqual(self.runtime.snapshot()["jobs"][1]["status"], "pending")
+
+    def test_deadline_is_rechecked_after_durable_intent_before_irreversible_submit(self):
+        self.competition_clock(datetime(2026, 11, 30, 14, 59, 59, tzinfo=timezone.utc))
+        self.initialize()
+        self.source.fill(2)
+        save = self.runtime._save_job
+        def cross_boundary(job):
+            save(job)
+            if job["status"] == "submitting":
+                self.competition_clock(datetime(2026, 11, 30, 15, tzinfo=timezone.utc))
+        with patch.object(self.runtime, "_save_job", side_effect=cross_boundary):
+            result = self.runtime.tick()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(self.destination.submissions, [])
+        job = self.runtime.snapshot()["jobs"][0]
+        self.assertEqual((job["status"], job["reason"]), ("blocked", "competition_ended"))
 
     def test_buy_partial_completion_then_sell(self):
         self.initialize()

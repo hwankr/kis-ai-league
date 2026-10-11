@@ -321,10 +321,12 @@ class DashboardServer(ThreadingHTTPServer):
         return super().server_bind()
 
     def __init__(self, port=8765, service=None, frontend_path=FRONTEND, market_service=None,
-                 chart_service=None, candidate_service=None, research_service=None, experiment_service=None):
+                 chart_service=None, candidate_service=None, research_service=None, experiment_service=None,
+                 operations_service=None):
         self.experiment_owner = None
         self.autonomous_monitor = None
         self.shutdown_requested = False
+        self.operations_service = operations_service
         self.last_loop_at = datetime.now(timezone.utc).isoformat()
         super().__init__(("127.0.0.1", port), DashboardHandler)
         self.hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
@@ -332,6 +334,9 @@ class DashboardServer(ThreadingHTTPServer):
         try:
             self._initialize(service, frontend_path, market_service, chart_service,
                              candidate_service, research_service, experiment_service)
+            if self.operations_service is None and self.automatic_research:
+                from backend.operations import OperationsService
+                self.operations_service = OperationsService()
         except BaseException:
             self.server_close()
             raise
@@ -370,6 +375,9 @@ class DashboardServer(ThreadingHTTPServer):
 
     def server_close(self):
         super().server_close()
+        operations = getattr(self, "operations_service", None)
+        if operations is not None:
+            operations.close()
         owner = getattr(self, "experiment_owner", None)
         service_stopped = True
         if owner is not None:
@@ -395,6 +403,8 @@ class DashboardServer(ThreadingHTTPServer):
                 pass
         if self.shutdown_requested:
             return
+        if self.automatic_research and self.operations_service is not None:
+            self.operations_service.tick()
         if self.automatic_research and self.research_service is not None:
             self.research_service.tick(self.candidate_service)
         if self.automatic_research and self.experiment_service is not None:
@@ -407,6 +417,11 @@ class DashboardServer(ThreadingHTTPServer):
         if self.autonomous_monitor is not None:
             payload = {**payload, "autonomy": self.autonomous_monitor.snapshot()}
         return payload
+
+    def operations_snapshot(self, payload=None):
+        payload = self.operations_service.snapshot() if payload is None else payload
+        health = self.health()
+        return {**payload, "dashboard": {key: health[key] for key in ("status", "updated_at")}}
 
     def health(self):
         service = self.experiment_service
@@ -461,7 +476,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         path = url.path
-        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates", "/api/research", "/api/experiments", "/api/mirror", "/api/health"):
+        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates", "/api/research", "/api/experiments", "/api/mirror", "/api/health", "/api/operations"):
             origin = self.headers.get("Origin")
             if (self.headers.get("X-KIS-Dashboard") != "1"
                     or (origin is not None and origin not in self.server.origins)
@@ -469,6 +484,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "대시보드에서 계좌를 조회하세요."})
                 return
             params = parse_qs(url.query, keep_blank_values=True)
+            if path == "/api/operations":
+                if params:
+                    self.json_response(400, {"error": "실행 상태 조회에는 추가 조건을 지정할 수 없습니다."})
+                elif self.server.operations_service is None:
+                    self.json_response(503, {"error": "실행 관리가 시작되지 않았습니다."})
+                else:
+                    try:
+                        self.json_response(200, self.server.operations_snapshot())
+                    except Exception:
+                        self.json_response(503, {"error": "실행 상태를 확인하지 못했습니다."})
+                return
             if path == "/api/health":
                 if params:
                     self.json_response(400, {"error": "상태 조회 조건이 올바르지 않습니다."})
@@ -634,6 +660,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 or self.headers.get("Sec-Fetch-Site") == "cross-site"
                 or self.headers.get("Origin") is not None and self.headers.get("Origin") not in self.server.origins):
             self.json_response(403, {"error": "대시보드에서 조회를 실행하세요."})
+            return
+        if self.path == "/api/operations":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if (not 1 <= length <= 512 or self.headers.get("Transfer-Encoding")
+                        or self.headers.get_content_type() != "application/json"):
+                    raise ValueError
+                self.connection.settimeout(5)
+                body = json.loads(self.rfile.read(length))
+                if (not isinstance(body, dict) or set(body) != {"action"}
+                        or body["action"] not in ("mirror_start", "mirror_stop")):
+                    raise ValueError
+                if self.server.operations_service is None:
+                    self.json_response(503, {"error": "실행 관리가 시작되지 않았습니다."})
+                    return
+                payload = self.server.operations_snapshot(self.server.operations_service.command(body))
+            except (ValueError, OSError):
+                self.json_response(400, {"error": "실행 요청이 올바르지 않거나 다른 작업이 진행 중입니다."})
+            except Exception:
+                self.json_response(503, {"error": "실행 요청 결과를 확인하지 못했습니다. 상태를 다시 조회하세요."})
+            else:
+                self.json_response(202 if payload.get("busy") else 200, payload)
             return
         if self.path == "/api/experiments":
             try:

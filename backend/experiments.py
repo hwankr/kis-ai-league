@@ -10,6 +10,7 @@ import tomllib
 from uuid import uuid4
 
 from backend.candidate_history import HistoryCache
+from backend.competition_deadline import KIS_LAST_DAY, KIS_ENDED_MESSAGE, ended
 from backend.eligibility import EligibilityService, assess_master
 from backend.experiment_store import ExperimentStore, encode
 from backend.history import series_for_profile
@@ -124,10 +125,11 @@ class ExperimentService:
                     prior_pause = self.store.setting("pause_reason") or ""
                     if "사용자" in prior_pause:
                         self.store.save_setting("user_paused", True)
-                    if not self.store.setting("user_paused", False):
+                    if not self.store.setting("user_paused", False) and not ended(self.now(), KIS_LAST_DAY):
                         self.store.save_setting("enabled", True)
                         self.store.save_setting("pause_reason", None)
                     self.store.save_setting("autonomous_initialized", True)
+                self._enforce_deadline()
                 for order in self.store.orders():
                     if order["status"] in {"unknown", "submitting", "cancel_pending"}:
                         self._order_issue(order)
@@ -152,6 +154,17 @@ class ExperimentService:
         self.store.save_setting("enabled", False)
         self.store.save_setting("pause_reason", reason)
         self.store.save_setting("user_paused", True)
+
+    def _enforce_deadline(self):
+        if not ended(self.now(), KIS_LAST_DAY):
+            return False
+        with self.lock:
+            values = {"enabled": False}
+            if not self.store.setting("user_paused", False):
+                values["pause_reason"] = KIS_ENDED_MESSAGE
+            if any(self.store.setting(key) != value for key, value in values.items()):
+                self.store.save_settings(values)
+        return True
 
     def _health(self, **changes):
         value = self.store.setting("autonomy_status", {})
@@ -373,7 +386,10 @@ class ExperimentService:
     def mirror_snapshot(self, *, after=0, limit=100):
         """Read verified fill observations without fetching data or enabling orders."""
         try:
-            return self.store.mirror_snapshot(after=after, limit=limit)
+            result = self.store.mirror_snapshot(after=after, limit=limit)
+            if ended(self.now(), KIS_LAST_DAY):
+                result["orders_enabled"] = False
+            return result
         except ValueError:
             raise KisError("연동 체결 조회 조건 또는 원장 상태를 확인하세요.") from None
 
@@ -405,6 +421,8 @@ class ExperimentService:
             return self.snapshot()
         if action == "start":
             with self.lock:
+                if self._enforce_deadline():
+                    raise KisError(KIS_ENDED_MESSAGE)
                 if self.worker is not None and self.worker.is_alive():
                     raise KisError("실험 작업이 진행 중입니다.")
                 policy = self._policy()
@@ -413,6 +431,8 @@ class ExperimentService:
                     decimal(policy[key], positive=True)
                 if any(order["status"] in {"unknown", "submitting", "cancel_pending"} for order in self._owned_orders(policy)):
                     raise KisError("미확정 주문을 먼저 확인하세요.")
+                if self._enforce_deadline():
+                    raise KisError(KIS_ENDED_MESSAGE)
                 self.store.save_setting("enabled", True)
                 self.store.save_setting("user_paused", False)
                 self.store.save_setting("pause_reason", None)
@@ -501,12 +521,14 @@ class ExperimentService:
         if time.monotonic() < self.next_tick:
             return
         self.next_tick = time.monotonic() + 30
+        self._enforce_deadline()
         if self.worker is not None and self.worker.is_alive():
             return
         if self._retry_due():
             self._launch("automatic")
 
     def _automatic(self):
+        self._enforce_deadline()
         failure = None
         try:
             policy = self._initialize_policy()
@@ -904,6 +926,7 @@ class ExperimentService:
         return price
 
     def _cycle(self):
+        self._enforce_deadline()
         policy = self._policy()
         broker = self._reconcile(policy)
         if not self.store.setting("enabled", False) or self.stopping:
@@ -1151,7 +1174,7 @@ class ExperimentService:
         return ordered, caps
 
     def _submit(self, policy, broker, decision, side, quantity, price, intent_key, *, run_id):
-        if self.stopping or not self.store.setting("enabled", False) or not self._market_open():
+        if self._enforce_deadline() or self.stopping or not self.store.setting("enabled", False) or not self._market_open():
             return
         if side == 'buy' and self.learning_account.state(policy.get('fingerprint', '')).get('risk', {}).get('active'):
             return
@@ -1183,9 +1206,10 @@ class ExperimentService:
             return
         # A pause can arrive while credentials or the durable intent are checked.
         # This intent was never sent; it must not become an ambiguous broker order.
-        if self.stopping or not self.store.setting("enabled", False) or not self._market_open():
+        expired = self._enforce_deadline()
+        if expired or self.stopping or not self.store.setting("enabled", False) or not self._market_open():
             order.update(status="cancelled", remaining_quantity=0, submission_skipped=True,
-                         error="전송 직전 주문이 중지되어 보내지 않았습니다.")
+                         error=KIS_ENDED_MESSAGE if expired else "전송 직전 주문이 중지되어 보내지 않았습니다.")
             order.pop('submission_attempted_at', None)
             self.store.save_order(order)
             return
@@ -1193,6 +1217,7 @@ class ExperimentService:
         try:
             ack = broker.submit(order["symbol"], side, quantity, str(price))
         except BrokerRejected as error:
+            self._enforce_deadline()
             order.update(status="rejected", remaining_quantity=0, error=str(error), broker_error_code=error.code,
                          request_sent=error.request_sent, submission_skipped=not error.request_sent,
                          terminal_observed_at=self._timestamp())

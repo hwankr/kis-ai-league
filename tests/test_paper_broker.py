@@ -1,5 +1,8 @@
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from pathlib import Path
+import tempfile
 from unittest.mock import Mock, patch
 import unittest
 
@@ -96,6 +99,49 @@ class PaperBrokerTests(unittest.TestCase):
         self.assertNotIn("test-secret", str(caught.exception))
         self.assertFalse(caught.exception.request_sent)
         self.client._request.assert_not_called()
+
+    def test_expired_competition_rejects_before_token_for_both_sides(self):
+        self.broker.now = lambda: datetime(2026, 11, 20, 15, tzinfo=timezone.utc)
+        for side in ("buy", "sell"):
+            with self.subTest(side=side), self.assertRaises(BrokerRejected) as caught:
+                self.broker.submit("005930", side, 1, 70000)
+            self.assertFalse(caught.exception.request_sent)
+        self.client.token.assert_not_called()
+        self.client._request.assert_not_called()
+
+    def test_expiry_during_token_or_request_waits_is_checked_before_urlopen(self):
+        for stage in ("token", "request_guard", "request_spacing"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                current = [datetime(2026, 11, 20, 14, 59, 59, tzinfo=timezone.utc)]
+                cutoff = datetime(2026, 11, 20, 15, tzinfo=timezone.utc)
+                @contextmanager
+                def wait_at(name):
+                    if name == stage:
+                        current[0] = cutoff
+                    yield
+                def token():
+                    if stage == "token":
+                        current[0] = cutoff
+                    return "test-token"
+                client = PaperClient(self.settings, Path(directory) / "token.json",
+                                     request_guard=lambda: wait_at("request_guard"))
+                broker = PaperBroker(self.profile, client=client, now=lambda: current[0])
+                with patch.object(client, "token", side_effect=token), \
+                        patch("backend.kis.request_spacing", side_effect=lambda _: wait_at("request_spacing")), \
+                        patch("backend.kis.urlopen") as opened:
+                    with self.assertRaises(BrokerRejected) as caught:
+                        broker.submit("005930", "buy", 1, 70000)
+                self.assertFalse(caught.exception.request_sent)
+                self.assertIn("대회가 종료", str(caught.exception))
+                opened.assert_not_called()
+
+    def test_competition_expiry_does_not_block_cancellation(self):
+        self.broker.now = lambda: datetime(2026, 11, 20, 15, tzinfo=timezone.utc)
+        with patch.object(self.broker, "orders", return_value=[{
+                "order_id": "123", "branch_id": "1234", "symbol": "005930", "remaining_quantity": 1}]):
+            result = self.broker.cancel("123", "1234", "005930", 1)
+        self.assertEqual(result["order_id"], "0000000123")
+        self.assertNotIn("before_send", self.client._request.call_args.kwargs)
 
     def test_business_rejection_exposes_only_safe_code(self):
         self.client._request.side_effect = KisError("KIS 업무 응답 오류 (APBK0918)")

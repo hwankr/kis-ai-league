@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { readExperiments } from './experiments';
 import type { ExperimentCommand, ExperimentData } from './experiments';
 
-const LOAD_ERROR = '실험실을 불러오지 못했습니다.';
+const LOAD_ERROR = '운용실을 불러오지 못했습니다.';
 const ACTION_ERROR = '요청 결과를 확인하지 못했습니다. 상태를 다시 조회해 주세요.';
 
 export default function useExperiments() {

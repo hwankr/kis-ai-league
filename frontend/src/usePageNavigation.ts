@@ -2,10 +2,10 @@ import { useEffect, useSyncExternalStore } from 'react';
 import type { ChartInterval, ChartRequest } from './types';
 
 export const pages = [
+  { id: 'experiments', label: '운용실' },
   { id: 'account', label: '내 계좌' },
   { id: 'trades', label: '거래 내역' },
   { id: 'candidates', label: '후보 탐색' },
-  { id: 'experiments', label: '실험실' },
   { id: 'chart', label: '시세·차트' },
 ] as const;
 export type PageId = typeof pages[number]['id'];
@@ -37,7 +37,7 @@ export function navigate(href: string) {
 export default function usePageNavigation() {
   const hash = useSyncExternalStore(subscribe, () => window.location.hash);
   const [path, search = ''] = hash.replace(/^#\/?/, '').split('?');
-  const page = legacyPages[hash] ?? pages.find(item => item.id === path)?.id ?? 'account';
+  const page = legacyPages[hash] ?? pages.find(item => item.id === path)?.id ?? 'experiments';
   const params = new URLSearchParams(search);
   const rawSymbol = params.get('symbol');
   const symbol = rawSymbol?.trim().toUpperCase() ?? null;

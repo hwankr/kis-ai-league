@@ -27,7 +27,7 @@ describe('experiment lab', () => {
     expect(screen.getByRole('button', { name: '모의 자동 주문 시작' }).hasAttribute('disabled')).toBe(true);
     expect(screen.getByRole('button', { name: '설정 저장', hidden: true }).hasAttribute('disabled')).toBe(true);
     expect((screen.getByText('고급 운용 설정').closest('details') as HTMLDetailsElement).open).toBe(false);
-    for (const label of ['실험 예산', '건당 매수 한도', '일일 매수 한도']) expect((screen.getByLabelText(label) as HTMLInputElement).value).toBe('');
+    for (const label of ['운용 예산', '건당 매수 한도', '일일 매수 한도']) expect((screen.getByLabelText(label) as HTMLInputElement).value).toBe('');
     expect(screen.getByText('분석 기록 없음')).toBeTruthy();
     expect(screen.getByText('주문 기록 없음')).toBeTruthy();
     expect(screen.getAllByRole('article').map(card => card.querySelector('dd')?.textContent)).toEqual(['—원', '—원', '—원']);
@@ -39,7 +39,7 @@ describe('experiment lab', () => {
     await userEvent.click(screen.getByText('고급 운용 설정'));
     await select('모의계좌', catalog.accounts[0].name);
     await select('주문 실행 전략', '추세 규칙');
-    await userEvent.type(screen.getByLabelText('실험 예산'), '3000000');
+    await userEvent.type(screen.getByLabelText('운용 예산'), '3000000');
     await userEvent.type(screen.getByLabelText('건당 매수 한도'), '500000');
     await userEvent.type(screen.getByLabelText('일일 매수 한도'), '1000000');
     await userEvent.click(screen.getByRole('button', { name: '설정 저장' }));
@@ -58,7 +58,7 @@ describe('experiment lab', () => {
     expect(screen.getByRole('button', { name: '분석 중' }).hasAttribute('disabled')).toBe(true);
     await userEvent.click(screen.getByRole('button', { name: '신규 주문 정지' }));
     expect(onExecute).toHaveBeenLastCalledWith({ action: 'pause' });
-    expect((screen.getByLabelText('실험 예산') as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText('운용 예산') as HTMLInputElement).disabled).toBe(true);
   });
 
   it('shows reasons, source IDs and unmodified scores, filters strategies and opens a chart', async () => {
@@ -335,7 +335,7 @@ describe('experiment requests', () => {
     await act(async () => {});
     expect(fetchMock.mock.calls[0]).toEqual(['/api/experiments', expect.objectContaining({ method: 'GET', cache: 'no-store', headers: { Accept: 'application/json', 'X-KIS-Dashboard': '1' } })]);
     await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
-    expect(result.current.error).toBe('실험실을 불러오지 못했습니다.');
+    expect(result.current.error).toBe('운용실을 불러오지 못했습니다.');
     expect(result.current.data?.runs).toHaveLength(1);
     await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
     expect(result.current.error).toBeNull();
