@@ -112,6 +112,7 @@ class ExperimentService:
             raise KisError('학습 운용 최대 낙폭은 0 초과 100 이하로 설정하세요.')
         self.learning = LearningService(self.store,
             enabled=settings.get("learning", {}).get("enabled", self.autonomous) is True,
+            daily_enabled=settings.get("learning", {}).get("daily_enabled", True) is True,
             now=self.now, llm_factory=self._get_llm, development_reader=self._development_inputs,
             proposer=self._propose_learning)
         # Never resubmit a mutation interrupted between durable intent and response.
@@ -318,16 +319,16 @@ class ExperimentService:
         from backend.experiment_analysis import strategy_specs
         from backend.learning_policy import policy_id
         specs = strategy_specs()
-        policy = self.learning.champion()
+        policy = self.learning.active_policy()
         for item in policy["strategies"]:
             specs.append({"id": item["id"], "label": item["name"],
-                          "description": f"채택 전략 · {item['holding_sessions']}거래일 · 배분 {item['weight'] * 100:g}%",
+                          "description": f"적용 전략 · {item['holding_sessions']}거래일 · 배분 {item['weight'] * 100:g}%",
                           "version": policy_id(policy), "selectable": False})
         return specs
 
     def _adopted_policy(self):
         if self.learning.enabled and self._policy().get("execution_strategy") == ALL_STRATEGIES:
-            return self.learning.champion()
+            return self.learning.active_policy()
         return None
 
     def _development_inputs(self, data):
@@ -352,8 +353,13 @@ class ExperimentService:
         from backend.learning_research import propose_candidate
         # Freeze the research account before the provider call; current order
         # settings can change while the response is being generated.
+        research_state = self.learning.state()
+        daily = getattr(self.learning, "daily", None)
+        if daily is not None and daily.enabled:
+            research_state = {**research_state, "fingerprint": self._policy().get("fingerprint"),
+                              "engine_version": daily.engine_version}
         context = proposal_context(champion, frames, limits, history,
-                                   self.learning.state(), llm, self._timestamp())
+                                   research_state, llm, self._timestamp())
         return propose_candidate(champion, frames, limits, history, llm=llm,
             on_llm_proposal=lambda policy: save_llm_proposal(
                 self.store, policy, context=context, captured_at=self._timestamp()))
@@ -635,7 +641,11 @@ class ExperimentService:
             self._automatic_failure_recorded = True
         try:
             candidate = self.candidate_service.snapshot() if self.candidate_service else None
-            if not self.stopping and (candidate is None or candidate["status"] == "complete" and not candidate.get("stale")):
+            pending = self.learning.daily.pending() if self.learning.enabled else None
+            prepare_daily = bool(pending and not pending.get("prepared_run")
+                                 and self.now().astimezone(KST).time() < daytime(9))
+            if not self.stopping and (prepare_daily or candidate is None
+                                     or candidate["status"] == "complete" and not candidate.get("stale")):
                 self._analyze(automatic_retry=True)
                 self._success("analyze")
                 analysis_completed = True
@@ -705,6 +715,7 @@ class ExperimentService:
             if not retry or not failed:
                 self._refresh_shadow(data)
                 self._learn(data, previous)
+                self._prepare_daily(data, previous)
                 return previous
         # An interrupted analysis has no executable result. Keep the attempt
         # separate from immutable completed runs and retry after process recovery.
@@ -733,7 +744,82 @@ class ExperimentService:
         self._refresh_shadow(data)
         self._event("analysis", f"{run['as_of']} 전략 분석 {len(decisions)}건 저장")
         self._learn(data, run)
+        self._prepare_daily(data, run)
         return run
+
+    def _prepare_daily(self, data, baseline):
+        """Freeze next-session signals without exposing an unactivated run."""
+        from backend.daily_policy import market_input_hash
+        from backend.experiment_analysis import analysis_version, build_snapshot
+        from backend.learning_policy import build_frame, policy_id, signals
+        if not self.learning.enabled or self._policy().get("execution_strategy") != ALL_STRATEGIES:
+            return False
+        pending = self.learning.daily.pending()
+        if not pending or pending.get("prepared_run"):
+            return False
+        current = self.now().astimezone(KST)
+        signal_day = str(data["as_of"])
+        if (pending["signal_day"] != signal_day or signal_day > current.date().isoformat()
+                or signal_day == current.date().isoformat() and current.time() < daytime(16)
+                or signal_day < current.date().isoformat() and current.time() >= daytime(9)
+                or market_input_hash(data) != pending["market_input_hash"]):
+            return False
+        frame = build_frame(data)
+        normalized = build_snapshot(**data)
+        version = analysis_version(self.config_path)
+        digestable = {key: value for key, value in normalized.items() if key != "observed_at"}
+        digestable["analysis_version"] = version
+        base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
+        candidate = pending["policy"]
+        learned = candidate["kind"] == "rules"
+        key = (hashlib.sha256(encode([base_key, policy_id(candidate), self.learning.version,
+            {key: value for key, value in frame.items() if key != "observed_at"}]).encode()).hexdigest()
+               if learned else base_key)
+        decisions = [item for item in baseline["signals"] if not item.get("policy_id")]
+        if learned:
+            decisions += signals(candidate, frame)
+        analysis = {"decisions": decisions, "input_hash": baseline["input_hash"], "version_id": version,
+                    "llm_status": baseline.get("llm_status"), "input": normalized}
+        run = {"id": uuid4().hex, "as_of": signal_day, "created_at": self._timestamp(),
+               "status": "ready", "input_hash": baseline["input_hash"], "version_id": version,
+               "collection_hash": key, "signals": decisions, "error": baseline.get("error"),
+               "llm_status": baseline.get("llm_status"), "analysis": analysis,
+               "learning_policy": candidate, "learning_engine_version": self.learning.version,
+               "daily_decision_id": pending["decision_id"]}
+        return self.learning.daily.prepare(pending, run)
+
+    def _activate_daily(self, today, days):
+        """The broker's first traded bar confirms the day; signals predate its open."""
+        from backend.daily_policy import market_input_hash
+        from backend.experiment_analysis import analysis_version
+        from backend.learning_compatibility import version_matches
+        if not self.learning.enabled or self._policy().get("execution_strategy") != ALL_STRATEGIES:
+            return False
+        pending = self.learning.daily.pending()
+        if not pending or not isinstance(pending.get("prepared_run"), dict):
+            return False
+        run = pending["prepared_run"]
+        sessions = sorted(set(days))
+        following = [day for day in sessions if day > pending["signal_day"]]
+        if (pending["signal_day"] not in sessions or not following or following[0] != today.isoformat()
+                or run["as_of"] != pending["signal_day"]
+                or stamp(run["created_at"]) >= datetime.combine(today, daytime(9), KST)
+                or run.get("version_id") != analysis_version(self.config_path)
+                or not version_matches(run.get("learning_engine_version"), self.learning.version)):
+            return False
+        try:
+            current = self.input_reader()
+            unchanged = (str(current["as_of"]) == pending["signal_day"]
+                         and market_input_hash(current) == pending["market_input_hash"])
+        except Exception:
+            self.learning.daily.note("error", "정책 적용 전 시장 자료를 확인하지 못했습니다. 기존 정책을 유지합니다.",
+                                     fingerprint=pending["fingerprint"])
+            return False
+        if not unchanged:
+            self.learning.daily.note("blocked", "준비한 정책의 시장 자료가 변경되어 적용을 보류합니다.",
+                                     fingerprint=pending["fingerprint"])
+            return False
+        return self.learning.daily.activate(pending, effective_day=today.isoformat())
 
     def _learn(self, data, run):
         policy = self._policy()
@@ -800,7 +886,7 @@ class ExperimentService:
                 self.now().astimezone(KST).date(), daytime(9), KST):
             return
         state = self.learning.state()
-        policies = [BASELINE_POLICY, self.learning.champion()]
+        policies = [BASELINE_POLICY, self.learning.active_policy()]
         if state.get('trial'):
             policies.append(state['trial']['policy'])
         wanted = {row['symbol'] for candidate in policies for row in signals(candidate, frame)}
@@ -1116,9 +1202,18 @@ class ExperimentService:
                          f"exit:{position['entry_id']}:{today.isoformat()}", run_id=None)
         if protected:
             return
+        self._activate_daily(today, days)
         # The latest completed analysis must have existed before this session opened.
         runs = [run for run in self.store.runs(100, details=False) if run["as_of"] == prior_days[-1]
                 and stamp(run["created_at"]) < datetime.combine(today, daytime(9), KST)]
+        adopted = self._adopted_policy()
+        if adopted:
+            from backend.learning_policy import BASELINE_POLICY, policy_id
+            runs = [run for run in runs
+                    if policy_id(run.get("learning_policy") or BASELINE_POLICY) == policy_id(adopted)]
+            active = self.learning.daily.active()
+            if active and active.get("effective_day") == today.isoformat():
+                runs = [run for run in runs if run["id"] == active["run_id"]]
         if not runs:
             self._issue("analysis_missing", "직전 거래일의 장전 완료 분석이 없어 신규 진입을 기다립니다.", blocking=False)
             return
@@ -1126,11 +1221,7 @@ class ExperimentService:
         if not self.store.setting("enabled", False) or self._blocked():
             return
         run = runs[0]
-        adopted = self._adopted_policy()
         if adopted:
-            from backend.learning_policy import BASELINE_POLICY, policy_id
-            if policy_id(run.get("learning_policy") or BASELINE_POLICY) != policy_id(adopted):
-                return  # New policy needs its own completed pre-open signals.
             from backend.learning_compatibility import version_matches
             if adopted["kind"] == "rules" and not version_matches(run.get("learning_engine_version"), self.learning.version):
                 return

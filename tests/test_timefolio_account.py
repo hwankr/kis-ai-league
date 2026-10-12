@@ -22,7 +22,9 @@ BINDING = {"source_account": "competition", "source_fingerprint": "private-sourc
 def observation():
     value = snapshot()
     value.update(account_key=BINDING["account_key"], contest=BINDING["contest"],
-                 nav=["1,000.08", "0.08 (0.01%)", "327위 / 2071명"])
+                 nav=["1,000.08", "0.08 (0.01%)", "327위 / 2071명"],
+                 guideline={"current_text": "금주 2.3%", "current_color": "red",
+                            "confirmed_text": "금주 제외 (확정) 누적 0번 위반"})
     value["tables"][0] = grid("positions", ["prodId", "prodNm", "close", "chPct", "pos", "wei", "avgPrc"],
                               [("pos1", ["005930", "삼성전자", "100", "-1.23", "3", "1.234", "90.1234"])])
     return value
@@ -179,6 +181,8 @@ class TimefolioAccountTests(unittest.TestCase):
                 self.assertIsNone(result["summary"])
                 self.assertEqual(result["holdings"], [])
                 self.assertEqual(result["orders"], [])
+                self.assertIsNone(result["turnover"]["current_pct"])
+                self.assertIsNone(result["turnover"]["missed_weeks"])
                 self.binding()
 
     def test_binding_change_during_collection_is_not_published(self):
@@ -232,6 +236,111 @@ class TimefolioAccountTests(unittest.TestCase):
         saved["snapshot"]["orders"][0]["token"] = "private-token"
         _write(path, saved)
         self.assertNotIn("private", json.dumps(self.read()))
+
+    def publish_guideline(self, guideline, *, session_date="2026-10-12", now=NOW):
+        value = observation()
+        value.update(guideline=guideline, session_date=session_date)
+        self.browser.account_snapshot.return_value = parse_account_snapshot(value, BINDING["account_key"], BINDING["contest"])
+        self.collector.next_at = 0
+        self.collector.tick()
+        return self.read(now=now)["turnover"]
+
+    def test_turnover_uses_official_display_and_confirmed_count(self):
+        self.collector.tick()
+        self.assertEqual(self.read()["turnover"], {
+            "week_start": "2026-10-12", "week_end": "2026-10-16", "current_pct": "2.3",
+            "target_pct": 5, "status": "below", "missed_weeks": 0, "max_missed_weeks": 3,
+            "source": "official_guideline"})
+        saved = json.loads((self.root / ".local" / "timefolio-account.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["snapshot"]["turnover"]["official_status"], "below")
+        self.assertNotIn("confirmed_text", json.dumps(saved))
+
+    def test_rounded_five_requires_official_color_and_preserves_display_precision(self):
+        for color, expected in (("red", "below"), ("black", "met"),
+                                ("rgb(255, 0, 0)", "below"), ("rgb(0, 0, 0)", "met"),
+                                ("", "unknown"), ("green", "unknown"), ([], "unknown")):
+            with self.subTest(color=color):
+                result = self.publish_guideline({"current_text": "금주 5.0%", "current_color": color})
+                self.assertEqual(result["current_pct"], "5.0")
+                self.assertEqual(result["status"], expected)
+                self.assertIsNone(result["missed_weeks"])
+
+    def test_conflicting_official_color_does_not_claim_compliance(self):
+        for display, color in (("4.9", "black"), ("5.1", "red")):
+            with self.subTest(display=display):
+                result = self.publish_guideline({"current_text": f"금주 {display}%", "current_color": color})
+                self.assertEqual(result["current_pct"], display)
+                self.assertEqual(result["status"], "unknown")
+
+    def test_projected_violations_are_not_confirmed_missed_weeks(self):
+        for text in ("금주 포함 (예상) 누적 4번 위반", "누적 4번 위반", "금주 제외 (확정) 누적 -1번 위반"):
+            with self.subTest(text=text):
+                result = self.publish_guideline({"current_text": "금주 2.3%", "current_color": "red", "confirmed_text": text})
+                self.assertIsNone(result["missed_weeks"])
+        result = self.publish_guideline({"confirmed_text": "금주 제외 (확정) 누적 4번 위반"})
+        self.assertEqual(result["missed_weeks"], 4)
+        self.assertIsNone(result["current_pct"])
+        self.assertEqual(result["status"], "unknown")
+
+    def test_missing_or_invalid_guideline_does_not_invent_turnover_or_drop_balance(self):
+        for value in (None, {}, "private", {"current_text": "금주 NaN%", "current_color": "black"},
+                      {"current_text": "금주 -1.0%", "current_color": "red"},
+                      {"current_text": "금주 5.00%", "current_color": "black"}):
+            with self.subTest(value=value):
+                result = self.publish_guideline(value)
+                self.assertIsNone(result["current_pct"])
+                self.assertIsNone(result["missed_weeks"])
+                self.assertIsNone(result["source"])
+                self.assertEqual(result["status"], "unknown")
+                self.assertEqual(self.read()["summary"]["nav"], "1000.08")
+
+    def test_old_week_and_future_session_do_not_become_current_week_progress(self):
+        for session_date in ("2026-10-09", "2026-10-13"):
+            with self.subTest(session_date=session_date):
+                result = self.publish_guideline(observation()["guideline"], session_date=session_date)
+                self.assertEqual(result["week_start"], "2026-10-12")
+                self.assertIsNone(result["current_pct"])
+                self.assertIsNone(result["missed_weeks"])
+                self.assertIsNone(result["source"])
+                self.assertEqual(result["status"], "unknown")
+
+    def test_week_rollover_uses_korean_date(self):
+        self.collector.tick()
+        sunday = datetime(2026, 10, 18, 14, 59, tzinfo=timezone.utc)
+        self.assertEqual(self.read(now=sunday)["turnover"]["current_pct"], "2.3")
+        monday = sunday + timedelta(minutes=1)
+        result = self.read(now=monday)["turnover"]
+        self.assertEqual(result["week_start"], "2026-10-19")
+        self.assertIsNone(result["current_pct"])
+        self.assertEqual(result["status"], "unknown")
+
+    def test_october_fifth_week_is_exempt_and_regular_week_resumes(self):
+        result = self.publish_guideline(observation()["guideline"], session_date="2026-10-08",
+                                        now=datetime(2026, 10, 8, 1, tzinfo=timezone.utc))
+        self.assertEqual((result["week_start"], result["week_end"], result["status"]),
+                         ("2026-10-05", "2026-10-09", "exempt"))
+        self.assertEqual(self.publish_guideline(observation()["guideline"])["status"], "below")
+
+    def test_legacy_saved_snapshot_without_turnover_is_backward_compatible(self):
+        self.browser.account_snapshot.return_value.pop("turnover")
+        self.collector.tick()
+        result = self.read()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["turnover"]["status"], "unknown")
+        self.assertIsNone(result["turnover"]["current_pct"])
+        self.assertIsNone(result["turnover"]["missed_weeks"])
+
+    def test_malformed_saved_turnover_is_unknown_without_exposing_raw_fields(self):
+        self.collector.tick()
+        path = self.root / ".local" / "timefolio-account.json"
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        saved["snapshot"]["turnover"].update(current_pct="NaN", missed_weeks="private", secret="private")
+        _write(path, saved)
+        result = self.read()
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNone(result["turnover"]["current_pct"])
+        self.assertEqual(result["turnover"]["status"], "unknown")
+        self.assertNotIn("private", json.dumps(result))
 
 
 if __name__ == "__main__":

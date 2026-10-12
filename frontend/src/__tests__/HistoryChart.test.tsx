@@ -49,10 +49,10 @@ describe('asset history chart', () => {
 
   it('distinguishes empty history from observations with missing total values', () => {
     const view = render(chart(data([])));
-    expect(element('history-empty').textContent).toBe('저장된 조회 이력이 없습니다');
+    expect(element('history-empty').textContent).toBe('저장된 이력 없음');
     expect(element('history-chart').hasAttribute('hidden')).toBe(true);
     view.rerender(chart(data([null, ''])));
-    expect(element('history-empty').textContent).toBe('총자산 값이 있는 이력이 없습니다');
+    expect(element('history-empty').textContent).toBe('총자산 값 미확인');
     expect(element('asset-history').dataset.observationCount).toBe('2');
     expect(element('asset-history').dataset.pointCount).toBe('0');
   });

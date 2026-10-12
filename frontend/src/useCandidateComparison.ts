@@ -69,21 +69,33 @@ function readComparison(value: unknown): CandidateComparisonData {
   return { ...data, rows } as unknown as CandidateComparisonData;
 }
 
-export default function useCandidateComparison() {
+export default function useCandidateComparison(enabled = true) {
   const [data, setData] = useState<CandidateComparisonData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(enabled && !document.hidden);
   const [error, setError] = useState<string | null>(null);
-  const session = useRef({ mounted: false, generation: 0, controller: null as AbortController | null,
-    timeout: undefined as number | undefined, status: 'idle' as CandidateComparisonData['status'], verified: false });
+  const session = useRef({ mounted: false, enabled: false, generation: 0, controller: null as AbortController | null,
+    timeout: undefined as number | undefined, poll: undefined as number | undefined,
+    status: 'idle' as CandidateComparisonData['status'], verified: false });
+
+  const cancel = useCallback(() => {
+    const current = session.current;
+    ++current.generation;
+    current.controller?.abort();
+    window.clearTimeout(current.timeout);
+    window.clearTimeout(current.poll);
+    current.controller = null;
+    current.timeout = current.poll = undefined;
+  }, []);
 
   const request = useCallback(async (start = false) => {
     const current = session.current;
-    if (!current.mounted || current.controller || start && (!current.verified || current.status === 'running')) return;
+    if (!current.mounted || !current.enabled || document.hidden || current.controller
+      || start && (!current.verified || current.status === 'running')) return;
     const controller = new AbortController();
     const generation = ++current.generation;
     current.controller = controller;
     setLoading(true);
-    const isCurrent = () => current.mounted && current.generation === generation;
+    const isCurrent = () => current.mounted && current.enabled && !document.hidden && current.generation === generation;
     const timeout = window.setTimeout(() => controller.abort(), 25_000);
     current.timeout = timeout;
     try {
@@ -124,22 +136,30 @@ export default function useCandidateComparison() {
   useEffect(() => {
     const current = session.current;
     current.mounted = true;
-    void request();
+    current.enabled = enabled;
+    const onVisibility = () => {
+      if (document.hidden) {
+        cancel();
+        setLoading(false);
+      } else if (enabled) void request();
+    };
+    if (enabled) void request();
+    if (!enabled || document.hidden) setLoading(false);
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
       current.mounted = false;
-      ++current.generation;
-      current.controller?.abort();
-      window.clearTimeout(current.timeout);
-      current.controller = null;
-      current.timeout = undefined;
+      current.enabled = false;
+      cancel();
+      document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [request]);
+  }, [enabled, request, cancel]);
 
   useEffect(() => {
-    if (data?.status !== 'running' || loading) return;
+    if (!enabled || document.hidden || data?.status !== 'running' || loading) return;
     const timer = window.setTimeout(() => { void request(); }, 2_000);
+    session.current.poll = timer;
     return () => window.clearTimeout(timer);
-  }, [data, loading, request]);
+  }, [data, loading, enabled, request]);
 
   const start = useCallback(() => request(true), [request]);
   const refresh = useCallback(() => request(), [request]);

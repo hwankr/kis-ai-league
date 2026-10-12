@@ -108,7 +108,6 @@ export default function CandidateComparison({ data, loading, error, onStart, onR
       </button>
     </div>
     <div className="candidate-meta">
-      <span>대회 대상 종목 전체</span>
       <span className={`candidate-state ${error || data?.error || data?.stale ? 'candidate-stale' : ''}`} role="status">
         {status}{data?.stale && rows.length > 0 && status !== '이전 결과' ? ' · 이전 결과' : ''}
         {running ? ` · ${number(data.progress.completed)} / ${number(data.progress.total)}` : ''}
@@ -125,7 +124,7 @@ export default function CandidateComparison({ data, loading, error, onStart, onR
       <button type="button" className="candidate-retry" disabled={loading} onClick={onRefresh}>상태 다시 확인</button></div> : null}
     {data ? <p className="candidate-counts" aria-label="전체 비교 집계">
       {screening ? <strong>일봉 비교</strong> : null}
-      <span>전체 {number(data.universe.count)}</span><span>성공 {number(counts.ok)}</span><span>제외 {number(counts.excluded)}</span><span>실패 {number(counts.error)}</span>
+      <span>성공 {number(counts.ok)}</span><span>제외 {number(counts.excluded)}</span><span>실패 {number(counts.error)}</span>
     </p> : null}
     {screening ? <div className="candidate-screening">
       <p className="candidate-counts" aria-label="후보 선별 집계">

@@ -1,7 +1,6 @@
-"""Prospective policy research, independent of the order worker.
+"""Daily provisional research and the preserved long-horizon evaluation mode.
 
-One frozen challenger is compared with its incumbent on new daily observations.
-Development data never count toward promotion. No broker or order API is used.
+Neither research path grants order permission or calls a broker API.
 """
 from copy import deepcopy
 from datetime import datetime, time, timezone
@@ -12,7 +11,7 @@ import threading
 
 from backend.experiment_store import encode
 from backend.kis import KST
-from backend.learning_compatibility import version_matches
+from backend.learning_compatibility import scorecard_version_matches, version_matches
 from backend.request_gate import file_lock
 
 def _hash(value):
@@ -20,7 +19,8 @@ def _hash(value):
 
 
 class LearningService:
-    def __init__(self, store, *, enabled, now, proposer=None, evaluator=None, llm_factory=None, development_reader=None):
+    def __init__(self, store, *, enabled, now, proposer=None, evaluator=None, llm_factory=None, development_reader=None,
+                 daily_enabled=False, daily_evaluator=None):
         self.store, self.enabled, self.now = store, enabled, now
         from backend.learning_account import LearningAccount
         LearningAccount(store)
@@ -31,6 +31,7 @@ class LearningService:
         self.lock = threading.Lock()
         self.pending = None
         self.attempted = None
+        self.retry_after = None
         self.version = hashlib.sha256(b''.join(Path(__file__).with_name(name).read_bytes() for name in (
             'learning.py', 'learning_policy.py', 'learning_evaluation.py', 'learning_account.py',
             'learning_attribution.py'))).hexdigest()
@@ -43,6 +44,13 @@ class LearningService:
                 CREATE TABLE IF NOT EXISTS learning_trials
                     (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL);
             """)
+        from backend.daily_policy import DailyPolicyService
+        self.daily = DailyPolicyService(store, enabled=enabled and daily_enabled, now=now,
+                                       fallback_policy=self.champion, evaluator=daily_evaluator,
+                                       stopping=lambda: self.stopping)
+
+    def active_policy(self):
+        return self.daily.policy() if self.daily.enabled else self.champion()
 
     def _timestamp(self):
         return self.now().astimezone(timezone.utc).isoformat(timespec="microseconds")
@@ -70,6 +78,9 @@ class LearningService:
         from backend.learning_account import confirmed_execution_orders
         from backend.learning_policy import policy_id
         history = self.history()
+        if self.daily.enabled:
+            history = [{**item['proposal'], 'candidate_id': policy_id(item['proposal']['policy']),
+                        'decision': item['decision']} for item in self.daily.history() if item.get('proposal')] + history
         fingerprint = (self.store.setting("policy") or {}).get("fingerprint")
         groups = {}
         for order in self.store.orders():
@@ -89,7 +100,7 @@ class LearningService:
                     "fill_ratio": sum(order["filled_quantity"] / order["quantity"] for order in terminal) / len(terminal) if terminal else None}
         for item in history:
             item["execution"] = execution(item["candidate_id"])
-        champion = self.champion()
+        champion = self.active_policy()
         return [{"policy": champion, "candidate_id": policy_id(champion), "decision": "execution_feedback",
                  "execution": execution(policy_id(champion))}, *history]
 
@@ -105,7 +116,7 @@ class LearningService:
                                "started_at": trial["created_at"],
                                "sessions": trial.get('elapsed_intervals', 0)} if trial else None,
                 "last_evaluation": state.get("last_evaluation"), "last_change": state.get("last_change"),
-                "error": state.get("error")}
+                "error": state.get("error"), **({'daily': self.daily.snapshot()} if self.daily.enabled else {})}
 
     def _start_ready(self, as_of, context):
         if context is None:
@@ -127,6 +138,8 @@ class LearningService:
         # A settled book may unlock the same frozen daily input. Changes to cash
         # alone must not reroll a candidate or duplicate a running proposal.
         with self.lock:
+            if self.retry_after and self.now() < self.retry_after:
+                return
             if self.attempted == attempt:
                 self.pending = None  # The latest state supersedes a queued handoff.
                 return
@@ -159,9 +172,17 @@ class LearningService:
                 return
             except Exception:
                 # Research failure is visible but never changes order permission.
-                state = self.state()
-                state.update(status="error", error="개선 실험을 완료하지 못했습니다. 다음 완료 자료에서 재시도합니다.")
-                self.store.save_setting("learning", state)
+                if self.daily.enabled:
+                    from datetime import timedelta
+                    self.daily.note('error', '일일 개선 평가 오류 · 기존 정책 유지',
+                                    fingerprint=limits.get('fingerprint'))
+                    with self.lock:
+                        self.retry_after = self.now() + timedelta(minutes=5)
+                        self.attempted = None
+                else:
+                    state = self.state()
+                    state.update(status="error", error="개선 실험을 완료하지 못했습니다. 다음 완료 자료에서 재시도합니다.")
+                    self.store.save_setting("learning", state)
 
     def _save(self, state, trial=None):
         from backend.learning_policy import policy_id
@@ -252,7 +273,7 @@ class LearningService:
             score.update(baseline_return_pct=0., status='ready')
         elif score['status'] != 'invalid':
             previous = next((item for item in frames if item['as_of'] == state.get('scorecard_day')), None)
-            if previous is None or not version_matches(state.get('scorecard_engine'), self.version):
+            if previous is None or not scorecard_version_matches(state.get('scorecard_engine'), self.version):
                 score.update(status='invalid', baseline_return_pct=None, error='최초 정책 비교 자료 또는 평가 버전 변경')
             else:
                 result = portfolio_metrics(BASELINE_POLICY, [previous, frame], state['scorecard_limits'],
@@ -277,6 +298,8 @@ class LearningService:
         return attribute_trial(trial, cohort)
 
     def process(self, data, baseline_signals, limits, *, context=None):
+        if self.daily.enabled:
+            return self._process_daily(data, baseline_signals, limits, context=context)
         from backend.learning_policy import BASELINE_POLICY, build_frame, policy_id, portfolio_metrics, validate_policy
         from backend.learning_research import propose_candidate
         from backend.learning_evaluation import make_evaluation_spec, evaluate_candidate, evaluate_scenarios
@@ -451,3 +474,52 @@ class LearningService:
             state.update(trial=trial, trial_sequence=sequence)
         state.update(status='evaluating', processed_day=frame['as_of'])
         self._save(state, state.get('trial'))
+
+    def _process_daily(self, data, baseline_signals, limits, *, context=None):
+        """Keep original trial evidence intact while researching each completed day."""
+        from backend.learning_policy import build_frame
+        from backend.learning_research import propose_candidate
+        from backend.learning_benchmarks import refresh_market_comparison
+        if not self.enabled or self.stopping:
+            return
+        current = self.now().astimezone(KST)
+        if str(data['as_of']) != current.date().isoformat() or current.time() < time(16):
+            return
+        frame = build_frame(data, baseline_signals)
+        frame['captured_at'] = self._timestamp()
+        frame['execution_quotes'] = deepcopy((context or {}).get('execution_quotes', {}))
+        digest = _hash({key: value for key, value in frame.items() if key not in {'observed_at', 'captured_at'}})
+        with self.store.connect() as db:
+            prior = db.execute('SELECT payload FROM learning_frames WHERE day=?', (frame['as_of'],)).fetchone()
+            if prior is None:
+                db.execute('INSERT INTO learning_frames VALUES (?,?,?)', (frame['as_of'], digest, encode(frame)))
+        if prior:
+            frozen = json.loads(prior[0])
+            ignored = {'observed_at', 'captured_at', 'benchmark_prices'}
+            if ({key: value for key, value in frozen.items() if key not in ignored}
+                    != {key: value for key, value in frame.items() if key not in ignored}
+                    or any(frame.get('benchmark_prices', {}).get(key) != value
+                           for key, value in frozen.get('benchmark_prices', {}).items())):
+                self.daily.note('blocked', '같은 거래일의 관측 자료 변경 · 원본 유지',
+                                fingerprint=limits.get('fingerprint'))
+                return
+        frames = self.frames()
+        if not frames or frames[-1]['as_of'] != frame['as_of']:
+            return
+        state = self.state()
+        book = (context or {}).get('initial_state')
+        fingerprint = limits.get('fingerprint') or (self.store.setting('policy') or {}).get('fingerprint')
+        if book:
+            model = deepcopy((context or {}).get('execution_model') or {'mode': 'daily_open'})
+            self._scorecard(state, frames, limits, model, fingerprint, book)
+            refresh_market_comparison(self.store, state, data, self._timestamp())
+            self._save(state)
+        development = frames
+        if self.development_reader:
+            historical = self.development_reader(data)
+            combined = {item['as_of']: item for item in historical if item['as_of'] <= frame['as_of']}
+            combined.update({item['as_of']: item for item in frames})
+            development = [combined[day] for day in sorted(combined)][-120:]
+        self.daily.process(data, development, limits, self._research_history(), context=context,
+                           proposer=self.proposer or propose_candidate,
+                           llm=self.llm_factory() if self.llm_factory else None)

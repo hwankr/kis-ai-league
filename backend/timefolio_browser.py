@@ -46,6 +46,28 @@ GRID_DOM = """table => {
 }"""
 
 
+# Read only the official guideline cells; violation-count colors have a
+# different meaning from the weekly-turnover status color.
+GUIDELINE_DOM = """() => {
+ const tables = Array.from(document.querySelectorAll('table.guideline-tab'));
+ if (tables.length !== 1) return null;
+ const rows = Array.from(tables[0].rows).filter(r => r.closest('table') === tables[0]);
+ const text = e => e?.innerText.replace(/\\s+/g, ' ').trim() || '';
+ const label = e => Array.from(e?.childNodes || []).filter(n => n.nodeType === 3)
+   .map(n => n.textContent).join('').trim();
+ const weekly = rows.filter(r => label(r.cells[0]) === '주간 회전율' &&
+   r.cells[0].title === '주간 순자산 대비 평균 거래대금 비율' &&
+   text(r.cells[1]) === '매주 5% 이상 유지');
+ const violations = rows.filter(r => text(r.cells[0]) === '주간회전율 위반' &&
+   text(r.cells[1]) === '위반 3번까지 허용 4번 이상 순위/시상 제외');
+ const spans = weekly.length === 1 ? Array.from(weekly[0].cells[2]?.children || [])
+   .filter(e => e.tagName === 'SPAN') : [];
+ const current = spans.length === 1 ? spans[0] : null;
+ return {current_text: text(current), current_color: current?.style.color || '',
+   confirmed_text: violations.length === 1 ? text(violations[0].cells[2]) : ''};
+}"""
+
+
 def _row_identity(row):
     cells = row["cells"]
     key = tuple((column, cell.get("id")) for column, cell in cells.items())
@@ -417,6 +439,11 @@ class TimefolioBrowser:
         tables.append(self._grid(self._table("genT"), "orders"))
         return tables
 
+    def _guideline(self):
+        self.page.get_by_role("button", name="가이드라인 위반", exact=True).click()
+        self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        return self.page.evaluate(GUIDELINE_DOM)
+
     def _observation(self, *, symbols=(), receipts_only=False, account_view=False):
         from backend.timefolio_dom import parse_receipts, parse_snapshot
         if account_view and receipts_only:
@@ -434,6 +461,7 @@ class TimefolioBrowser:
             }""")
         tables = [] if receipts_only else [self._grid(self._table("pos"), "positions"),
                                            self._grid(self._table("w2o"), "targets")]
+        guideline = self._guideline() if account_view else None
         tables.extend(self._receipt_tables())
         self._binding()
         if self._date() != session_date:
@@ -445,7 +473,7 @@ class TimefolioBrowser:
                    "session_date": session_date, "tables": tables, "known_receipts": known}
         if account_view:
             from backend.timefolio_account import parse_account_snapshot
-            return parse_account_snapshot({**payload, "nav": nav}, account, self.contest)
+            return parse_account_snapshot({**payload, "nav": nav, "guideline": guideline}, account, self.contest)
         if receipts_only:
             return parse_receipts(payload, account, self.contest)
         return parse_snapshot(payload, symbols, account, self.contest)

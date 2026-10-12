@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import App from '../App';
 import StockChart from '../components/StockChart';
 import useStockChart from '../useStockChart';
+import { navigate } from '../usePageNavigation';
 import type { StockChartData } from '../types';
 import { catalog, deferred, element, marketData, quote, response, snapshot, tradeHistory } from './fixtures';
 
@@ -59,7 +60,7 @@ describe('stock chart', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(element('stock-chart').dataset.interval).toBe('5m');
-    expect(screen.getByText('종목을 선택하거나 코드를 입력해 조회하세요')).toBeTruthy();
+    expect(screen.getByText('종목 선택 전')).toBeTruthy();
     view.unmount();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -313,5 +314,110 @@ describe('stock chart', () => {
     expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/chart?')).map(([url]) => url))
       .toEqual(['/api/chart?symbol=005930&interval=day']);
     await waitFor(() => expect(document.activeElement).toBe(element('page-title')));
+  });
+});
+
+describe('chart query activity', () => {
+  it('blocks inactive queries and refreshes while retaining selection and cache without an activation auto-query', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(chartData()));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(({ enabled }) => useStockChart(enabled), { initialProps: { enabled: false } });
+    await act(async () => { await view.result.current.query('005930', 'day'); await view.result.current.refresh(); });
+    expect(fetchMock).not.toHaveBeenCalled();
+    view.rerender({ enabled: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await act(async () => view.result.current.query('005930', 'day'));
+    const saved = view.result.current.data;
+    view.rerender({ enabled: false });
+    await act(async () => { await view.result.current.query('000660', '5m'); await view.result.current.refresh(); });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(view.result.current.request).toEqual({ symbol: '005930', interval: 'day' });
+    expect(view.result.current.data).toBe(saved);
+    view.rerender({ enabled: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await act(async () => view.result.current.query('005930', 'day'));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts on exit and rejects a late chart response after reentry', async () => {
+    const pending = deferred<Response>();
+    const fetchMock = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValue(response(chartData({ symbol: '000660' })));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(({ enabled }) => useStockChart(enabled), { initialProps: { enabled: true } });
+    act(() => { void view.result.current.query('005930', 'day'); });
+    view.rerender({ enabled: false });
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(view.result.current.loading).toBe(false);
+    view.rerender({ enabled: true });
+    await act(async () => view.result.current.query('000660', 'day'));
+    await act(async () => pending.resolve(response(chartData())));
+    expect(view.result.current.data?.symbol).toBe('000660');
+    expect(view.result.current.error).toBeNull();
+  });
+
+  it('defers a hidden deep-link query and resumes only an interrupted chart after visibility changes', async () => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    const pending = deferred<Response>();
+    const fetchMock = vi.fn().mockReturnValueOnce(pending.promise)
+      .mockResolvedValue(response(chartData({ updated_at: '2026-10-03T04:05:00Z' })));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(() => useStockChart());
+    await act(async () => view.result.current.query('005930', 'day'));
+    expect(fetchMock).not.toHaveBeenCalled();
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve(response(chartData())));
+    expect(view.result.current.data?.updated_at).toBe('2026-10-03T04:05:00Z');
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    view.unmount();
+  });
+
+  it('retains a completed chart on visibility return without querying it again', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(chartData()));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(() => useStockChart());
+    await act(async () => view.result.current.query('005930', 'day'));
+    const saved = view.result.current.data;
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(view.result.current.data).toBe(saved);
+    await act(async () => view.result.current.refresh());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/chart?symbol=005930&interval=day&refresh=1');
+  });
+
+  it('does not revive a completed chart after an invalid chart URL and visibility return with automatic refresh off', async () => {
+    window.history.replaceState(null, '', '/#/chart?symbol=005930&interval=day');
+    const fetchMock = vi.fn((input: RequestInfo | URL) => Promise.resolve(response(
+      String(input).startsWith('/api/chart?') ? chartData() : marketData())));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App/>);
+    await screen.findByRole('slider', { name: '삼성전자 일봉 차트' });
+    fireEvent.click(screen.getByRole('switch'));
+    expect((screen.getByRole('switch') as HTMLInputElement).checked).toBe(false);
+    act(() => navigate('#/chart?symbol=INVALID&interval=day'));
+    expect(window.location.hash).toBe('#/chart?symbol=INVALID&interval=day');
+    expect(screen.getByRole('alert').textContent).toContain('차트 주소의 종목코드 또는 주기');
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/chart?')).map(([url]) => url))
+      .toEqual(['/api/chart?symbol=005930&interval=day']);
   });
 });

@@ -36,7 +36,7 @@ describe('account dashboard', () => {
     expect(element('cash').textContent).toBe('10,000,000');
     expect(element('unrealized-return').textContent).toBe('0.00%');
     expect(element('holdings-count').textContent).toBe('0');
-    expect(element('empty-title').textContent).toBe('아직 보유한 주식이 없어요');
+    expect(element('empty-title').textContent).toBe('보유 종목 없음');
     expect(element('updated-at').textContent).toContain('KST');
     expect(element('asset-history').dataset.accountId).toBe('practice');
     expect(element('asset-history').dataset.pointCount).toBe('1');
@@ -92,8 +92,8 @@ describe('account dashboard', () => {
   });
 
   it.each([
-    ['removed', '선택했던 계좌가 목록에 없어요'],
-    ['pending', '이 계좌는 설정이 필요해요'],
+    ['removed', '선택 계좌 없음'],
+    ['pending', '계좌 설정 필요'],
   ])('does not substitute the default for saved selection %s', async (id, message) => {
     localStorage.setItem('kis-dashboard-account', id);
     const fetchMock = mockFetch(() => response(snapshot()));
@@ -130,7 +130,7 @@ describe('account dashboard', () => {
     await refresh();
     expect(element('total-value').textContent).toBe('10,000,000');
     expect(element('asset-history').dataset.pointCount).toBe('1');
-    expect(element('error-notice').textContent).toContain('이전 조회 데이터를 표시');
+    expect(element('error-notice').textContent).toContain('이전 데이터');
     expect(element('connection-label').textContent).toBe('갱신 지연 · 이전 데이터');
     await refresh();
     await connected();
@@ -147,7 +147,7 @@ describe('account dashboard', () => {
     expect(element('total-value').textContent).toBe('—');
     expect(element('asset-history').dataset.pointCount).toBe('1');
     expect(element('history-chart').hasAttribute('hidden')).toBe(false);
-    expect(element('error-notice').textContent).not.toContain('이전 조회 데이터를');
+    expect(element('error-notice').textContent).not.toContain('이전 데이터');
   });
 
   it('marks a cached error response as stale while retaining its values and observation count', async () => {
@@ -160,7 +160,7 @@ describe('account dashboard', () => {
     expect(element('total-value').textContent).toBe('9,500,000');
     expect(element('connection-label').textContent).toBe('갱신 지연 · 이전 데이터');
     expect(element('asset-history').dataset.observationCount).toBe('1');
-    expect(element('error-notice').textContent).toContain('이전 조회 데이터를 표시');
+    expect(element('error-notice').textContent).toContain('이전 데이터');
   });
 
   it('clears existing data when the selected account disappears on catalog refresh', async () => {
@@ -173,7 +173,7 @@ describe('account dashboard', () => {
     await refresh();
     expect(element('total-value').textContent).toBe('—');
     expect(element('asset-history').dataset.pointCount).toBe('0');
-    expect(element('error-notice').textContent).toContain('선택했던 계좌가 목록에 없어요');
+    expect(element('error-notice').textContent).toContain('선택 계좌 없음');
     expect(fetchMock.mock.calls.map(([url]) => url)).not.toContain('/api/account?account=league');
   });
 
@@ -198,6 +198,41 @@ describe('account dashboard', () => {
     expect(element('total-value').textContent).toBe('—');
     expect(element('asset-history').dataset.pointCount).toBe('0');
     expect(element('error-notice').hidden).toBe(false);
+  });
+
+  it.each(['account', 'trades'])('resumes the interrupted initial %s lookup with automatic refresh disabled', async page => {
+    vi.useFakeTimers();
+    window.history.replaceState(null, '', `/#/${page}`);
+    const old = deferred<Response>();
+    let requests = 0;
+    let oldUrl = '';
+    let oldSignal: AbortSignal | null = null;
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, options?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/accounts') return Promise.resolve(response(catalog));
+      if (++requests === 1) { oldUrl = url; oldSignal = options?.signal as AbortSignal; return old.promise; }
+      return Promise.resolve(response(page === 'account' ? snapshot('practice', { summary: { total_value: '20000000' } }) : tradeHistory(url)));
+    }));
+    const view = render(<App/>);
+    await act(async () => {});
+    expect(requests).toBe(1);
+    fireEvent.click(screen.getByRole('switch'));
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    fireEvent(document, new Event('visibilitychange'));
+    expect((oldSignal as AbortSignal | null)?.aborted).toBe(true);
+    await act(async () => old.resolve(response(page === 'account'
+      ? snapshot('practice', { summary: { total_value: '999999' } }) : tradeHistory(oldUrl))));
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(requests).toBe(1);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => { fireEvent(document, new Event('visibilitychange')); });
+    expect(requests).toBe(2);
+    if (page === 'account') expect(element('total-value').textContent).toBe('20,000,000');
+    else expect(element('trades-count').textContent).toBe('0');
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(requests).toBe(2);
+    view.unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('has one refresh timer in StrictMode, pauses while hidden, and cleans up on unmount', async () => {

@@ -9,6 +9,7 @@ import CandidateComparison from './components/CandidateComparison';
 import ResearchObservation from './components/ResearchObservation';
 import ExperimentLab from './components/ExperimentLab';
 import OperationsPanel from './components/OperationsPanel';
+import CompetitionProgress from './components/CompetitionProgress';
 import TimefolioAccount from './components/TimefolioAccount';
 import { number, percent, signClass, timestamp } from './format';
 import useAccountDashboard from './useAccountDashboard';
@@ -19,27 +20,27 @@ import usePageNavigation, { chartHref, navigate, pages } from './usePageNavigati
 import type { ChartInterval } from './types';
 
 export default function App() {
-  const dashboard = useAccountDashboard();
-  const market = useMarketData(dashboard.autoRefresh);
-  const chart = useStockChart();
-  const candidates = useCandidateComparison();
   const route = usePageNavigation();
+  const accountPage = route.page === 'account' || route.page === 'trades';
+  const dashboard = useAccountDashboard({ catalogEnabled: accountPage || route.page === 'experiments',
+    balanceEnabled: route.page === 'account', tradesEnabled: route.page === 'trades' });
+  const market = useMarketData(dashboard.autoRefresh, route.page === 'chart');
+  const chart = useStockChart(route.page === 'chart');
+  const candidates = useCandidateComparison(route.page === 'candidates');
   const content = useRef<HTMLElement>(null);
   const previousPage = useRef(route.page);
-  const accountPage = route.page === 'account' || route.page === 'trades';
   const ownRefresh = route.page === 'experiments' || route.page === 'timefolio';
-  const pageLoading = route.page === 'chart' ? market.loading : dashboard.loading;
+  const pageLoading = route.page === 'chart' ? market.loading : route.page === 'trades'
+    ? dashboard.catalogLoading || dashboard.trades.loading : dashboard.loading;
+  const pageError = dashboard.catalogError || (accountPage ? dashboard.selectionError : null)
+    || (route.page === 'account' ? dashboard.error : null);
   const account = dashboard.accounts.find(account => account.id === dashboard.selectedId);
   const summary = dashboard.snapshot?.summary;
   const updated = timestamp(dashboard.snapshot?.updated_at ?? null);
 
   useEffect(() => {
-    if (route.request) void chart.query(route.request.symbol, route.request.interval);
+    if (route.page === 'chart' && route.request) void chart.query(route.request.symbol, route.request.interval);
   }, [route.page, route.request?.symbol, route.request?.interval, chart.query]);
-
-  useEffect(() => {
-    if (route.page === 'candidates') void candidates.refresh();
-  }, [route.page, candidates.refresh]);
 
   useLayoutEffect(() => {
     const changedPage = previousPage.current !== route.page;
@@ -106,11 +107,13 @@ export default function App() {
           </button>
         </div>
       </div>
-      <div id="error-notice" className="error-notice" role="alert" hidden={!accountPage || !dashboard.error}>{dashboard.error}</div>
+      <div id="error-notice" className="error-notice" role="alert" hidden={!(accountPage || route.page === 'experiments') || !pageError}>{pageError}
+        {route.page === 'experiments' && dashboard.catalogError ? <button type="button" className="lab-button" disabled={dashboard.catalogLoading}
+          onClick={() => { void dashboard.refreshCatalog(); }}>계좌 목록 다시 조회</button> : null}</div>
       <p id="refresh-announcement" className="sr-only" role="status" aria-live="polite">{accountPage ? dashboard.announcement : ''}</p>
       {accountPage ? <div className="page-account-picker">
-        <AccountPicker accounts={dashboard.accounts} selectedId={dashboard.selectedId} loading={!dashboard.catalogLoaded && dashboard.loading}
-          emptyLabel={!dashboard.catalogLoaded && !dashboard.loading ? '계좌 목록 확인 필요' : undefined} onSelect={dashboard.selectAccount}/>
+        <AccountPicker accounts={dashboard.accounts} selectedId={dashboard.selectedId} loading={dashboard.catalogLoading}
+          emptyLabel={!dashboard.catalogLoaded && !dashboard.catalogLoading ? '계좌 목록 확인 필요' : undefined} onSelect={dashboard.selectAccount}/>
       </div> : null}
 
       <div className="app-page" hidden={route.page !== 'account'}>
@@ -138,7 +141,6 @@ export default function App() {
             <span id="connection-status" className={`status-badge status-${dashboard.status}`}><span className="status-dot" aria-hidden="true"></span><span id="connection-label">{dashboard.statusLabel}</span></span>
             <dl className="connection-details">
               <div><dt>마지막 조회</dt><dd><time id="updated-at" dateTime={updated.dateTime}>{updated.text}</time></dd></div>
-              <div><dt>조회 범위</dt><dd>국내주식</dd></div>
             </dl>
           </div>
         </aside>
@@ -163,10 +165,10 @@ export default function App() {
         <MarketQuotes data={market.data} loading={market.loading} error={market.error} onSelectSymbol={selectSymbol}/>
       </div>
       <div className="app-page page-content" hidden={route.page !== 'experiments'}>
-        {route.page === 'experiments' ? <div className="operations-room"><OperationsPanel/>
+        {route.page === 'experiments' ? <div className="operations-room"><OperationsPanel/><CompetitionProgress/>
           <ExperimentLab accounts={dashboard.accounts} onSelectSymbol={symbol => { void queryChart(symbol, 'day'); }}/></div> : null}
       </div>
-      <footer className="page-footer"><span>KIS AI League</span>{accountPage ? <span id="account-label">{account?.name ?? '계좌 선택 필요'}</span> : null}</footer>
+      {accountPage ? <footer className="page-footer"><span id="account-label">{account?.name ?? '계좌 선택 필요'}</span></footer> : null}
     </main>
   </>;
 }

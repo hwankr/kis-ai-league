@@ -47,20 +47,35 @@ function readChart(value: unknown, request: ChartRequest): StockChartData {
   return { ...data, bars } as unknown as StockChartData;
 }
 
-export default function useStockChart() {
+export default function useStockChart(enabled = true) {
   const [interval, setInterval] = useState<ChartInterval>('day');
   const [request, setRequest] = useState<ChartRequest | null>(null);
   const [data, setData] = useState<StockChartData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const session = useRef({ mounted: false, generation: 0, controller: null as AbortController | null,
-    timeout: undefined as number | undefined, request: null as ChartRequest | null, cache: new Map<string, StockChartData>() });
+  const session = useRef({ mounted: false, enabled: false, generation: 0, controller: null as AbortController | null,
+    timeout: undefined as number | undefined, request: null as ChartRequest | null,
+    pending: null as ChartRequest | null, cache: new Map<string, StockChartData>() });
+
+  const cancel = useCallback(() => {
+    const current = session.current;
+    ++current.generation;
+    current.controller?.abort();
+    window.clearTimeout(current.timeout);
+    current.controller = null;
+    current.timeout = undefined;
+  }, []);
 
   const query = useCallback(async (symbol: string, requestedInterval: ChartInterval, options: { refresh?: boolean } = {}) => {
     const current = session.current;
     const normalizedSymbol = symbol.trim().toUpperCase();
-    if (!current.mounted || !/^[0-9A-Z]{6}$/.test(normalizedSymbol)) return;
+    if (!current.mounted || !current.enabled || !/^[0-9A-Z]{6}$/.test(normalizedSymbol)) return;
     const next = { symbol: normalizedSymbol, interval: requestedInterval };
+    if (document.hidden) {
+      current.pending = next;
+      return;
+    }
+    current.pending = null;
     const generation = ++current.generation;
     current.controller?.abort();
     window.clearTimeout(current.timeout);
@@ -74,7 +89,7 @@ export default function useStockChart() {
     setData(cached ?? null);
     setError(null);
     setLoading(true);
-    const isCurrent = () => current.mounted && current.generation === generation;
+    const isCurrent = () => current.mounted && current.enabled && !document.hidden && current.generation === generation;
     const timeout = window.setTimeout(() => controller.abort(), 60_000);
     current.timeout = timeout;
     try {
@@ -118,13 +133,29 @@ export default function useStockChart() {
   useEffect(() => {
     const current = session.current;
     current.mounted = true;
+    current.enabled = enabled;
+    if (!enabled) {
+      current.pending = null;
+      setLoading(false);
+    }
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (current.controller) current.pending = current.request;
+        cancel();
+        setLoading(false);
+      } else if (enabled) {
+        const requested = current.pending;
+        if (requested) void query(requested.symbol, requested.interval);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
       current.mounted = false;
-      ++current.generation;
-      current.controller?.abort();
-      window.clearTimeout(current.timeout);
+      current.enabled = false;
+      cancel();
+      document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, []);
+  }, [enabled, query, cancel]);
 
   return { data, request, interval, setInterval, loading, error, query, refresh };
 }

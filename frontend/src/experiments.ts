@@ -28,6 +28,22 @@ export interface AutonomyData {
   daily_reports: { date: string; created_at: string; total_value: string | null; return_pct: string | null;
     orders: number; filled_orders: number; issues: number }[];
 }
+export interface DailyPolicyMetrics {
+  net_return_pct: number; stress_return_pct: number; max_drawdown_pct: number;
+  stress_drawdown_pct: number; recent_stress_return_pct: number;
+}
+export interface DailyLearningData {
+  enabled: boolean; status: 'waiting' | 'researching' | 'prepared' | 'active' | 'keep' | 'blocked' | 'error';
+  active: { id: string; name: string; adopted_at: string | null; signal_day: string | null; effective_day: string | null } | null;
+  pending: { id: string; name: string; signal_day: string; prepared_at: string | null } | null;
+  last_decision: { as_of: string; decision: 'apply' | 'keep' | 'blocked' | 'error'; reason: string;
+    candidate_name: string | null; change_family: string | null;
+    metrics: { basis: 'development_only'; intervals: number; recent_intervals: number;
+      champion: DailyPolicyMetrics; candidate: DailyPolicyMetrics; delta: Record<string, number>;
+      checks: Record<string, boolean>; loss_reduction_only: boolean } | null;
+  } | null;
+  error: string | null;
+}
 export interface LearningData {
   enabled: boolean; status: 'disabled' | 'waiting' | 'researching' | 'evaluating' | 'error';
   champion: { id: string; name: string; adopted_at: string | null };
@@ -45,6 +61,7 @@ export interface LearningData {
       status: string; basis: 'daily_open_model' | 'observed_quotes_model'; market_name: 'KOSPI 가격지수'; error?: string | null } | null;
   } | null;
   error: string | null;
+  daily?: DailyLearningData;
 }
 export interface ExperimentData {
   status: 'idle' | 'running' | 'error'; busy: boolean; environment: 'paper'; updated_at: string | null; error: string | null;
@@ -83,6 +100,35 @@ const nullableNumber = (value: unknown) => value === null || typeof value === 'n
 const finiteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 const dateOrTime = (value: unknown) => time(value) || text(value) && /^\d{4}-\d{2}-\d{2}$/.test(value)
   && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+const day = (value: unknown) => text(value) && /^\d{4}-\d{2}-\d{2}$/.test(value) && dateOrTime(value);
+const dailyTime = (value: unknown) => time(value) && text(value) && day(value.slice(0, 10));
+const nullableDailyTime = (value: unknown) => value === null || dailyTime(value);
+const nullableDay = (value: unknown) => value === null || day(value);
+const policyMetrics = (value: unknown) => object(value)
+  && ['net_return_pct', 'stress_return_pct', 'max_drawdown_pct', 'stress_drawdown_pct', 'recent_stress_return_pct']
+    .every(key => finiteNumber(value[key]));
+
+function validDailyLearning(value: unknown): boolean {
+  if (!object(value) || typeof value.enabled !== 'boolean'
+    || !['waiting', 'researching', 'prepared', 'active', 'keep', 'blocked', 'error'].includes(String(value.status))
+    || !nullableText(value.error)) return false;
+  const { active, pending, last_decision: decision } = value;
+  if (!(active === null || object(active) && text(active.id) && text(active.name)
+    && nullableDailyTime(active.adopted_at) && nullableDay(active.signal_day) && nullableDay(active.effective_day))
+    || !(pending === null || object(pending) && text(pending.id) && text(pending.name)
+      && day(pending.signal_day) && nullableDailyTime(pending.prepared_at))) return false;
+  if (decision === null) return true;
+  if (!object(decision) || !(day(decision.as_of) || dailyTime(decision.as_of))
+    || !['apply', 'keep', 'blocked', 'error'].includes(String(decision.decision))
+    || !text(decision.reason) || !nullableText(decision.candidate_name) || !nullableText(decision.change_family)) return false;
+  const { metrics } = decision;
+  return metrics === null || object(metrics) && metrics.basis === 'development_only'
+    && count(metrics.intervals) && count(metrics.recent_intervals)
+    && policyMetrics(metrics.champion) && policyMetrics(metrics.candidate)
+    && object(metrics.delta) && Object.values(metrics.delta).every(finiteNumber)
+    && object(metrics.checks) && Object.values(metrics.checks).every(value => typeof value === 'boolean')
+    && typeof metrics.loss_reduction_only === 'boolean';
+}
 
 export function readExperiments(value: unknown): ExperimentData {
   if (!object(value) || !['idle', 'running', 'error'].includes(String(value.status)) || typeof value.busy !== 'boolean'
@@ -134,6 +180,7 @@ export function readExperiments(value: unknown): ExperimentData {
       || !(learning.last_change === null || object(learning.last_change) && time(learning.last_change.at)
         && ['from', 'to', 'reason'].every(key => text((learning.last_change as Record<string, unknown>)[key])))
       || !nullableText(learning.error)) throw new Error('학습 운용 응답 형식 확인 필요');
+    if (learning.daily !== undefined && !validDailyLearning(learning.daily)) throw new Error('일일 개선 응답 형식 확인 필요');
     if (learning.account !== undefined && learning.account !== null) {
       const account = learning.account;
       if (!object(account) || !dateOrTime(account.as_of) || !money(account.equity) || !money(account.cash)

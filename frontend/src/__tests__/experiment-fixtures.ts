@@ -1,4 +1,4 @@
-import type { AutonomyData, ExperimentData, ExperimentOrder, ExperimentRun, LearningData } from '../experiments';
+import type { AutonomyData, DailyLearningData, ExperimentData, ExperimentOrder, ExperimentRun, LearningData } from '../experiments';
 
 export function experimentRun(overrides: Partial<ExperimentRun> = {}): ExperimentRun {
   return { id: 'run-1', as_of: '2026-10-02', created_at: '2026-10-05T00:00:00Z', status: 'complete', input_hash: 'fixture-input-hash',
@@ -32,6 +32,18 @@ export function learning(overrides: Partial<LearningData> = {}): LearningData {
       challenger_return_pct: 1.75, champion_drawdown_pct: -0.5, challenger_drawdown_pct: -0.25,
       closed_trades: 3, decision: 'keep', reason: '평가 기간 부족' },
     last_change: null, error: null, ...overrides };
+}
+export function dailyLearning(overrides: Partial<DailyLearningData> = {}): DailyLearningData {
+  return { enabled: true, status: 'prepared',
+    active: { id: 'daily-1', name: '현재 일일 정책', adopted_at: '2026-10-12T00:00:00Z', signal_day: '2026-10-09', effective_day: '2026-10-12' },
+    pending: { id: 'daily-2', name: '진입 조건 개선안', signal_day: '2026-10-12', prepared_at: '2026-10-12T07:15:00Z' },
+    last_decision: { as_of: '2026-10-12', decision: 'apply', reason: '비용 후 수익과 최근 구간 개선',
+      candidate_name: '진입 조건 개선안', change_family: 'conditions', metrics: {
+        basis: 'development_only', intervals: 60, recent_intervals: 20,
+        champion: { net_return_pct: 2, stress_return_pct: 1, max_drawdown_pct: 3, stress_drawdown_pct: 4, recent_stress_return_pct: .5 },
+        candidate: { net_return_pct: 3, stress_return_pct: 2, max_drawdown_pct: 2, stress_drawdown_pct: 3, recent_stress_return_pct: 1 },
+        delta: { net_return_pct: 1, stress_return_pct: 1 }, checks: { normal_improvement: true }, loss_reduction_only: false,
+      } }, error: null, ...overrides };
 }
 export function learningAccount(overrides: Partial<NonNullable<LearningData['account']>> = {}): NonNullable<LearningData['account']> {
   return { as_of: '2026-10-09T06:30:00Z', equity: '1025000', cash: '700000', return_pct: 2.5,

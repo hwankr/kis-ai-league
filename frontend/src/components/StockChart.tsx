@@ -114,7 +114,7 @@ export default function StockChart({ chart }: { chart: ReturnType<typeof useStoc
   }, [request?.symbol]);
   const submit = (nextInterval = interval) => {
     const value = symbol.trim().toUpperCase();
-    if (!/^[0-9A-Z]{6}$/.test(value)) { setInputError('영문·숫자 6자리 종목코드를 입력해 주세요.'); return; }
+    if (!/^[0-9A-Z]{6}$/.test(value)) { setInputError('종목코드는 영문·숫자 6자리입니다.'); return; }
     setSymbol(value);
     setInputError(null);
     void query(value, nextInterval);
@@ -153,10 +153,10 @@ export default function StockChart({ chart }: { chart: ReturnType<typeof useStoc
     {data && hasBars ? <>
       <div className="stock-chart-identity"><h3>{data.name || data.symbol}</h3>{data.name ? <span>{data.symbol}</span> : null}
         <span>KRX · {intervalLabel(data.interval)}{data.adjusted ? ' · 수정주가' : ''}</span></div>
-      <div className="stock-chart-meta"><span>{data.bars[0].time.slice(0, 10)}{data.bars[0].time.slice(0, 10) !== data.as_of ? ` ~ ${data.as_of}` : ''}</span>
+      <div className="stock-chart-meta">{data.bars[0].time.slice(0, 10) !== data.as_of ? <span>시작일 {data.bars[0].time.slice(0, 10)}</span> : null}
         <span>마지막 거래일 <strong>{data.as_of}</strong></span></div>
       <Candlesticks key={`${data.symbol}-${data.interval}-${data.updated_at}`} data={data}/>
       <p className="stock-chart-source"><span>{data.source} · 원 / 주 · KST</span><span>조회 <time dateTime={updated.dateTime}>{updated.text}</time></span></p>
-    </> : <p className="stock-chart-empty">{loading ? '차트를 불러오는 중' : error ? '차트를 표시할 수 없습니다' : request ? '조회 가능한 차트가 없습니다' : '종목을 선택하거나 코드를 입력해 조회하세요'}</p>}
+    </> : !error ? <p className="stock-chart-empty">{loading ? '조회 중' : request ? '차트 데이터 없음' : '종목 선택 전'}</p> : null}
   </section>;
 }

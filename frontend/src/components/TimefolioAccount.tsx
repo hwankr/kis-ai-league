@@ -52,7 +52,7 @@ export function TimefolioAccountView({ data, loading, error, autoRefresh, onAuto
     </dl>
     <section className="timefolio-table-panel" aria-labelledby="timefolio-holdings-title">
       <div className="panel-heading"><div className="panel-title"><h2 id="timefolio-holdings-title">보유 종목</h2>
-        <span className="holdings-count">{hasSnapshot ? data.holdings.length : '—'}</span></div><span className="table-unit">단위: 원</span></div>
+        <span className="holdings-count">{hasSnapshot ? data.holdings.length : '—'}</span></div><span className="table-unit">원</span></div>
       {data?.holdings.length ? <div className="table-scroll" tabIndex={0} role="region" aria-label="타임폴리오 보유 종목 상세"><table className="timefolio-holdings-table">
         <thead><tr><th scope="col">종목</th><th scope="col">보유 수량</th><th scope="col">현재가</th><th scope="col">평균 매입가</th><th scope="col">평가금액</th><th scope="col">평가손익 / 수익률</th><th scope="col">비중</th></tr></thead>
         <tbody>{data.holdings.map(holding => <tr key={holding.symbol}>

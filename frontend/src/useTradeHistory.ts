@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { numeric } from './format';
 import type { Trade, TradeHistory, TradeRange } from './types';
 
 const DAY_MS = 86_400_000;
-const LOAD_ERROR = '거래 내역을 불러오지 못했습니다. 다시 조회해 주세요.';
+const LOAD_ERROR = '거래 내역 조회 실패';
 
 export function todayInSeoul(now = new Date()): string {
   return new Date(now.getTime() + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10);
@@ -53,34 +53,40 @@ function readTrades(data: Record<string, unknown>): TradeHistory {
   return { ...data, trades } as unknown as TradeHistory;
 }
 
-export default function useTradeHistory() {
+export default function useTradeHistory(enabled = true) {
   const [range, setRange] = useState(defaultTradeRange);
   const [data, setData] = useState<TradeHistory | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [accountId, setAccountId] = useState<string | null>(null);
   const session = useRef({
-    accountId: null as string | null, range, generation: 0, mounted: true,
+    accountId: null as string | null, range, generation: 0, mounted: true, enabled,
     controller: null as AbortController | null, timeout: undefined as number | undefined,
   });
 
-  const clear = useCallback(() => {
+  const cancel = useCallback(() => {
     const current = session.current;
+    const interrupted = current.controller !== null;
     ++current.generation;
-    current.accountId = null;
     current.controller?.abort();
     window.clearTimeout(current.timeout);
     current.controller = null;
     current.timeout = undefined;
+    setLoading(false);
+    return interrupted;
+  }, []);
+
+  const clear = useCallback(() => {
+    cancel();
+    session.current.accountId = null;
     setData(null);
     setError(null);
-    setLoading(false);
     setAccountId(null);
-  }, []);
+  }, [cancel]);
 
   const refresh = useCallback(async (accountId: string, nextRange?: TradeRange) => {
     const current = session.current;
-    if (!current.mounted || document.hidden) return;
+    if (!current.mounted || !current.enabled || document.hidden) return;
     const requestRange = nextRange ?? current.range;
     if (tradeRangeError(requestRange)) return;
     const changed = current.accountId !== accountId || current.range.start !== requestRange.start || current.range.end !== requestRange.end;
@@ -97,7 +103,8 @@ export default function useTradeHistory() {
     setLoading(true);
     const timeout = window.setTimeout(() => controller.abort(), 25_000);
     current.timeout = timeout;
-    const isCurrent = () => current.mounted && current.generation === generation && current.accountId === accountId;
+    const isCurrent = () => current.mounted && current.enabled && !document.hidden
+      && current.generation === generation && current.accountId === accountId;
     try {
       const query = new URLSearchParams({ account: accountId, start: requestRange.start, end: requestRange.end });
       const response = await fetch(`/api/trades?${query}`, {
@@ -140,16 +147,22 @@ export default function useTradeHistory() {
     if (current.accountId) void refresh(current.accountId, nextRange);
   }, [refresh]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const current = session.current;
     current.mounted = true;
+    current.enabled = enabled;
+    if (!enabled) cancel();
     return () => {
       current.mounted = false;
-      ++current.generation;
-      current.controller?.abort();
-      window.clearTimeout(current.timeout);
+      cancel();
     };
-  }, []);
+  }, [enabled, cancel]);
 
-  return { data, range, loading, error, accountId, refresh, clear, query };
+  useEffect(() => {
+    const onVisibility = () => { if (document.hidden) cancel(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [cancel]);
+
+  return { data, range, loading, error, accountId, refresh, clear, cancel, query };
 }

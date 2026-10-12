@@ -8,7 +8,7 @@ export default function Holdings({ holdings, emptyTitle }: Props) {
   return <section className="holdings-panel" aria-labelledby="holdings-title">
     <div className="panel-heading">
       <div className="panel-title"><h2 id="holdings-title">보유 종목</h2><span id="holdings-count" className="holdings-count">{holdings ? holdings.length : '—'}</span></div>
-      <span className="table-unit">단위: 원</span>
+      <span className="table-unit">원</span>
     </div>
     <div id="holdings-table-container" className="table-scroll" tabIndex={0} role="region" aria-label="보유 종목 상세" hidden={!hasHoldings}>
       <table>

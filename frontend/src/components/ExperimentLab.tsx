@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { ExperimentCommand, ExperimentData, ExperimentPolicy } from '../experiments';
+import type { DailyLearningData, ExperimentCommand, ExperimentData, ExperimentPolicy } from '../experiments';
 import { number, percent, signClass, timestamp } from '../format';
 import type { AccountChoice } from '../types';
 import useExperiments from '../useExperiments';
@@ -32,6 +32,11 @@ const states: Record<string, string> = {
 };
 const statusLabel = (state: string) => states[state] ?? state;
 const learningStates = { disabled: '중지', waiting: '대기', researching: '후보 연구 중', evaluating: '후보 평가 중', error: '확인 필요' };
+const dailyStates = { waiting: '심사 대기', researching: '개선안 검토 중', prepared: '다음 거래일 적용 대기',
+  active: '적용 중', keep: '현재 정책 유지', blocked: '적용 보류', error: '확인 필요' };
+const dailyDecisions = { apply: '적용 결정', keep: '현재 정책 유지', blocked: '적용 보류', error: '심사 오류' };
+const changeFamilies: Record<string, string> = { conditions: '진입 조건', ranking: '종목 순위', allocation: '자금 배분',
+  exit: '청산 조건', execution: '주문 집행', bootstrap: '초기 정책', rollback: '이전 정책 복귀' };
 const learningDecisions: Record<string, string> = { promote: '후보 채택', promoted: '후보 채택', keep: '현재 전략 유지',
   retained: '현재 전략 유지', waiting: '평가 중', wait: '평가 중', reject: '후보 제외', rejected: '후보 제외',
   invalid: '평가 무효', rollback: '이전 전략 복귀' };
@@ -56,6 +61,25 @@ function ResolveOrder({ id, name, disabled, onExecute }: { id: string; name: str
     <button className="lab-button" type="submit" disabled={disabled || !brokerId.trim() || !branchId.trim()}>주문 대조</button></form></details>;
 }
 
+function DailyLearning({ daily, fallbackPolicy }: { daily: DailyLearningData; fallbackPolicy: string }) {
+  const decision = daily.last_decision;
+  const candidateName = decision?.candidate_name !== daily.pending?.name ? decision?.candidate_name : null;
+  return <div className="lab-daily-learning">
+    <dl className="lab-learning-strategies"><div><dt>현재 적용 정책</dt><dd>{daily.active?.name ?? fallbackPolicy}</dd>
+      {daily.active?.effective_day ? <dd className="lab-learning-time">적용 거래일 <time dateTime={daily.active.effective_day}>{daily.active.effective_day}</time></dd>
+        : daily.active?.adopted_at ? <dd className="lab-learning-time">적용 <time dateTime={daily.active.adopted_at}>{timestamp(daily.active.adopted_at).text}</time></dd> : null}</div>
+      <div><dt>다음 정책</dt><dd>{daily.pending?.name ?? '없음'}</dd>
+        {daily.pending ? <dd className="lab-learning-time">신호 기준일 <time dateTime={daily.pending.signal_day}>{daily.pending.signal_day}</time></dd> : null}</div></dl>
+    {decision ? <div className="lab-daily-decision">
+      <div className="lab-learning-result"><strong>{dailyDecisions[decision.decision]}</strong><span>최근 심사 <time dateTime={decision.as_of}>
+        {decision.as_of.length === 10 ? decision.as_of : timestamp(decision.as_of).text}</time></span></div>
+      {candidateName || decision.change_family ? <p className="lab-daily-candidate">{[candidateName,
+        decision.change_family ? changeFamilies[decision.change_family] ?? decision.change_family : null].filter(Boolean).join(' · ')}</p> : null}
+      <p className="lab-learning-reason">{decision.reason}</p>
+    </div> : <p className="lab-learning-reason lab-subtle">심사 기록 없음</p>}
+  </div>;
+}
+
 export function ExperimentLabPanel({ data, loading, pending, error, accounts, onRefresh, onExecute, onSelectSymbol }: Props) {
   const [policy, setPolicy] = useState<ExperimentPolicy>(data?.policy ?? emptyPolicy);
   const savedPolicy = JSON.stringify(data?.policy ?? emptyPolicy);
@@ -73,6 +97,10 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
   const orderPages = Math.max(1, Math.ceil(orders.length / PAGE_SIZE));
   const currentOrderPage = Math.min(orderPage, orderPages);
   const learning = data?.learning;
+  const daily = learning?.daily;
+  const dailyStatus = daily?.status === 'prepared' && !daily.pending?.prepared_at
+    ? '신호 준비 대기' : daily ? dailyStates[daily.status] : null;
+  const LearningRecord = daily ? 'details' : 'div';
   const ownedAccount = learning?.account;
   const comparisons = ownedAccount?.comparisons;
   const label = (id: string) => id === 'all-strategies-v1' ? learning?.enabled ? '자동 전략 운용' : '전체 전략 균등' : data?.strategies.find(strategy => strategy.id === id)?.label ?? id;
@@ -135,7 +163,6 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
         <div><dt>보유 종목</dt><dd>{number(data?.positions.length)}</dd></div>
         <div><dt>진행 주문</dt><dd>{data ? number(openOrderCount) : '—'}</dd></div>
       </dl>}
-      {autonomy && !issues.length ? <p className="lab-no-issues">확인할 사항 없음</p> : null}
       <details className="lab-policy">
         <summary>고급 운용 설정{dirty ? <span className="lab-unsaved">저장 전</span> : null}</summary>
         <form onSubmit={event => { event.preventDefault(); if (complete && dirty && !locked && !data?.automation.enabled) void onExecute({ action: 'configure', policy }); }}>
@@ -158,8 +185,11 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
     </section>
 
     {learning ? <section className="lab-learning" aria-labelledby="lab-learning-title">
-      <div className="panel-heading lab-heading"><h2 id="lab-learning-title">학습·전략 교체</h2>
-        <span className={`lab-badge ${learning.enabled ? 'lab-badge-active' : ''}`}>{learningStates[learning.status]}</span></div>
+      <div className="panel-heading lab-heading"><h2 id="lab-learning-title">{daily ? '일일 개선' : '학습·전략 교체'}</h2>
+        <span className={`lab-badge ${(daily ? daily.enabled && !error && daily.status !== 'error' && daily.status !== 'blocked' : learning.enabled) ? 'lab-badge-active' : ''}`} role="status">
+          {daily ? error ? '조회 지연 · 이전 상태' : !daily.enabled ? '중지' : dailyStatus : learningStates[learning.status]}</span></div>
+      {daily ? <DailyLearning daily={daily} fallbackPolicy={learning.champion.name}/> : null}
+      {daily?.error && daily.error !== warning && daily.error !== learning.error ? <p className="lab-error" role="alert">{daily.error}</p> : null}
       {ownedAccount ? <div className="lab-owned-account" role="group" aria-label="AI 운용 성과">
         <div className="lab-owned-heading"><h3>AI 운용 성과</h3><time dateTime={ownedAccount.as_of}>
           {ownedAccount.as_of.length === 10 ? ownedAccount.as_of : timestamp(ownedAccount.as_of).text}</time></div>
@@ -185,14 +215,17 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
             {riskResetBlocked ? <span>주문 정지·보유 및 미체결 정리 필요</span> : null}</> : null}
         </div>
       </div> : null}
-      <dl className="lab-learning-strategies"><div><dt>현재 전략</dt><dd>{learning.champion.name}</dd>
+      <LearningRecord className={daily ? 'lab-long-term' : undefined}>
+      {daily ? <summary>장기 검증 기록</summary> : null}
+      <dl className="lab-learning-strategies"><div><dt>{daily ? '검증 기준 전략' : '현재 전략'}</dt><dd>{learning.champion.name}</dd>
         {learning.champion.adopted_at ? <dd className="lab-learning-time">채택 <time dateTime={learning.champion.adopted_at}>{timestamp(learning.champion.adopted_at).text}</time></dd> : null}</div>
         <div><dt>평가 후보</dt><dd>{learning.challenger?.name ?? '없음'}</dd>{learning.challenger ? <dd className="lab-learning-time">
           <time dateTime={learning.challenger.started_at}>{timestamp(learning.challenger.started_at).text}</time> · 수익률 {number(learning.challenger.sessions)}구간</dd> : null}</div></dl>
       {learning.last_evaluation ? <div className="lab-learning-evaluation">
         <div className="lab-learning-result"><strong>{learningDecisions[learning.last_evaluation.decision] ?? learning.last_evaluation.decision}</strong>
           {learning.last_evaluation.phase === 'paper_provisional' ? <span>모의 비교</span> : null}
-          <span>{number(learning.last_evaluation.sessions)} / {number(learning.last_evaluation.required_sessions)}구간 · 완결 {number(learning.last_evaluation.closed_trades)}건</span>
+          <span>{daily ? `관측 ${number(learning.last_evaluation.sessions)}구간 · 기준 ${number(learning.last_evaluation.required_sessions)}구간`
+            : `${number(learning.last_evaluation.sessions)} / ${number(learning.last_evaluation.required_sessions)}구간`} · 완결 {number(learning.last_evaluation.closed_trades)}건</span>
           <time dateTime={learning.last_evaluation.as_of}>{learning.last_evaluation.as_of.length === 10 ? learning.last_evaluation.as_of : timestamp(learning.last_evaluation.as_of).text}</time></div>
         <table className="lab-learning-table" aria-label="현재 전략과 후보의 평가 결과"><thead><tr><th scope="col">평가 지표</th><th scope="col">현재</th><th scope="col">후보</th></tr></thead>
           <tbody><tr><th scope="row">수익률</th><td className={signClass(learning.last_evaluation.champion_return_pct)}>{percent(learning.last_evaluation.champion_return_pct)}</td>
@@ -202,6 +235,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
       </div> : <p className="lab-learning-reason lab-subtle">평가 기록 없음</p>}
       {learning.last_change ? <div className="lab-learning-change"><span>최근 교체</span><time dateTime={learning.last_change.at}>{timestamp(learning.last_change.at).text}</time>
         <strong>{label(learning.last_change.from)} → {label(learning.last_change.to)}</strong><p>{learning.last_change.reason}</p></div> : null}
+      </LearningRecord>
       {learning.error ? <p className="lab-error" role="alert">{learning.error}</p> : null}
     </section> : null}
 
@@ -219,7 +253,7 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
       <div className="lab-strategy-grid">{data?.strategies.map(strategy => {
         const metric = data.metrics.find(item => item.strategy_id === strategy.id);
         return <article className={`lab-strategy-card ${data.policy.execution_strategy === strategy.id ? 'lab-strategy-selected' : ''}`} key={strategy.id}>
-          <div className="lab-card-title"><h3>{strategy.label}</h3>{data.policy.execution_strategy === strategy.id ? <span className="lab-tag">주문 전략</span> : null}</div>
+          <div className="lab-card-title"><h3 title={strategy.version}>{strategy.label}</h3>{data.policy.execution_strategy === strategy.id ? <span className="lab-tag">주문 전략</span> : null}</div>
           <p>{strategy.description}</p><dl className="lab-live-metrics"><div><dt>비용 추정 실현손익</dt><dd className={signClass(metric?.realized_pnl)}>{number(metric?.realized_pnl, true)}<span>원</span></dd></div>
             <div><dt>완결 거래</dt><dd>{number(metric?.closed_trades)}</dd></div><div><dt>보유</dt><dd>{number(metric?.open_positions)}</dd></div></dl>
           <dl className="lab-shadow-metrics"><div><dt>가상 완결</dt><dd>{number(metric?.shadow_closed)}</dd></div>
@@ -227,7 +261,6 @@ export function ExperimentLabPanel({ data, loading, pending, error, accounts, on
               <span className="lab-metric-divider">/</span><span className={signClass(metric?.shadow_stress_pct)}>{percent(metric?.shadow_stress_pct)}</span></dd></div></dl>
           <p className="lab-shadow-counts"><span>진입 대기 {number(metric?.shadow_pending)}</span><span>관찰 {number(metric?.shadow_open)}</span><span>미확정 {number(metric?.shadow_unknown)}</span><span>제외 {number(metric?.shadow_excluded)}</span>
             {metric?.shadow_version_count !== undefined ? <span>버전 {number(metric.shadow_version_count)}{metric.shadow_version_count > 1 ? '개 합산' : ''}</span> : null}</p>
-          <span className="lab-version" title={strategy.version}>{strategy.version.length > 12 ? strategy.version.slice(0, 12) : strategy.version}</span>
         </article>;
       })}</div>
       {!data?.strategies.length ? <p className="lab-empty">{loading ? '전략 조회 중' : '전략 없음'}</p> : null}

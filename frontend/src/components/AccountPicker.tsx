@@ -112,7 +112,7 @@ export default function AccountPicker({ accounts, selectedId, loading, emptyLabe
           aria-expanded={open} aria-controls="account-options"
           aria-activedescendant={open && activeIndex >= 0 ? `account-option-${activeIndex}` : undefined}
           disabled={!accounts.length} onClick={() => open ? close() : show()} onKeyDown={handleKeyDown}>
-          <span id="account-select-value">{selected?.name || (accounts.length ? '계좌 선택' : emptyLabel ?? (loading ? '계좌 목록을 불러오는 중' : '등록된 계좌 없음'))}</span>
+          <span id="account-select-value">{selected?.name || (accounts.length ? '계좌 선택' : emptyLabel ?? (loading ? '계좌 목록 조회 중' : '등록된 계좌 없음'))}</span>
           <svg className="account-select-chevron" viewBox="0 0 20 20" fill="none" aria-hidden="true">
             <path d="m6 8 4 4 4-4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
           </svg>

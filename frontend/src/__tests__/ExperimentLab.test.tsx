@@ -6,7 +6,7 @@ import { ExperimentLabPanel } from '../components/ExperimentLab';
 import { readExperiments } from '../experiments';
 import useExperiments from '../useExperiments';
 import { catalog, deferred, response } from './fixtures';
-import { autonomy, configuredPolicy, experimentOrder, experimentRun, experiments, learning, learningAccount } from './experiment-fixtures';
+import { autonomy, configuredPolicy, dailyLearning, experimentOrder, experimentRun, experiments, learning, learningAccount } from './experiment-fixtures';
 
 const props = { loading: false, pending: null, error: null, accounts: catalog.accounts, onRefresh: () => {},
   onExecute: async () => true, onSelectSymbol: () => {} };
@@ -151,7 +151,6 @@ describe('experiment lab', () => {
     expect(within(performance).getByText('-0.50%')).toBeTruthy();
     expect(screen.getByText('정상 운용')).toBeTruthy();
     expect(document.querySelector('.lab-status-line')?.textContent).toContain('전체 전략 균등');
-    expect(screen.getByText('확인할 사항 없음')).toBeTruthy();
     expect(screen.getByLabelText('최근 자동 운용 확인').textContent).toContain('최근 분석2026. 10. 05. 09:00:00 KST');
     expect(screen.getByLabelText('최근 자동 운용 확인').textContent).toContain('최근 주문2026. 10. 05. 09:01:00 KST');
     expect(screen.getByText('주문 5 · 체결 3 · 확인 0')).toBeTruthy();
@@ -325,6 +324,71 @@ describe('experiment lab', () => {
   });
 });
 
+describe('daily learning display', () => {
+  it('waits for completed signals before showing next-session application as prepared', () => {
+    const daily = dailyLearning({ active: null, pending: { ...dailyLearning().pending!, prepared_at: null } });
+    const { rerender } = render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ daily }) })}/>);
+    let panel = screen.getByRole('region', { name: '일일 개선' });
+    expect(within(panel).getByRole('status').textContent).toBe('신호 준비 대기');
+    expect(panel.querySelector('.lab-daily-learning')?.textContent).toContain('현재 적용 정책추세 규칙');
+    expect(within(panel).queryByText('다음 거래일 적용 대기')).toBeNull();
+    rerender(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ daily: {
+      ...daily, pending: { ...daily.pending!, prepared_at: '2026-10-12T07:15:00Z' },
+    } }) })}/>);
+    panel = screen.getByRole('region', { name: '일일 개선' });
+    expect(within(panel).getByRole('status').textContent).toBe('다음 거래일 적용 대기');
+    expect(within(panel).queryByText('신호 준비 대기')).toBeNull();
+  });
+
+  it('separates the active policy from the next policy and keeps long-term evaluation secondary', () => {
+    render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ daily: dailyLearning(),
+      last_evaluation: { ...learning().last_evaluation!, sessions: 4, required_sessions: 60 } }) })}/>);
+    const panel = screen.getByRole('region', { name: '일일 개선' });
+    expect(within(panel).getByRole('status').textContent).toBe('다음 거래일 적용 대기');
+    expect(within(panel).getByText('현재 일일 정책')).toBeTruthy();
+    expect(within(panel).getByText('진입 조건 개선안')).toBeTruthy();
+    expect(panel.textContent).toContain('적용 거래일 2026-10-12');
+    expect(panel.textContent).toContain('신호 기준일 2026-10-12');
+    expect(panel.textContent).toContain('최근 심사 2026-10-12');
+    expect(within(panel).getByText('비용 후 수익과 최근 구간 개선')).toBeTruthy();
+    const record = within(panel).getByText('장기 검증 기록').closest('details');
+    expect(record?.open).toBe(false);
+    expect(record?.textContent).toContain('관측 4구간 · 기준 60구간');
+    expect(panel.textContent).not.toContain('4 / 60');
+    expect(within(panel).getByRole('table', { name: '현재 전략과 후보의 평가 결과' }).closest('details')).toBe(record);
+  });
+
+  it.each([['keep', '현재 정책 유지'], ['blocked', '적용 보류'], ['error', '심사 오류']] as const)
+    ('shows %s and its reason without implying that a candidate was applied', (decision, label) => {
+      const daily = dailyLearning({ status: decision, pending: null,
+        last_decision: { ...dailyLearning().last_decision!, decision, reason: '최근 구간 개선 미확인', metrics: null } });
+      render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ daily }) })}/>);
+      const panel = screen.getByRole('region', { name: '일일 개선' });
+      expect(within(panel).getAllByText(label).length).toBeGreaterThan(0);
+      expect(within(panel).getByText('최근 구간 개선 미확인')).toBeTruthy();
+      expect(within(panel).getByText('현재 일일 정책')).toBeTruthy();
+      expect(within(panel).queryByText('적용 결정')).toBeNull();
+      expect(within(panel).queryByText('다음 거래일 적용 대기')).toBeNull();
+    });
+
+  it('shows active and disabled states without inventing pending policies or decisions', () => {
+    const daily = dailyLearning({ status: 'active', pending: null, last_decision: null });
+    const { rerender } = render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ daily }) })}/>);
+    expect(screen.getByRole('region', { name: '일일 개선' }).textContent).toContain('적용 중');
+    expect(screen.getByText('심사 기록 없음')).toBeTruthy();
+    rerender(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ daily: { ...daily, enabled: false } }) })}/>);
+    expect(within(screen.getByRole('region', { name: '일일 개선' })).getByRole('status').textContent).toBe('중지');
+  });
+
+  it('marks a retained daily state unverified after a failed refresh and preserves its facts', () => {
+    render(<ExperimentLabPanel {...props} error="운용실을 불러오지 못했습니다." data={experiments({ learning: learning({ daily: dailyLearning({ status: 'active' }) }) })}/>);
+    const panel = screen.getByRole('region', { name: '일일 개선' });
+    expect(within(panel).getByRole('status').textContent).toBe('조회 지연 · 이전 상태');
+    expect(within(panel).getByRole('status').className).not.toContain('lab-badge-active');
+    expect(within(panel).getByText('현재 일일 정책')).toBeTruthy();
+  });
+});
+
 describe('experiment requests', () => {
   it('polls GET every 20 seconds, preserves data on failures and recovers', async () => {
     vi.useFakeTimers();
@@ -495,6 +559,46 @@ describe('experiment response validation', () => {
     const data = experiments({ learning: learning() });
     Object.assign(data.learning!.last_evaluation!, { phase: 'paper_provisional', statistics: { combined_p_value: .02 } });
     expect(readExperiments(data)).toBe(data);
+  });
+
+  it('accepts optional daily learning, nullable initial policy dates and decisions without metrics', () => {
+    for (const daily of [undefined, dailyLearning(), dailyLearning({ active: null, pending: null, last_decision: null }),
+      dailyLearning({ active: { id: 'initial', name: '초기 정책', adopted_at: null, signal_day: null, effective_day: null },
+        pending: { ...dailyLearning().pending!, prepared_at: null }, last_decision: { ...dailyLearning().last_decision!,
+          candidate_name: null, change_family: null, metrics: null } })]) {
+      const data = experiments({ learning: learning({ daily }) });
+      expect(readExperiments(data)).toBe(data);
+    }
+  });
+
+  it.each([
+    null, { ...dailyLearning(), enabled: 'true' }, { ...dailyLearning(), status: 'complete' },
+    { ...dailyLearning(), active: { ...dailyLearning().active, adopted_at: '2026-02-31T00:00:00Z' } },
+    { ...dailyLearning(), active: { ...dailyLearning().active, signal_day: '2026-02-31' } },
+    { ...dailyLearning(), active: { ...dailyLearning().active, effective_day: '2026-10-12T00:00:00Z' } },
+    { ...dailyLearning(), pending: { ...dailyLearning().pending, signal_day: null } },
+    { ...dailyLearning(), pending: { ...dailyLearning().pending, prepared_at: 'invalid' } },
+    { ...dailyLearning(), last_decision: { ...dailyLearning().last_decision, as_of: '2026-02-31' } },
+    { ...dailyLearning(), last_decision: { ...dailyLearning().last_decision, decision: 'promote' } },
+    { ...dailyLearning(), last_decision: { ...dailyLearning().last_decision, candidate_name: 1 } },
+    { ...dailyLearning(), error: false },
+  ])('rejects malformed daily policy status and dates', daily => {
+    expect(() => readExperiments({ ...experiments(), learning: { ...learning(), daily } })).toThrow('일일 개선 응답 형식 확인 필요');
+  });
+
+  it.each([
+    [], { basis: 'development_only' },
+    { ...dailyLearning().last_decision!.metrics, basis: 'confirmed_performance' },
+    { ...dailyLearning().last_decision!.metrics, intervals: 1.5 },
+    { ...dailyLearning().last_decision!.metrics, recent_intervals: -1 },
+    { ...dailyLearning().last_decision!.metrics, champion: { ...dailyLearning().last_decision!.metrics!.champion, net_return_pct: Infinity } },
+    { ...dailyLearning().last_decision!.metrics, candidate: { ...dailyLearning().last_decision!.metrics!.candidate, max_drawdown_pct: '1' } },
+    { ...dailyLearning().last_decision!.metrics, delta: { stress_return_pct: NaN } },
+    { ...dailyLearning().last_decision!.metrics, checks: { normal_improvement: 1 } },
+    { ...dailyLearning().last_decision!.metrics, loss_reduction_only: 'false' },
+  ])('rejects nonfinite or malformed daily development metrics', metrics => {
+    const daily = { ...dailyLearning(), last_decision: { ...dailyLearning().last_decision, metrics } };
+    expect(() => readExperiments({ ...experiments(), learning: { ...learning(), daily } })).toThrow('일일 개선 응답 형식 확인 필요');
   });
 
   it.each([

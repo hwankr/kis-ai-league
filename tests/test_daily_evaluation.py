@@ -1,0 +1,344 @@
+"""Daily provisional selection with synthetic data; no broker or storage calls."""
+from copy import deepcopy
+import json
+import unittest
+from unittest.mock import Mock
+
+from backend.daily_evaluation import VERSION, evaluate_daily_candidate
+from backend.learning_evaluation import daily_metrics
+from backend.learning_policy import BASELINE_POLICY, LEGACY_IDS, portfolio_metrics
+from tests.test_learning_policy import LIMITS, frames, policy
+
+
+def changed(parent=None):
+    result = deepcopy(parent or policy())
+    result["strategies"][0]["holding_sessions"] = 4
+    return {"policy": result}
+
+
+def evidence(normal, stress=None):
+    return daily_metrics(normal, stress, first_day="2026-07-01")
+
+
+def observed_frames(count):
+    observations = frames(count)
+    for frame in observations:
+        frame["captured_at"] = frame["observed_at"]
+        frame["baseline_signals"] = [{"strategy_id": identity, "symbol": "005930", "action": "hold", "status": "ready"}
+                                     for identity in LEGACY_IDS]
+    return observations
+
+
+class DailyEvaluationTests(unittest.TestCase):
+    def evaluate(self, a, b, *, parent=None, proposal=None, observations=None):
+        parent = parent or policy()
+        return evaluate_daily_candidate(parent, proposal or changed(parent), observations or frames(len(a["daily_log_returns"]) + 1),
+                                        LIMITS, evaluator=Mock(side_effect=[a, b]))
+
+    def test_two_intervals_can_support_provisional_change_without_closed_trades(self):
+        a, b = evidence([0., 0.]), evidence([.001, .002], [.0008, .0018])
+        b["closed_trades"] = 0
+        result = self.evaluate(a, b)
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["version"], VERSION)
+        self.assertEqual(result["metrics"]["basis"], "development_only")
+        self.assertEqual(result["metrics"]["intervals"], 2)
+        self.assertEqual(result["metrics"]["recent_intervals"], 1)
+        self.assertFalse(result["metrics"]["loss_reduction_only"])
+        self.assertNotIn("p_value", result["metrics"])
+        self.assertEqual(result["changes"][0]["path"], "strategies[0].holding_sessions")
+
+    def test_one_return_interval_is_sufficient_for_provisional_comparison(self):
+        result = self.evaluate(evidence([0.]), evidence([.001]))
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["intervals"], 1)
+        self.assertEqual(result["metrics"]["recent_intervals"], 1)
+
+    def test_improved_but_still_losing_policy_is_explicitly_provisional(self):
+        result = self.evaluate(evidence([-.02] * 6), evidence([-.005] * 6, [-.006] * 6))
+        self.assertEqual(result["decision"], "apply")
+        self.assertTrue(result["metrics"]["loss_reduction_only"])
+        self.assertIn("손실 축소", result["reason"])
+        self.assertLess(result["metrics"]["candidate"]["net_return_pct"], 0)
+
+    def test_best_candidate_with_no_parent_advantage_keeps_current(self):
+        result = self.evaluate(evidence([.005] * 6), evidence([.003] * 6))
+        self.assertEqual(result["decision"], "keep")
+        self.assertFalse(result["metrics"]["checks"]["normal_improvement"])
+
+    def test_normal_gain_cannot_hide_stress_cost_loss(self):
+        result = self.evaluate(evidence([.002] * 6), evidence([.003] * 6, [.001] * 6))
+        self.assertEqual(result["decision"], "keep")
+        self.assertTrue(result["metrics"]["checks"]["normal_improvement"])
+        self.assertFalse(result["metrics"]["checks"]["stress_improvement"])
+
+    def test_any_cost_scenario_drawdown_worsening_vetoes(self):
+        result = self.evaluate(evidence([.001] * 6), evidence([.003] * 6, [-.005] + [.004] * 5))
+        self.assertEqual(result["decision"], "keep")
+        self.assertTrue(result["metrics"]["checks"]["stress_improvement"])
+        self.assertFalse(result["metrics"]["checks"]["drawdown_not_worse"])
+
+    def test_recent_relative_reversal_is_a_diagnostic_not_an_extra_gate(self):
+        result = self.evaluate(evidence([.002] * 6), evidence([.004] * 4 + [.001] * 2))
+        self.assertEqual(result["decision"], "apply")
+        self.assertTrue(result["metrics"]["checks"]["stress_improvement"])
+        self.assertFalse(result["metrics"]["checks"]["recent_improvement"])
+
+    def test_recent_window_is_capped_at_twenty_intervals(self):
+        result = self.evaluate(evidence([0.] * 90), evidence([.001] * 90))
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["recent_intervals"], 20)
+
+    def test_identical_or_cosmetically_changed_policy_needs_no_evaluation(self):
+        parent = policy()
+        same = deepcopy(parent)
+        same["name"] = "another name"
+        same["strategies"][0]["id"] = "another-id"
+        same["strategies"][0]["name"] = "another strategy name"
+        evaluate = Mock(side_effect=AssertionError("no evaluation needed"))
+        result = evaluate_daily_candidate(parent, {"policy": same}, frames(3), LIMITS, evaluator=evaluate)
+        self.assertEqual(result["decision"], "keep")
+        self.assertEqual(result["changes"], [])
+        evaluate.assert_not_called()
+
+    def test_redundant_conditions_do_not_fake_behavioral_change(self):
+        parent = policy()
+        parent["strategies"][0]["conditions"] = [{"feature": "return_5d_pct", "op": "gt", "value": 2}]
+        candidate = deepcopy(parent)
+        candidate["strategies"][0]["conditions"].append({"feature": "return_5d_pct", "op": "gt", "value": 1})
+        result = evaluate_daily_candidate(parent, {"policy": candidate}, frames(3), LIMITS)
+        self.assertEqual(result["decision"], "keep")
+
+    def test_multiple_families_and_strategy_slot_changes_are_blocked(self):
+        for kind in ("families", "identity", "cancel", "limits"):
+            proposal = changed()
+            if kind == "families":
+                proposal["policy"]["strategies"][0]["top_n"] = 2
+            elif kind == "identity":
+                proposal["policy"]["strategies"][0]["id"] = "different-slot"
+            elif kind == "cancel":
+                proposal["policy"]["cancel_after_minutes"] = 20
+            else:
+                proposal["limits"] = {**LIMITS, "budget": "20000"}
+            evaluate = Mock()
+            with self.subTest(kind=kind):
+                result = evaluate_daily_candidate(policy(), proposal, frames(3), LIMITS, evaluator=evaluate)
+                self.assertEqual(result["decision"], "blocked")
+                evaluate.assert_not_called()
+
+    def test_legacy_bootstrap_accepts_first_rules_policy_but_not_unmodeled_cancel_change(self):
+        result = self.evaluate(evidence([0.] * 3), evidence([.001] * 3),
+                               parent=BASELINE_POLICY, proposal={"policy": policy()}, observations=observed_frames(4))
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["change_family"], "bootstrap")
+        candidate = policy(cancel_after_minutes=20)
+        result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": candidate}, frames(4), LIMITS)
+        self.assertEqual(result["decision"], "blocked")
+
+    def test_legacy_historical_signals_are_not_invented_or_treated_as_cash(self):
+        for kind in ("missing", "historical", "missing_strategy", "unknown", "naive_time", "no_capture"):
+            observations = observed_frames(5)
+            for frame in observations:
+                if kind == "missing":
+                    frame["baseline_signals"] = []
+                elif kind == "historical":
+                    frame["role"] = "development_only"
+                elif kind == "missing_strategy":
+                    frame["baseline_signals"].pop()
+                elif kind == "unknown":
+                    frame["baseline_signals"][-1]["status"] = "error"
+                elif kind == "naive_time":
+                    frame["captured_at"] = frame["as_of"] + "T16:05:00"
+                else:
+                    frame.pop("captured_at")
+            evaluate = Mock()
+            with self.subTest(kind=kind):
+                result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS, evaluator=evaluate)
+                self.assertEqual(result["decision"], "blocked")
+                self.assertEqual(result["metrics"]["error"], "insufficient_observed_baseline")
+                self.assertEqual(result["metrics"]["observed_baseline_frames"], 0)
+                evaluate.assert_not_called()
+
+    def test_legacy_comparison_uses_only_continuous_observed_suffix_for_both_policies(self):
+        observations = observed_frames(7)
+        observations[3]["baseline_signals"].pop()
+        original = deepcopy(observations)
+        records = []
+        def evaluate(candidate, supplied, limits):
+            records.append(deepcopy(supplied))
+            return daily_metrics([0., 0.] if candidate["kind"] == "legacy" else [.001, .001],
+                                 first_day=supplied[0]["as_of"])
+        result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS, evaluator=evaluate)
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["intervals"], 2)
+        self.assertEqual(result["metrics"]["excluded_frames"], 4)
+        self.assertEqual(result["metrics"]["start_day"], observations[4]["as_of"])
+        self.assertEqual(records, [observations[4:], observations[4:]])
+        self.assertEqual(observations, original)
+
+    def test_latest_legacy_signal_gap_cannot_select_an_older_favorable_window(self):
+        observations = observed_frames(7)
+        observations[-1]["baseline_signals"] = []
+        result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS)
+        self.assertEqual(result["decision"], "blocked")
+        self.assertEqual(result["metrics"]["observed_baseline_frames"], 0)
+
+    def test_missing_exchange_session_starts_a_new_observed_suffix(self):
+        observations = observed_frames(6)
+        del observations[2]
+        calls = []
+        def evaluate(candidate, supplied, limits):
+            calls.append(deepcopy(supplied))
+            return daily_metrics([0., 0.] if candidate["kind"] == "legacy" else [.001, .001],
+                                 first_day=supplied[0]["as_of"])
+        result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS, evaluator=evaluate)
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["excluded_frames"], 2)
+        self.assertEqual(result["metrics"]["observed_baseline_frames"], 3)
+        self.assertEqual(calls, [observations[2:], observations[2:]])
+
+    def test_legacy_signal_captured_at_or_after_following_open_cannot_form_an_interval(self):
+        for clock in ("09:00:00+09:00", "09:00:01+09:00", "00:00:00+00:00"):
+            observations = observed_frames(2)
+            observations[0]["captured_at"] = observations[1]["as_of"] + "T" + clock
+            evaluate = Mock()
+            with self.subTest(clock=clock):
+                result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS,
+                                                  evaluator=evaluate)
+                self.assertEqual(result["decision"], "blocked")
+                self.assertEqual(result["metrics"]["observed_baseline_frames"], 1)
+                self.assertEqual(result["metrics"]["error"], "insufficient_observed_baseline")
+                evaluate.assert_not_called()
+
+    def test_late_legacy_signal_discards_only_the_unavailable_prefix(self):
+        observations = observed_frames(4)
+        observations[1]["captured_at"] = observations[2]["as_of"] + "T09:01:00+09:00"
+        calls = []
+        def evaluate(candidate, supplied, limits):
+            calls.append(deepcopy(supplied))
+            return daily_metrics([0.] if candidate["kind"] == "legacy" else [.001], first_day=supplied[0]["as_of"])
+        result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS, evaluator=evaluate)
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["excluded_frames"], 2)
+        self.assertEqual(calls, [observations[2:], observations[2:]])
+
+    def test_legacy_signal_captured_before_next_open_including_weekend_remains_usable(self):
+        for captured in ("2026-10-10T16:00:00+09:00", "2026-10-12T08:59:59+09:00"):
+            observations = observed_frames(2)
+            days = ["2026-10-08", "2026-10-12"]
+            for index, frame in enumerate(observations):
+                frame.update(as_of=days[index], observed_at=days[index] + "T16:05:00+09:00",
+                             captured_at=days[index] + "T16:05:00+09:00", session_days=days[:index + 1])
+            observations[0]["captured_at"] = captured
+            def evaluate(candidate, supplied, limits):
+                result = evidence([0.] if candidate["kind"] == "legacy" else [.001])
+                for key in ("equity_curve", "stress_equity_curve"):
+                    for point, day in zip(result[key], days):
+                        point["as_of"] = day
+                return result
+            with self.subTest(captured=captured):
+                result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS,
+                                                  evaluator=evaluate)
+                self.assertEqual(result["decision"], "apply")
+                self.assertEqual(result["metrics"]["excluded_frames"], 0)
+
+    def test_legacy_one_observation_cannot_form_a_return_interval(self):
+        observations = observed_frames(5)
+        observations[-2]["role"] = "development_only"
+        result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS)
+        self.assertEqual(result["decision"], "blocked")
+        self.assertEqual(result["metrics"]["observed_baseline_frames"], 1)
+        self.assertIn("연속 관측 2개", result["reason"])
+
+    def test_two_observed_legacy_frames_are_enough_to_compare(self):
+        result = self.evaluate(evidence([0.]), evidence([.001]), parent=BASELINE_POLICY,
+                               proposal={"policy": policy()}, observations=observed_frames(2))
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["intervals"], 1)
+
+    def test_rule_parent_still_uses_development_frames_without_legacy_decisions(self):
+        observations = frames(4)
+        for frame in observations:
+            frame["role"] = "development_only"
+        result = self.evaluate(evidence([0.] * 3), evidence([.001] * 3), observations=observations)
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(result["metrics"]["intervals"], 3)
+
+    def test_limits_are_identical_and_all_inputs_are_immutable(self):
+        parent, proposal, observations, limits = policy(), changed(), frames(3), deepcopy(LIMITS)
+        originals = deepcopy((parent, proposal, observations, limits))
+        calls = []
+        def evaluate(candidate, supplied, supplied_limits):
+            calls.append(deepcopy((supplied, supplied_limits)))
+            supplied.clear()
+            supplied_limits["budget"] = "1"
+            candidate.clear()
+            return evidence([0., 0.] if len(calls) == 1 else [.001, .001])
+        first = evaluate_daily_candidate(parent, proposal, observations, limits, evaluator=evaluate)
+        self.assertEqual(first["decision"], "apply")
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual((parent, proposal, observations, limits), originals)
+        json.dumps(first, allow_nan=False)
+
+    def test_naive_insufficient_or_invalid_sources_block(self):
+        cases = [[], frames(1)]
+        unordered = frames(3)
+        unordered[1]["as_of"] = unordered[0]["as_of"]
+        cases.append(unordered)
+        nonfinite = frames(3)
+        nonfinite[0]["rows"][0]["features"]["turnover"] = float("nan")
+        cases.append(nonfinite)
+        for observations in cases:
+            with self.subTest(observations=observations):
+                self.assertEqual(evaluate_daily_candidate(policy(), changed(), observations, LIMITS)["decision"], "blocked")
+
+    def test_unpaired_nonfinite_or_inconsistent_evaluator_output_blocks(self):
+        for kind in ("dates", "length", "return", "equity", "summary", "summary_nan", "invalid", "extra_nan"):
+            a, b = evidence([0.] * 3), evidence([.001] * 3)
+            if kind == "dates":
+                b = daily_metrics([.001] * 3, first_day="2026-07-02")
+            elif kind == "length":
+                b["stress_daily_log_returns"].pop()
+            elif kind == "return":
+                b["daily_log_returns"][1] = .5
+            elif kind == "equity":
+                b["equity_curve"][1]["equity"] = float("inf")
+            elif kind == "summary":
+                b["net_return_pct"] = 1000
+            elif kind == "summary_nan":
+                b["net_return_pct"] = float("nan")
+            elif kind == "invalid":
+                b["valid"] = False
+            else:
+                b["diagnostics"] = {"unused": float("nan")}
+            with self.subTest(kind=kind):
+                result = self.evaluate(a, b)
+                self.assertEqual(result["decision"], "blocked")
+                json.dumps(result, allow_nan=False)
+
+    def test_evaluator_failure_is_blocked_without_exception_details(self):
+        result = evaluate_daily_candidate(policy(), changed(), frames(3), LIMITS,
+                                          evaluator=Mock(side_effect=RuntimeError("private debug information")))
+        self.assertEqual(result["decision"], "blocked")
+        self.assertEqual(result["metrics"]["error"], "evaluation_failed")
+        self.assertNotIn("private", json.dumps(result))
+
+    def test_real_replay_uses_same_costs_and_does_not_require_60_sessions(self):
+        observations = observed_frames(5)
+        for index, frame in enumerate(observations):
+            bar = frame["rows"][0]
+            bar.update(open=100 + max(0, index - 1) * 5, close=100 + index * 5,
+                       low=99 + max(0, index - 1) * 5, high=101 + index * 5)
+        result = evaluate_daily_candidate(BASELINE_POLICY, {"policy": policy()}, observations, LIMITS)
+        self.assertEqual(result["decision"], "apply")
+        actual = portfolio_metrics(policy(), observations, LIMITS)
+        self.assertAlmostEqual(result["metrics"]["candidate"]["net_return_pct"], actual["net_return_pct"])
+        self.assertLess(result["metrics"]["candidate"]["stress_return_pct"], result["metrics"]["candidate"]["net_return_pct"])
+
+    def test_rounding_noise_does_not_become_an_improvement(self):
+        result = self.evaluate(evidence([.001] * 3), evidence([.001 + 1e-14] * 3))
+        self.assertEqual(result["decision"], "keep")
+
+
+if __name__ == "__main__":
+    unittest.main()

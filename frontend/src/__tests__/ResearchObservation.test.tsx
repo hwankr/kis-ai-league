@@ -29,8 +29,7 @@ describe('forward observation display', () => {
     })}/>);
     const summary = screen.getByLabelText('전진 신호 집계');
     expect(summary.querySelector('dd')?.textContent).toBe('1');
-    expect(screen.getByText('연구 중 · 미채택')).toBeDefined();
-    expect(screen.getByText('자동 주문 없음')).toBeDefined();
+    expect(screen.getByText('미채택')).toBeDefined();
     const table = screen.getByRole('table');
     expect(within(table).getAllByText('+2.50%')).toHaveLength(1);
     expect(within(table).getAllByText('평가 제외')).toHaveLength(2);

@@ -38,6 +38,6 @@ export default function MarketQuotes({ data, loading, error, onSelectSymbol }: P
           </tr>;
         })}</tbody>
       </table>
-    </div> : !warning ? <p className="market-empty">{loading ? '시세 수집 상태를 불러오는 중' : '등록된 관심 종목이 없습니다'}</p> : null}
+    </div> : !warning ? <p className="market-empty">{loading ? '조회 중' : '관심 종목 없음'}</p> : null}
   </section>;
 }

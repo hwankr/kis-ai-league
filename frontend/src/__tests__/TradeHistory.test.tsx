@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../App';
+import { navigate } from '../usePageNavigation';
 import { defaultTradeRange, todayInSeoul, tradeRangeError } from '../useTradeHistory';
 import { catalog, deferred, element, marketData, response, snapshot, trade, tradeHistory } from './fixtures';
 
@@ -18,8 +19,8 @@ function mockApi(trades: (url: string) => Response | Promise<Response>, accounts
 }
 
 async function ready() {
+  await waitFor(() => expect(element('trade-history').dataset.accountId).not.toBe(''));
   await waitFor(() => expect(element('trade-history').getAttribute('aria-busy')).toBe('false'));
-  await waitFor(() => expect(element('connection-label').textContent).toBe('계좌 연결됨'));
 }
 
 async function refresh() {
@@ -48,33 +49,35 @@ describe('trade history', () => {
     const fetchMock = mockApi(url => response(tradeHistory(url)));
     render(<App />);
     await ready();
-    expect(screen.getByText('조회 기간에 체결 내역이 없습니다')).toBeTruthy();
+    expect(screen.getByText('해당 기간 체결 없음')).toBeTruthy();
     expect(element('trades-count').textContent).toBe('0');
     expect(document.getElementById('trades-error')).toBeNull();
     const request = fetchMock.mock.calls.find(([url]) => String(url).startsWith('/api/trades?'));
     expect(request?.[1]?.headers).toEqual({ Accept: 'application/json', 'X-KIS-Dashboard': '1' });
   });
 
-  it('shows an initial trade error without changing successful balances or history', async () => {
-    mockApi(url => response(tradeHistory(url, { status: 'error', error: '체결 조회 실패', updated_at: null }), 502));
+  it('shows an initial trade error without querying hidden balances or history', async () => {
+    const fetchMock = mockApi(url => response(tradeHistory(url, { status: 'error', error: '체결 조회 실패', updated_at: null }), 502));
     render(<App />);
     await ready();
     expect(screen.getByText('체결 조회 실패')).toBeTruthy();
-    expect(screen.queryByText('조회 기간에 체결 내역이 없습니다')).toBeNull();
+    expect(screen.queryByText('해당 기간 체결 없음')).toBeNull();
     expect(element('trades-count').textContent).toBe('—');
-    expect(element('total-value').textContent).toBe('10,000,000');
-    expect(element('asset-history').dataset.pointCount).toBe('1');
+    expect(element('total-value').textContent).toBe('—');
+    expect(element('asset-history').dataset.pointCount).toBe('0');
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith('/api/account?'))).toBe(false);
   });
 
-  it('keeps balance refresh available while trade lookup is delayed', async () => {
+  it('keeps date queries available while a trade lookup is delayed', async () => {
     const slow = deferred<Response>();
     let requests = 0;
     mockApi(url => { requests += 1; return requests === 1 ? slow.promise : response(tradeHistory(url)); });
     render(<App />);
-    await waitFor(() => expect(element('connection-label').textContent).toBe('계좌 연결됨'));
+    await waitFor(() => expect(requests).toBe(1));
     expect(element('trade-history').getAttribute('aria-busy')).toBe('true');
-    expect((element('refresh-button') as HTMLButtonElement).disabled).toBe(false);
-    await refresh();
+    expect((element('refresh-button') as HTMLButtonElement).disabled).toBe(true);
+    queryRange('2025-01-01', '2025-01-31');
+    await ready();
     expect(requests).toBe(2);
   });
 
@@ -144,6 +147,43 @@ describe('trade history', () => {
     expect(element('trade-history').dataset.startDate).toBe('2025-02-01');
     expect(element('trades-count').textContent).toBe('0');
     expect(seen).toHaveLength(3);
+  });
+
+  it('preserves the range across pages and clears hidden trades when the account changes', async () => {
+    const fetchMock = mockApi(url => response(tradeHistory(url, { trades: [{ ...trade,
+      order_date: new URL(url, 'http://localhost').searchParams.get('end')! }], total_count: 1 })));
+    render(<App/>);
+    await ready();
+    queryRange('2025-01-01', '2025-01-31');
+    await ready();
+    await act(async () => { navigate('#/account'); });
+    await waitFor(() => expect(element('connection-label').textContent).toBe('계좌 연결됨'));
+    expect(element('trade-history').dataset.rowCount).toBe('1');
+    const beforeSwitch = fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/trades?')).length;
+    await userEvent.click(screen.getByRole('combobox'));
+    await userEvent.click(screen.getByRole('option', { name: '대회 계좌' }));
+    expect(element('trade-history').dataset.rowCount).toBe('0');
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/trades?'))).toHaveLength(beforeSwitch);
+    await act(async () => { navigate('#/trades'); });
+    await ready();
+    expect(element('trade-history').dataset.accountId).toBe('league');
+    expect(element('trade-history').dataset.startDate).toBe('2025-01-01');
+    expect(element('trade-history').dataset.endDate).toBe('2025-01-31');
+    expect((screen.getByLabelText('시작일') as HTMLInputElement).value).toBe('2025-01-01');
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/trades?account=league&start=2025-01-01&end=2025-01-31')).toBe(true);
+  });
+
+  it('does not carry a balance error into a successful trade view', async () => {
+    window.history.replaceState(null, '', '/#/account');
+    mockApi(url => response(tradeHistory(url)), () => response(catalog),
+      () => response(snapshot('practice', { status: 'error', updated_at: null, error: '잔고 인증 실패' }), 502));
+    render(<App/>);
+    await waitFor(() => expect(element('error-notice').textContent).toContain('잔고 인증 실패'));
+    await act(async () => { navigate('#/trades'); });
+    await ready();
+    expect(element('error-notice').hidden).toBe(true);
+    expect(document.getElementById('trades-error')).toBeNull();
+    expect(screen.getByText('해당 기간 체결 없음')).toBeTruthy();
   });
 
   it.each(['identity', 'range', 'fresh-error'] as const)('clears cached trades for %s responses', async kind => {

@@ -62,6 +62,6 @@ export default function TradeHistory({ data, range, accountId, loading, error, o
           <td className="trade-price"><span className="trade-price-label">평균 체결가 </span>{number(trade.price)}<span className="trade-price-unit">원</span></td>
         </tr>)}</tbody>
       </table>
-    </div> : !error ? <p id="trades-empty" className="trades-empty">{loading ? '거래 내역을 불러오는 중' : data?.status === 'ok' ? '조회 기간에 체결 내역이 없습니다' : '조회할 계좌를 확인해 주세요'}</p> : null}
+    </div> : !error ? <p id="trades-empty" className="trades-empty">{loading ? '조회 중' : data?.status === 'ok' ? '해당 기간 체결 없음' : '계좌 선택 필요'}</p> : null}
   </section>;
 }

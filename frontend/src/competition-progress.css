@@ -1,0 +1,31 @@
+.competition-progress { padding-bottom: 28px; border-bottom: 1px solid #edf0f3; min-width: 0; }
+.competition-progress > .panel-heading { margin-bottom: 20px; }
+.competition-groups { display: grid; grid-template-columns: minmax(0, 4fr) minmax(180px, 1fr); gap: 28px; }
+.competition-kis, .competition-timefolio { min-width: 0; }
+.competition-source { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 18px; font-size: 11px; color: var(--muted); }
+.competition-source a { font-size: 12px; font-weight: 500; color: var(--secondary); text-decoration-color: #c9d1d9; text-underline-offset: 3px; }
+.competition-kis-metrics { display: grid; grid-template-columns: 1fr 1.65fr 1fr 1fr; gap: 22px; }
+.competition-label { display: flex; align-items: baseline; justify-content: space-between; gap: 4px; color: var(--secondary); font-size: 12px; }
+.competition-check { color: var(--blue); font-size: 10px; }
+.competition-value { display: flex; align-items: baseline; flex-wrap: wrap; gap: 3px; margin: 10px 0 12px; font-variant-numeric: tabular-nums; }
+.competition-value strong { font-size: 22px; font-weight: 600; letter-spacing: -.5px; }
+.competition-value > span { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.competition-metric progress { appearance: none; display: block; width: 100%; height: 4px; border: 0; border-radius: 4px; overflow: hidden; background: #edf0f3; }
+.competition-metric progress::-webkit-progress-bar { background: #edf0f3; }
+.competition-metric progress::-webkit-progress-value { background: #8aa9ce; border-radius: 4px; }
+.competition-metric progress::-moz-progress-bar { background: #8aa9ce; }
+.competition-met progress::-webkit-progress-value { background: var(--blue); }
+.competition-met progress::-moz-progress-bar { background: var(--blue); }
+.competition-note, .competition-updated { display: block; margin-top: 10px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.competition-updated { margin-top: 14px; }
+.competition-error { margin: 10px 0 0; color: #8b5e14; font-size: 11px; overflow-wrap: anywhere; }
+.competition-timefolio { padding-left: 28px; border-left: 1px solid #edf0f3; }
+@media (max-width: 1000px) {
+  .competition-groups { grid-template-columns: 1fr; gap: 22px; }
+  .competition-timefolio { padding: 20px 0 0; border-left: 0; border-top: 1px solid #edf0f3; }
+  .competition-timefolio .competition-metric { max-width: 360px; }
+}
+@media (max-width: 560px) {
+  .competition-kis-metrics { grid-template-columns: 1fr 1.65fr; gap: 24px 20px; }
+  .competition-value strong { font-size: 21px; }
+}

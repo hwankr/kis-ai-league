@@ -1,8 +1,9 @@
 import { StrictMode } from 'react';
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../App';
+import useMarketData from '../useMarketData';
 import { catalog, deferred, element, marketData, quote, response, snapshot, tradeHistory } from './fixtures';
 
 const savedMarket = () => marketData({ symbols: [quote.symbol], quotes: [quote], collector: {
@@ -51,12 +52,12 @@ describe('market collection', () => {
     expect(fetchMock.mock.calls.every(([url]) => !String(url).includes('/quote'))).toBe(true);
   });
 
-  it('shows chart refresh as busy while account balances settle independently', async () => {
+  it('shows chart refresh as busy without loading inactive account balances', async () => {
     const pending = deferred<Response>();
-    mockApi(() => pending.promise);
+    const fetchMock = mockApi(() => pending.promise);
     render(<App />);
-    expect(screen.getByText('시세 수집 상태를 불러오는 중')).toBeTruthy();
-    await waitFor(() => expect(element('connection-label').textContent).toBe('계좌 연결됨'));
+    expect(within(element('market-quotes')).getByText('조회 중')).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith('/api/account?'))).toBe(false);
     expect((element('refresh-button') as HTMLButtonElement).disabled).toBe(true);
     await act(async () => pending.resolve(response(savedMarket())));
     await ready();
@@ -69,9 +70,9 @@ describe('market collection', () => {
     render(<App />);
     await ready();
     expect(screen.getByText('시세 수집 상태를 불러오지 못했습니다.')).toBeTruthy();
-    expect(screen.queryByText('등록된 관심 종목이 없습니다')).toBeNull();
+    expect(screen.queryByText('관심 종목 없음')).toBeNull();
     await refresh();
-    expect(screen.getByText('등록된 관심 종목이 없습니다')).toBeTruthy();
+    expect(screen.getByText('관심 종목 없음')).toBeTruthy();
     expect(screen.getByText('수집 전')).toBeTruthy();
     expect(document.getElementById('market-error')).toBeNull();
   });
@@ -102,7 +103,7 @@ describe('market collection', () => {
     expect(screen.getByText('수집 실패')).toBeTruthy();
     expect(element('market-quotes').dataset.rowCount).toBe('2');
     expect(within(element('market-quotes')).getByRole('cell', { name: /61,200/ })).toBeTruthy();
-    expect(element('total-value').textContent).toBe('10,000,000');
+    expect(element('total-value').textContent).toBe('—');
   });
 
   it('keeps saved prices and the specific error when the local store becomes unavailable', async () => {
@@ -156,7 +157,7 @@ describe('market collection', () => {
     await ready();
     expect(element('market-quotes').dataset.rowCount).toBe('1');
     expect(within(element('market-quotes')).getByRole('cell', { name: /61,200/ })).toBeTruthy();
-    expect(fetchMock.mock.calls.filter(([url]) => url === '/api/market')).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([url]) => url === '/api/market')).toHaveLength(2);
   });
 
   it('loads quotes even when the initial account catalog is unavailable', async () => {
@@ -209,5 +210,62 @@ describe('market collection', () => {
     expect(calls).toBe(initial + 2);
     view.unmount();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('market query activity', () => {
+  it('skips inactive initial, polling and manual reads, then refreshes once on each activation', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(response(savedMarket()));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(({ enabled }) => useMarketData(true, enabled), { initialProps: { enabled: false } });
+    await act(async () => { await view.result.current.refresh(); await vi.advanceTimersByTimeAsync(60_000); });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await act(async () => view.rerender({ enabled: true }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    view.rerender({ enabled: false });
+    expect(view.result.current.data?.quotes[0].price).toBe('61200');
+    await act(async () => { await view.result.current.refresh(); await vi.advanceTimersByTimeAsync(60_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await act(async () => view.rerender({ enabled: true }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    view.unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('aborts on page exit and rejects a late response after the page is reactivated', async () => {
+    const pending = deferred<Response>();
+    const fetchMock = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValue(response(savedMarket()));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(({ enabled }) => useMarketData(true, enabled), { initialProps: { enabled: true } });
+    view.rerender({ enabled: false });
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(view.result.current.loading).toBe(false);
+    await act(async () => view.rerender({ enabled: true }));
+    await act(async () => pending.resolve(response({ ...savedMarket(), quotes: [{ ...quote, price: '999' }] })));
+    expect(view.result.current.data?.quotes[0].price).toBe('61200');
+    expect(view.result.current.error).toBeNull();
+  });
+
+  it('resumes an interrupted read on visibility return even with automatic refresh off', async () => {
+    const pending = deferred<Response>();
+    const fetchMock = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValue(response(savedMarket()));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(() => useMarketData(false));
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    await act(async () => view.result.current.refresh());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve(response(marketData())));
+    expect(view.result.current.data?.quotes).toHaveLength(1);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

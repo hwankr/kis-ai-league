@@ -7,6 +7,7 @@ import type { ChartInterval, StockChartData } from '../types';
 import { catalog, element, marketData, response, snapshot, tradeHistory } from './fixtures';
 import { experiments } from './experiment-fixtures';
 import { timefolio } from './timefolio-fixtures';
+import { research } from './research-fixtures';
 
 function candidates(): CandidateComparisonData {
   const common = { status: 'ok' as const, error: null, as_of: '2026-10-02', close: '1000',
@@ -46,6 +47,8 @@ function installFetch() {
     if (url === '/api/market') return Promise.resolve(response(marketData()));
     if (url === '/api/experiments') return Promise.resolve(response(experiments()));
     if (url === '/api/timefolio') return Promise.resolve(response(timefolio()));
+    if (url === '/api/research') return Promise.resolve(response(research()));
+    if (url === '/api/competition') return Promise.resolve(response({ error: '대회 요건 조회 실패' }, 503));
     if (url === '/api/operations') return Promise.resolve(response({
       dashboard: { status: 'ok', updated_at: null },
       mirror: { status: 'stopped', updated_at: null, reason: null, can_start: true, can_stop: false }, busy: false, error: null,
@@ -69,8 +72,15 @@ async function chooseFilter(label: string, option: string) {
   await userEvent.click(screen.getByRole('option', { name: option }));
 }
 
-async function ready() {
+async function accountReady() {
   await waitFor(() => expect(element('connection-label').textContent).toBe('계좌 연결됨'));
+}
+
+async function marketReady() {
+  await waitFor(() => {
+    expect(element('collector-status').textContent).toBe('수집 전');
+    expect(element('market-quotes').getAttribute('aria-busy')).toBe('false');
+  });
 }
 
 async function chartReady(symbol: string, interval: ChartInterval) {
@@ -102,7 +112,7 @@ describe('page navigation', () => {
     installFetch();
     window.history.replaceState(null, '', '#/account');
     render(<App/>);
-    await ready();
+    await accountReady();
     const destinations = [
       ['내 계좌', 'account', '총 평가금액'], ['거래 내역', 'trades', '체결 내역'],
       ['후보 탐색', 'candidates', '후보 종목 비교'], ['시세·차트', 'chart', '종목 차트'],
@@ -113,6 +123,12 @@ describe('page navigation', () => {
     for (const [label, route, heading] of destinations) {
       await userEvent.click(menu().getByRole('link', { name: label }));
       await waitFor(() => expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(label));
+      if (route === 'account') await accountReady();
+      else if (route === 'trades') await screen.findByText('해당 기간 체결 없음');
+      else if (route === 'candidates') await screen.findByRole('button', { name: '삼성전자 차트 보기' });
+      else if (route === 'chart') await marketReady();
+      else if (route === 'experiments') await screen.findByRole('button', { name: '타임폴리오 연동 시작' });
+      else if (route === 'timefolio') await screen.findByText('1,012.5');
       expect(window.location.hash).toBe(`#/${route}`);
       expect(menu().getAllByRole('link', { current: 'page' })).toHaveLength(1);
       expect(menu().getByRole('link', { name: label }).getAttribute('aria-current')).toBe('page');
@@ -129,7 +145,7 @@ describe('page navigation', () => {
     window.history.replaceState(null, '', '#/account');
     localStorage.setItem('kis-dashboard-account', 'league');
     render(<App/>);
-    await ready();
+    await accountReady();
     expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/timefolio')).toBe(false);
     await userEvent.click(menu().getByRole('link', { name: '타임폴리오' }));
     await screen.findByText('1,012.5');
@@ -137,6 +153,7 @@ describe('page navigation', () => {
     expect(screen.queryByRole('combobox', { name: /계좌/ })).toBeNull();
     expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/timefolio')).toHaveLength(1);
     await userEvent.click(menu().getByRole('link', { name: '내 계좌' }));
+    await accountReady();
     expect(localStorage.getItem('kis-dashboard-account')).toBe('league');
     expect(element('asset-history').dataset.accountId).toBe('league');
     expect(screen.queryByRole('heading', { name: '계좌 현황' })).toBeNull();
@@ -224,7 +241,8 @@ describe('page navigation', () => {
     const push = vi.spyOn(window.history, 'pushState');
     render(<App/>);
     await waitFor(() => expect(window.location.hash).toBe(href));
-    await ready();
+    if (href === '#/candidates') await screen.findByRole('button', { name: '삼성전자 차트 보기' });
+    else await marketReady();
     expect(screen.getByRole('heading', { level: 1, name: title })).toBeTruthy();
     expect(replace).toHaveBeenCalledWith(null, '', href);
     expect(push).not.toHaveBeenCalled();
@@ -251,7 +269,7 @@ describe('page navigation', () => {
     for (const href of ['#/chart?symbol=bad&interval=day', '#/chart?symbol=005930&interval=week', '#/chart?symbol=&interval=5m']) {
       window.history.replaceState(null, '', href);
       const view = render(<App/>);
-      await ready();
+      await marketReady();
       expect(screen.getByRole('alert').textContent).toBe('차트 주소의 종목코드 또는 주기가 올바르지 않습니다.');
       expect(screen.getByRole('heading', { level: 1, name: '시세·차트' })).toBeTruthy();
       expect(chartRequests(fetchMock)).toEqual([]);

@@ -30,7 +30,6 @@
 .lab-issue p { margin: 8px 0 0; color: var(--secondary); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .lab-issue .lab-issue-question { color: var(--muted); font-size: 12px; }
 .lab-issue-actions { display: flex; flex-wrap: wrap; gap: 7px; }
-.lab-no-issues { margin: 0 0 20px; color: var(--muted); font-size: 12px; }
 .lab-owned-account { margin-bottom: 22px; padding: 16px; border: 1px solid #edf0f3; border-radius: 9px; }
 .lab-owned-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .lab-owned-heading h3 { margin: 0; font-size: 13px; font-weight: 500; }
@@ -57,6 +56,10 @@
 .lab-learning-table tbody th { font-weight: 400; }
 .lab-learning-table th:not(:first-child), .lab-learning-table td { text-align: right; }
 .lab-learning-reason { margin: 12px 0 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.lab-daily-learning { margin-bottom: 22px; }
+.lab-daily-candidate { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.lab-long-term { margin-top: 22px; padding-top: 16px; border-top: 1px solid #edf0f3; }
+.lab-long-term > summary { width: fit-content; margin-bottom: 18px; color: var(--muted); font-size: 12px; line-height: 1.7; cursor: pointer; }
 .lab-learning-change { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 18px; padding-top: 16px; border-top: 1px solid #edf0f3; font-size: 12px; line-height: 1.7; }
 .lab-learning-change > span, .lab-learning-change time { color: var(--muted); }
 .lab-learning-change strong { font-weight: 500; }
@@ -96,7 +99,7 @@
 .lab-card-title { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: center; gap: 8px; }
 .lab-card-title h3 { margin: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
 .lab-tag { background: #edf5ff; color: var(--blue); }
-.lab-strategy-card p { min-height: 38px; margin: 12px 0 20px; font-size: 12px; line-height: 1.65; color: var(--muted); overflow-wrap: anywhere; }
+.lab-strategy-card p { margin: 12px 0 20px; font-size: 12px; line-height: 1.65; color: var(--muted); overflow-wrap: anywhere; }
 .lab-strategy-card dl { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 8px; margin: 0; }
 .lab-strategy-card dt { color: var(--muted); font-size: 11px; }
 .lab-strategy-card dd { margin: 7px 0 0; font-size: 17px; font-weight: 500; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -110,7 +113,6 @@
 .lab-strategy-card .lab-shadow-metrics dd .lab-metric-divider { font-size: 11px; }
 .lab-strategy-card .lab-shadow-counts { display: flex; flex-wrap: wrap; gap: 5px 12px; min-height: 0; margin: 12px 0 0; font-size: 11px; }
 .lab-comparison-basis { margin: 0 0 14px; color: var(--muted); font-size: 11px; }
-.lab-version { display: block; margin-top: 16px; color: #919ba8; font-size: 10px; overflow-wrap: anywhere; }
 .lab-subtle { color: var(--muted); font-size: 12px; }
 .lab-filters { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); max-width: 600px; gap: 16px; margin: 0 0 16px; }
 .lab-filters .styled-select-field { min-width: 0; }

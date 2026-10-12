@@ -1,26 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { numeric } from './format';
+import useAccountCatalog from './useAccountCatalog';
 import useTradeHistory from './useTradeHistory';
 import type { AccountChoice, AccountSnapshot, HistoryData, HistoryPlaceholder, Holding, Numeric, Summary } from './types';
 
-const ACCOUNT_STORAGE_KEY = 'kis-dashboard-account';
 const REFRESH_MS = 30_000;
-const CONNECTION_ERROR = '계좌를 불러오지 못했습니다. 서버 연결 상태를 확인한 뒤 다시 조회해 주세요.';
+const CONNECTION_ERROR = '계좌 조회 실패 · 서버 연결 확인 필요';
 const clearedAccount = {
   snapshot: null,
   history: null,
-  historyPlaceholder: { state: 'loading', message: '이력을 불러오는 중' } as HistoryPlaceholder,
+  historyPlaceholder: { state: 'loading', message: '조회 중' } as HistoryPlaceholder,
   error: null,
   status: 'loading',
   statusLabel: '계좌 연결 중',
   announcement: '',
-  emptyTitle: '계좌를 불러오고 있어요',
+  emptyTitle: '조회 중',
 } as const;
 
 interface DashboardState {
-  accounts: AccountChoice[];
-  selectedId: string | null;
-  catalogLoaded: boolean;
   loading: boolean;
   snapshot: AccountSnapshot | null;
   history: HistoryData | null;
@@ -32,11 +29,6 @@ interface DashboardState {
   emptyTitle: string;
 }
 
-function savedSelection(): string | null {
-  try { return localStorage.getItem(ACCOUNT_STORAGE_KEY) || null; }
-  catch { return null; }
-}
-
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : null;
@@ -44,22 +36,6 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function message(value: unknown, fallback: string): string {
   return typeof value === 'string' && value ? value : fallback;
-}
-
-function readCatalog(value: unknown): { accounts: AccountChoice[]; defaultId: string | null } {
-  const catalog = record(value);
-  if (!catalog || !Array.isArray(catalog.accounts)) throw new Error('Invalid account catalog');
-  const ids = new Set<string>();
-  const accounts = catalog.accounts.map((value: unknown): AccountChoice => {
-    const account = record(value);
-    if (!account || typeof account.id !== 'string' || !account.id || ids.has(account.id)
-      || typeof account.name !== 'string' || typeof account.configured !== 'boolean') {
-      throw new Error('Invalid account catalog');
-    }
-    ids.add(account.id);
-    return { id: account.id, name: account.name, configured: account.configured };
-  });
-  return { accounts, defaultId: typeof catalog.default_account === 'string' ? catalog.default_account : null };
 }
 
 function readNumber(value: unknown): Numeric {
@@ -105,39 +81,52 @@ function readSnapshot(data: Record<string, unknown>, account: AccountChoice, his
     account: { id: account.id, name: account.name }, updated_at: data.updated_at,
     refresh_interval_seconds: numeric(data.refresh_interval_seconds) ?? 30, stale: data.stale === true,
     error: typeof data.error === 'string' ? data.error : null, summary, holdings,
-    history: history ?? { points: [], total_count: 0, error: '이력을 불러오지 못했습니다' },
+    history: history ?? { points: [], total_count: 0, error: '이력 조회 실패' },
   };
 }
 
-export default function useAccountDashboard() {
-  const trades = useTradeHistory();
-  const { refresh: refreshTrades, clear: clearTrades } = trades;
-  const [initialSelection] = useState(savedSelection);
-  const [state, setState] = useState<DashboardState>(() => ({
-    ...clearedAccount, accounts: [], selectedId: initialSelection, catalogLoaded: false, loading: true,
-  }));
+export default function useAccountDashboard({ catalogEnabled = true, balanceEnabled = true, tradesEnabled = true } = {}) {
+  const catalog = useAccountCatalog(catalogEnabled);
+  const selectedAccount = catalog.accounts.find(account => account.id === catalog.selectedId);
+  const account = catalog.loaded && !catalog.error && selectedAccount?.configured ? selectedAccount : null;
+  const accountId = account?.id ?? null;
+  const trades = useTradeHistory(tradesEnabled);
+  const { refresh: refreshTrades, clear: clearTrades, cancel: cancelTrades } = trades;
+  const [state, setState] = useState<DashboardState>(() => ({ ...clearedAccount, loading: false }));
   const [autoRefresh, setAutoRefresh] = useState(true);
   const session = useRef({
-    accounts: [] as AccountChoice[], selectedId: initialSelection, catalogLoaded: false,
-    selectionInitialized: initialSelection !== null, generation: 0, inFlight: false,
+    account, balanceEnabled, tradesEnabled, catalogLoading: catalog.loading, tradesLoading: trades.loading,
+    resumePending: false, generation: 0, inFlight: false,
     controller: null as AbortController | null, timeout: undefined as number | undefined, mounted: false,
   });
+
+  const cancelBalance = useCallback(() => {
+    const current = session.current;
+    ++current.generation;
+    current.controller?.abort();
+    window.clearTimeout(current.timeout);
+    current.controller = null;
+    current.timeout = undefined;
+    current.inFlight = false;
+    setState(previous => previous.loading ? { ...previous, loading: false } : previous);
+  }, []);
 
   const fail = useCallback((error: string) => {
     setState(previous => ({
       ...previous,
       historyPlaceholder: previous.historyPlaceholder.state === 'loading'
-        ? { state: 'error', message: '이력을 불러오지 못했습니다' } : previous.historyPlaceholder,
-      error: previous.snapshot ? `${error} 이전 조회 데이터를 표시하고 있습니다.` : error,
+        ? { state: 'error', message: '이력 조회 실패' } : previous.historyPlaceholder,
+      error: previous.snapshot ? `${error} · 이전 데이터` : error,
       status: 'stale', statusLabel: previous.snapshot ? '갱신 지연 · 이전 데이터' : '연결 확인 필요',
-      emptyTitle: previous.snapshot ? previous.emptyTitle : '계좌 정보를 불러오지 못했습니다',
+      emptyTitle: previous.snapshot ? previous.emptyTitle : '계좌 조회 실패',
       announcement: '계좌 조회에 실패했습니다.',
     }));
   }, []);
 
-  const refresh = useCallback(async ({ reloadAccounts = false, switchAccount = false } = {}) => {
+  const refreshBalance = useCallback(async () => {
     const current = session.current;
-    if (!current.mounted || (current.inFlight && !switchAccount) || document.hidden) return;
+    const account = current.account;
+    if (!current.mounted || !current.balanceEnabled || !account || current.inFlight || document.hidden) return;
     const generation = ++current.generation;
     current.controller?.abort();
     window.clearTimeout(current.timeout);
@@ -147,64 +136,25 @@ export default function useAccountDashboard() {
     setState(previous => ({ ...previous, loading: true }));
     const timeout = window.setTimeout(() => controller.abort(), 25_000);
     current.timeout = timeout;
-    const isCurrent = () => current.mounted && generation === current.generation;
-    let readingCatalog = reloadAccounts || !current.catalogLoaded;
+    const isCurrent = () => current.mounted && current.balanceEnabled && !document.hidden
+      && generation === current.generation && current.account?.id === account.id;
     try {
       const options: RequestInit = {
         headers: { Accept: 'application/json', 'X-KIS-Dashboard': '1' }, cache: 'no-store', signal: controller.signal,
       };
-      if (readingCatalog) {
-        const response = await fetch('/api/accounts', options);
-        const payload: unknown = await response.json();
-        if (!isCurrent()) return;
-        if (!response.ok) {
-          clearTrades();
-          setState(previous => ({ ...previous, ...clearedAccount,
-            historyPlaceholder: { state: 'error', message: '계좌 설정을 확인해 주세요' } }));
-          fail(message(record(payload)?.error, '계좌 목록을 불러오지 못했습니다. 설정을 확인한 뒤 새로고침해 주세요.'));
-          return;
-        }
-        const catalog = readCatalog(payload);
-        current.accounts = catalog.accounts;
-        current.catalogLoaded = true;
-        if (!current.selectionInitialized) {
-          current.selectedId = catalog.defaultId;
-          current.selectionInitialized = true;
-        }
-        setState(previous => ({ ...previous, accounts: catalog.accounts, selectedId: current.selectedId, catalogLoaded: true }));
-        readingCatalog = false;
-      }
-
-      const account = current.accounts.find(account => account.id === current.selectedId);
-      if (!account?.configured) {
-        clearTrades();
-        setState(previous => ({
-          ...previous, ...clearedAccount,
-          historyPlaceholder: { state: 'empty', message: account ? '계좌 설정이 필요합니다' : '조회할 계좌를 선택해 주세요' },
-          error: account ? '이 계좌는 설정이 필요해요. 계좌 설정을 완료한 뒤 새로고침해 주세요.'
-            : current.selectedId ? '선택했던 계좌가 목록에 없어요. 조회할 계좌를 다시 선택해 주세요.'
-              : '조회할 계좌를 선택해 주세요. 등록된 계좌가 없다면 계좌 설정 후 새로고침해 주세요.',
-          emptyTitle: account ? '계좌 설정이 필요해요' : '계좌를 선택해 주세요',
-          status: 'stale', statusLabel: '계좌 선택 확인', announcement: '계좌 조회에 실패했습니다.',
-        }));
-        return;
-      }
-
       const requestAccountId = account.id;
-      void refreshTrades(requestAccountId);
       const response = await fetch(`/api/account?account=${encodeURIComponent(requestAccountId)}`, options);
       const payload: unknown = await response.json();
-      if (!isCurrent() || requestAccountId !== current.selectedId) return;
+      if (!isCurrent()) return;
+      if (controller.signal.aborted) throw new Error('Request timed out');
       if (response.status === 404) {
-        clearTrades();
         setState(previous => ({ ...previous, ...clearedAccount }));
-        fail('선택한 계좌를 찾을 수 없어요. 새로고침 후 계좌를 다시 선택해 주세요.');
+        fail('선택 계좌 없음 · 새로고침 후 다시 선택');
         return;
       }
       const data = record(payload);
       if (!data || (data.status !== 'ok' && data.status !== 'error')) throw new Error('Invalid response');
       if (record(data.account)?.id !== requestAccountId) {
-        clearTrades();
         // A config failure or mismatched identity cannot reuse a previous account's values.
         setState(previous => ({ ...previous, ...clearedAccount }));
         fail(message(data.error, CONNECTION_ERROR));
@@ -216,11 +166,11 @@ export default function useAccountDashboard() {
       const history = readHistory(data.history);
       const snapshot = readSnapshot(data, account, history);
       setState(previous => ({
-        ...previous, history, historyPlaceholder: { state: 'error', message: '이력을 불러오지 못했습니다' },
-        ...(snapshot ? { snapshot, emptyTitle: '아직 보유한 주식이 없어요' } : {}),
+        ...previous, history, historyPlaceholder: { state: 'error', message: '이력 조회 실패' },
+        ...(snapshot ? { snapshot, emptyTitle: '보유 종목 없음' } : {}),
       }));
       if (!response.ok || data.status === 'error' || data.stale) {
-        fail(message(data.error, '계좌 정보를 갱신하지 못했습니다.'));
+        fail(message(data.error, '계좌 갱신 실패'));
       } else if (snapshot) {
         setState(previous => ({ ...previous, error: null, status: 'connected', statusLabel: '계좌 연결됨',
           announcement: '계좌 정보가 갱신되었습니다.' }));
@@ -229,11 +179,6 @@ export default function useAccountDashboard() {
       }
     } catch {
       if (!isCurrent()) return;
-      if (readingCatalog) {
-        clearTrades();
-        setState(previous => ({ ...previous, ...clearedAccount,
-          historyPlaceholder: { state: 'error', message: '계좌 목록을 확인해 주세요' } }));
-      }
       fail(CONNECTION_ERROR);
     } finally {
       window.clearTimeout(timeout);
@@ -244,48 +189,80 @@ export default function useAccountDashboard() {
         setState(previous => ({ ...previous, loading: false }));
       }
     }
-  }, [fail, refreshTrades, clearTrades]);
+  }, [fail]);
 
-  const selectAccount = useCallback((id: string) => {
+  const refreshCurrent = useCallback(() => {
     const current = session.current;
-    if (current.selectedId === id || !current.accounts.some(account => account.id === id && account.configured)) return;
-    current.selectedId = id;
-    clearTrades();
-    current.selectionInitialized = true;
-    try { localStorage.setItem(ACCOUNT_STORAGE_KEY, id); } catch { /* Selection also works without storage. */ }
-    setState(previous => ({ ...previous, ...clearedAccount, selectedId: id }));
-    void refresh({ switchAccount: true });
-  }, [refresh, clearTrades]);
+    if (!current.mounted || !current.account || current.catalogLoading || !catalog.isReady() || document.hidden) return;
+    current.resumePending = false;
+    if (current.balanceEnabled) void refreshBalance();
+    if (current.tradesEnabled) void refreshTrades(current.account.id);
+  }, [refreshBalance, refreshTrades, catalog.isReady]);
 
-  useEffect(() => {
+  const refresh = useCallback(async ({ reloadAccounts = false } = {}) => {
+    if (reloadAccounts) await catalog.refresh();
+    else refreshCurrent();
+  }, [catalog.refresh, refreshCurrent]);
+
+  useLayoutEffect(() => {
     const current = session.current;
     current.mounted = true;
-    void refresh();
+    return () => { current.mounted = false; cancelBalance(); };
+  }, [cancelBalance]);
+
+  useLayoutEffect(() => {
+    const current = session.current;
+    if ((current.account?.id ?? null) !== accountId) {
+      cancelBalance();
+      clearTrades();
+      setState({ ...clearedAccount, loading: false });
+    }
+    current.account = account;
+    current.catalogLoading = catalog.loading;
+    current.tradesLoading = trades.loading;
+    current.balanceEnabled = balanceEnabled;
+    current.tradesEnabled = tradesEnabled;
+    if (!balanceEnabled) cancelBalance();
+  }, [accountId, account, catalog.loading, trades.loading, balanceEnabled, tradesEnabled, cancelBalance, clearTrades]);
+
+  useEffect(() => {
+    refreshCurrent();
     return () => {
-      current.mounted = false;
-      ++current.generation;
-      current.controller?.abort();
-      window.clearTimeout(current.timeout);
-      current.controller = null;
-      current.timeout = undefined;
-      current.inFlight = false;
+      cancelBalance();
+      cancelTrades();
     };
-  }, [refresh]);
+  }, [balanceEnabled, tradesEnabled, accountId, catalog.loading, catalog.revision, refreshCurrent, cancelBalance, cancelTrades]);
 
   useEffect(() => {
     let timer: number | undefined;
     const schedule = () => {
       window.clearInterval(timer);
-      timer = autoRefresh && !document.hidden ? window.setInterval(() => { void refresh(); }, REFRESH_MS) : undefined;
+      timer = autoRefresh && accountId && (balanceEnabled || tradesEnabled) && !document.hidden
+        ? window.setInterval(refreshCurrent, REFRESH_MS) : undefined;
     };
     const onVisibility = () => {
       schedule();
-      if (autoRefresh && !document.hidden) void refresh();
+      if (document.hidden) {
+        session.current.resumePending = session.current.inFlight || session.current.tradesLoading;
+        cancelBalance(); cancelTrades();
+      } else if (autoRefresh || session.current.resumePending) refreshCurrent();
     };
     schedule();
     document.addEventListener('visibilitychange', onVisibility);
     return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', onVisibility); };
-  }, [autoRefresh, refresh]);
+  }, [autoRefresh, balanceEnabled, tradesEnabled, accountId, refreshCurrent, cancelBalance, cancelTrades]);
 
-  return { ...state, autoRefresh, setAutoRefresh, selectAccount, refresh, trades };
+  const selectionError = catalog.loaded && !account
+    ? selectedAccount ? '계좌 설정 필요 · 설정 후 새로고침'
+      : catalog.selectedId ? '선택 계좌 없음 · 계좌 다시 선택' : '계좌 선택 필요 · 미등록 시 계좌 설정'
+    : null;
+  const unavailable = catalog.error || selectionError;
+  return { ...state, ...(unavailable ? { ...clearedAccount, loading: false, status: 'stale' as const,
+    statusLabel: catalog.error ? '계좌 목록 확인 필요' : '계좌 선택 확인',
+    emptyTitle: catalog.error ? '계좌 목록 확인 필요' : selectedAccount ? '계좌 설정 필요' : '계좌 선택 필요',
+    historyPlaceholder: { state: 'error' as const, message: unavailable } } : {}),
+    loading: balanceEnabled && (state.loading || catalog.loading),
+    accounts: catalog.accounts, selectedId: catalog.selectedId, catalogLoaded: catalog.loaded,
+    catalogLoading: catalog.loading, catalogError: catalog.error, selectionError,
+    autoRefresh, setAutoRefresh, selectAccount: catalog.selectAccount, refresh, refreshCatalog: catalog.refresh, trades };
 }

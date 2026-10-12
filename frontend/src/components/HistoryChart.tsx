@@ -47,8 +47,8 @@ export default function HistoryChart({ history, accountId, accountName, placehol
   const error = typeof history?.error === 'string' ? history.error : '';
   const state = !validHistory ? history === null ? placeholder?.state ?? 'loading' : 'error'
     : error ? 'error' : hasValues ? 'ready' : 'empty';
-  const emptyMessage = !validHistory ? history === null ? placeholder?.message ?? '이력을 불러오는 중' : '이력을 불러오지 못했습니다'
-    : points.length ? '총자산 값이 있는 이력이 없습니다' : error ? '이력을 표시할 수 없습니다' : '저장된 조회 이력이 없습니다';
+  const emptyMessage = !validHistory ? history === null ? placeholder?.message ?? '조회 중' : '이력 조회 실패'
+    : points.length ? '총자산 값 미확인' : error ? '이력 확인 필요' : '저장된 이력 없음';
   const first = points[0];
   const last = points.at(-1);
   const minimum = Math.min(...valued.map((point) => point.value));

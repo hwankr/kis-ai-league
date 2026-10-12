@@ -47,8 +47,7 @@ export function ResearchObservationPanel({ data, loading, error, onRefresh, onSe
 
   return <section id="research-observation" className="research-panel" aria-labelledby="research-title" aria-busy={loading}>
     <div className="panel-heading research-heading">
-      <div className="panel-title research-title"><h2 id="research-title">전진 관찰</h2><span className="research-badge">연구 중 · 미채택</span></div>
-      <span className="research-order-state">자동 주문 없음</span>
+      <div className="panel-title research-title"><h2 id="research-title">전진 관찰</h2><span className="research-badge">미채택</span></div>
     </div>
     <div className="research-meta">
       <span className={warning ? 'research-warning-state' : 'research-state'} role="status">{state}</span>
@@ -70,7 +69,7 @@ export function ResearchObservationPanel({ data, loading, error, onRefresh, onSe
     {warning ? <div className="candidate-warning"><p className="history-error research-error" role="alert">{warning}</p>
       <button type="button" className="candidate-retry" disabled={loading} onClick={onRefresh}>다시 확인</button></div> : null}
     {rows.length ? <>
-      <div className="research-table-note">최근 기록 · 가상 결과 · 비용 후 · 슬리피지 편도 0.1%</div>
+      <div className="research-table-note">비용 후 · 슬리피지 편도 0.1%</div>
       <table className="research-table" aria-label="전진 관찰 신호와 가상 결과">
         <thead><tr><th scope="col">종목</th><th scope="col">신호일 / 구분</th><th scope="col">관찰 상태</th><th scope="col">진입 / 종료</th><th scope="col">가상 수익률</th></tr></thead>
         <tbody>{rows.map(row => {

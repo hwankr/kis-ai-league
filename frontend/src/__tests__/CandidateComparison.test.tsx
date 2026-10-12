@@ -1,5 +1,5 @@
 import { StrictMode } from 'react';
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import App from '../App';
@@ -142,7 +142,7 @@ describe('candidate comparison', () => {
     expect(screen.getByText('1.5배')).toBeTruthy();
     expect(screen.getByRole('link', { name: '대상 목록 출처' }).getAttribute('href')).toBe('https://www.truefriend.com/league');
     expect(screen.getByRole('columnheader', { name: /수정종가/ })).toBeTruthy();
-    expect(screen.getByText('대회 대상 종목 전체')).toBeTruthy();
+    expect(screen.getByText('대상 목록 1종목')).toBeTruthy();
     expect(screen.getByText(/13:00:00 KST/)).toBeTruthy();
     await userEvent.click(screen.getByRole('button', { name: '삼성전자 차트 보기' }));
     expect(select).toHaveBeenCalledWith('005930');
@@ -178,7 +178,7 @@ describe('candidate comparison', () => {
     await chooseFilter('시장', 'KOSDAQ');
     expect(displayedSymbols()).toEqual(['000030']);
     expect(screen.getByText('1종목 · 1 / 1페이지')).toBeTruthy();
-    expect(screen.getByText('전체 31')).toBeTruthy();
+    expect(screen.getByText('대상 목록 31종목')).toBeTruthy();
     expect(screen.getByText('성공 29')).toBeTruthy();
     expect(screen.getByText('제외 1')).toBeTruthy();
     expect(screen.getByText('실패 1')).toBeTruthy();
@@ -310,5 +310,54 @@ describe('candidate comparison', () => {
     expect(document.activeElement).toBe(element('page-title'));
     expect(window.location.hash).toBe(`#/chart?symbol=${symbol}&interval=day`);
     expect(fetchMock.mock.calls.filter(([url]) => url === '/api/candidates')).toHaveLength(1);
+  });
+});
+
+describe('candidate query activity', () => {
+  it('polls a running comparison only on the active visible page and preserves its rows on exit', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(response(comparison({ status: 'running' })));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(({ enabled }) => useCandidateComparison(enabled), { initialProps: { enabled: false } });
+    await act(async () => { await view.result.current.refresh(); await view.result.current.start(); await vi.advanceTimersByTimeAsync(6_000); });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await act(async () => view.rerender({ enabled: true }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    view.rerender({ enabled: false });
+    expect(view.result.current.data?.rows).toHaveLength(1);
+    await act(async () => { await view.result.current.refresh(); await view.result.current.start(); await vi.advanceTimersByTimeAsync(6_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await act(async () => view.rerender({ enabled: true }));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    act(() => fireEvent(document, new Event('visibilitychange')));
+    await act(async () => { await view.result.current.refresh(); await vi.advanceTimersByTimeAsync(6_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    await act(async () => fireEvent(document, new Event('visibilitychange')));
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    view.unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('abandons an in-flight start response without cancelling the server job or accepting stale rows', async () => {
+    const pending = deferred<Response>();
+    const fetchMock = vi.fn().mockResolvedValueOnce(response(comparison()))
+      .mockReturnValueOnce(pending.promise).mockResolvedValue(response(comparison({ status: 'running' })));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderHook(({ enabled }) => useCandidateComparison(enabled), { initialProps: { enabled: true } });
+    await act(async () => {});
+    act(() => { void view.result.current.start(); });
+    expect(fetchMock.mock.calls[1][1].method).toBe('POST');
+    view.rerender({ enabled: false });
+    expect(fetchMock.mock.calls[1][1].signal.aborted).toBe(true);
+    await act(async () => view.rerender({ enabled: true }));
+    await act(async () => pending.resolve(response(comparison({ rows: [row({ close: '999' })] }))));
+    expect(view.result.current.data?.rows[0].close).toBe('61200');
+    expect(view.result.current.data?.status).toBe('running');
+    expect(fetchMock.mock.calls.map(([, options]) => options.method)).toEqual(['GET', 'POST', 'GET']);
+    expect(view.result.current.error).toBeNull();
   });
 });

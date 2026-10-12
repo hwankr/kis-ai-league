@@ -2,7 +2,6 @@
 .research-heading { flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
 .research-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
 .research-badge { padding: 5px 8px; border-radius: 5px; background: #f2f4f6; color: var(--secondary); font-size: 11px; font-weight: 500; white-space: nowrap; }
-.research-order-state { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .research-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted); font-size: 12px; line-height: 1.6; font-variant-numeric: tabular-nums; }
 .research-state { color: var(--blue); }
 .research-warning-state { color: #865b10; }

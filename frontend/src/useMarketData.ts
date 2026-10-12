@@ -47,21 +47,31 @@ function readMarket(data: Record<string, unknown>): MarketData {
   return { ...data, quotes: quotes.length ? symbols.map(symbol => quotes.find(quote => quote.symbol === symbol)!) : [] } as unknown as MarketData;
 }
 
-export default function useMarketData(autoRefresh: boolean) {
+export default function useMarketData(autoRefresh: boolean, enabled = true) {
   const [data, setData] = useState<MarketData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(enabled && !document.hidden);
   const [error, setError] = useState<string | null>(null);
-  const session = useRef({ mounted: false, generation: 0, controller: null as AbortController | null,
-    timeout: undefined as number | undefined });
+  const session = useRef({ mounted: false, enabled: false, generation: 0, controller: null as AbortController | null,
+    timeout: undefined as number | undefined, resumeNeeded: false });
+
+  const cancel = useCallback(() => {
+    const current = session.current;
+    ++current.generation;
+    current.controller?.abort();
+    window.clearTimeout(current.timeout);
+    current.controller = null;
+    current.timeout = undefined;
+  }, []);
 
   const refresh = useCallback(async () => {
     const current = session.current;
-    if (!current.mounted || current.controller || document.hidden) return;
+    if (!current.mounted || !current.enabled || current.controller || document.hidden) return;
     const generation = ++current.generation;
     const controller = new AbortController();
     current.controller = controller;
+    current.resumeNeeded = true;
     setLoading(true);
-    const isCurrent = () => current.mounted && current.generation === generation;
+    const isCurrent = () => current.mounted && current.enabled && !document.hidden && current.generation === generation;
     const timeout = window.setTimeout(() => controller.abort(), 25_000);
     current.timeout = timeout;
     try {
@@ -87,6 +97,7 @@ export default function useMarketData(autoRefresh: boolean) {
       if (isCurrent()) {
         current.controller = null;
         current.timeout = undefined;
+        current.resumeNeeded = false;
         setLoading(false);
       }
     }
@@ -95,31 +106,36 @@ export default function useMarketData(autoRefresh: boolean) {
   useEffect(() => {
     const current = session.current;
     current.mounted = true;
-    void refresh();
+    current.enabled = enabled;
+    if (enabled) {
+      current.resumeNeeded = true;
+      void refresh();
+    }
+    if (!enabled || document.hidden) setLoading(false);
     return () => {
       current.mounted = false;
-      ++current.generation;
-      current.controller?.abort();
-      window.clearTimeout(current.timeout);
-      current.controller = null;
-      current.timeout = undefined;
+      current.enabled = false;
+      cancel();
     };
-  }, [refresh]);
+  }, [enabled, refresh, cancel]);
 
   useEffect(() => {
     let timer: number | undefined;
     const schedule = () => {
       window.clearInterval(timer);
-      timer = autoRefresh && !document.hidden ? window.setInterval(() => { void refresh(); }, 30_000) : undefined;
+      timer = enabled && autoRefresh && !document.hidden ? window.setInterval(() => { void refresh(); }, 30_000) : undefined;
     };
     const onVisibility = () => {
       schedule();
-      if (autoRefresh && !document.hidden) void refresh();
+      if (document.hidden) {
+        cancel();
+        setLoading(false);
+      } else if (enabled && (autoRefresh || session.current.resumeNeeded)) void refresh();
     };
     schedule();
     document.addEventListener('visibilitychange', onVisibility);
     return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', onVisibility); };
-  }, [autoRefresh, refresh]);
+  }, [autoRefresh, enabled, refresh, cancel]);
 
   return { data, loading, error, refresh };
 }

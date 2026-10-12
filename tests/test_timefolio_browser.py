@@ -12,10 +12,19 @@ from unittest.mock import Mock, patch
 
 from backend.kis import KST
 from backend.mirror_runtime import MirrorBlocked, MirrorRejected, MirrorUnknown
-from backend.timefolio_browser import CONTEST, GRID_DOM, ORIGIN, TimefolioBrowser, match_receipt
+from backend.timefolio_browser import CONTEST, GRID_DOM, GUIDELINE_DOM, ORIGIN, TimefolioBrowser, match_receipt
 
 
 NOW = datetime(2026, 10, 12, 10, 0, tzinfo=KST)
+
+# Official visible guideline DOM verified on 2026-10-12; no remote data is loaded.
+GUIDELINE_HTML = """<button>가이드라인 위반</button><table class="simple-tab guideline-tab"><tbody>
+ <tr><td title="주간 순자산 대비 평균 거래대금 비율">주간 회전율<span class="badge">?</span></td>
+ <td>매주 5% 이상 유지</td><td><span style="color: red;">금주 2.3%</span></td><td></td></tr>
+ <tr><td>주간회전율 위반</td><td>위반 3번까지 허용<br>4번 이상 순위/시상 제외</td>
+ <td>금주 제외 (확정)<br>누적<span style="color: red;">0</span>번 위반</td>
+ <td>금주 포함 (예상)<br>누적<span style="color: black;">4</span>번 위반</td></tr>
+ </tbody></table>"""
 
 
 def proposal(**changes):
@@ -752,7 +761,7 @@ class TimefolioGridDOMBrowserTests(unittest.TestCase):
         from tests.test_timefolio_account import observation
         source = observation()
         self.page.set_content("""<fieldset><legend>NAV</legend><span>1,000.08</span>
-          <span>0.08 (0.01%)</span><span>327위 / 2071명</span></fieldset>""")
+          <span>0.08 (0.01%)</span><span>327위 / 2071명</span></fieldset>""" + GUIDELINE_HTML)
         adapter = TimefolioBrowser("unused-local-account-profile")
         adapter.page, adapter._account_key = self.page, source["account_key"]
         adapter._main, adapter._binding = Mock(), Mock()
@@ -766,12 +775,30 @@ class TimefolioGridDOMBrowserTests(unittest.TestCase):
             self.assertEqual(result["summary"]["nav"], "1000.08")
             self.assertEqual(result["summary"]["rank"], 327)
             self.assertEqual(result["holdings"][0]["market_value"], "300")
+            self.assertEqual(result["turnover"], {"current_pct": "2.3", "official_status": "below",
+                                                  "missed_weeks": 0, "source": "official_guideline"})
             adapter._main.assert_called_once_with(receipts_only=False)
             self.page.locator("fieldset").evaluate("e=>e.after(e.cloneNode(true))")
             with self.assertRaisesRegex(ValueError, "account_nav_missing"):
                 adapter.account_snapshot()
         with self.assertRaisesRegex(ValueError, "account_observation_requires_positions"):
             adapter._observation(account_view=True, receipts_only=True)
+
+    def test_guideline_turnover_color_is_separate_from_confirmed_and_projected_counts(self):
+        self.page.set_content(GUIDELINE_HTML.replace('color: red;">금주 2.3%', 'color: black;">금주 5.0%'))
+        self.assertEqual(self.page.evaluate(GUIDELINE_DOM), {
+            "current_text": "금주 5.0%", "current_color": "black", "confirmed_text": "금주 제외 (확정) 누적0번 위반"})
+
+    def test_guideline_missing_ambiguous_or_changed_cells_do_not_supply_guessed_values(self):
+        self.page.set_content("<p>주간 회전율 9.9%</p>")
+        self.assertIsNone(self.page.evaluate(GUIDELINE_DOM))
+        self.page.set_content(GUIDELINE_HTML + GUIDELINE_HTML)
+        self.assertIsNone(self.page.evaluate(GUIDELINE_DOM))
+        self.page.set_content(GUIDELINE_HTML.replace("주간 순자산 대비 평균 거래대금 비율", "다른 기준"))
+        self.assertEqual(self.page.evaluate(GUIDELINE_DOM)["current_text"], "")
+        self.page.set_content(GUIDELINE_HTML.replace("금주 제외 (확정)", "금주 포함 (예상)"))
+        from backend.timefolio_account import _guideline
+        self.assertIsNone(_guideline(self.page.evaluate(GUIDELINE_DOM))["missed_weeks"])
 
     def test_selected_form_rejects_wrong_missing_or_ambiguous_stock_and_missing_required_inputs(self):
         for change in (

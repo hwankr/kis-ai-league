@@ -1,6 +1,6 @@
 """Read-only Timefolio account observations, separate from order decisions."""
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
@@ -88,6 +88,70 @@ def _nav(values):
             "rank": rank, "participants": participants}
 
 
+def _guideline(value):
+    """Keep only displayed official facts, never estimate turnover from NAV."""
+    result = {"current_pct": None, "official_status": "unknown", "missed_weeks": None, "source": None}
+    if not isinstance(value, dict):
+        return result
+    current = value.get("current_text")
+    match = re.fullmatch(r"금주\s+(\d+\.\d)%", current) if isinstance(current, str) else None
+    if match:
+        try:
+            number = _number(match[1], nonnegative=True)
+        except ValueError:
+            pass
+        else:
+            result["current_pct"] = format(number, ".1f")
+            color = value.get("current_color")
+            # The display rounds to one decimal; red 5.0% is still below 5%.
+            if isinstance(color, str) and color in {"red", "rgb(255, 0, 0)"} and number <= 5:
+                result["official_status"] = "below"
+            elif isinstance(color, str) and color in {"black", "rgb(0, 0, 0)"} and number >= 5:
+                result["official_status"] = "met"
+    confirmed = value.get("confirmed_text")
+    match = re.fullmatch(r"금주\s*제외\s*\(확정\)\s*누적\s*(\d+)\s*번\s*위반", confirmed) if isinstance(confirmed, str) else None
+    if match:
+        try:
+            result["missed_weeks"] = _integer(match[1])
+        except ValueError:
+            pass
+    if result["current_pct"] is not None or result["missed_weeks"] is not None:
+        result["source"] = "official_guideline"
+    return result
+
+
+def _turnover(snapshot, current):
+    today = current.astimezone(KST).date()
+    start = today - timedelta(days=today.weekday())
+    result = {"week_start": start.isoformat(), "week_end": (start + timedelta(days=4)).isoformat(),
+              "current_pct": None, "target_pct": 5, "status": "unknown", "missed_weeks": None,
+              "max_missed_weeks": 3, "source": None}
+    if not isinstance(snapshot, dict):
+        return result
+    session = date.fromisoformat(snapshot["session_date"])
+    value = snapshot.get("turnover")
+    if (session > today or session - timedelta(days=session.weekday()) != start
+            or not isinstance(value, dict) or value.get("source") != "official_guideline"):
+        return result
+    try:
+        number = _number(value.get("current_pct"), optional=True, nonnegative=True)
+        missed = _integer(value.get("missed_weeks"), optional=True)
+        if number is not None and number != number.quantize(Decimal("0.1")):
+            return result
+    except (ValueError, InvalidOperation):
+        return result
+    if number is None and missed is None:
+        return result
+    result.update(current_pct=format(number, ".1f") if number is not None else None,
+                  missed_weeks=missed, source="official_guideline")
+    status = value.get("official_status")
+    if start == date(2026, 10, 5):
+        result["status"] = "exempt"
+    elif number is not None and ((status == "below" and number <= 5) or (status == "met" and number >= 5)):
+        result["status"] = status
+    return result
+
+
 def parse_account_snapshot(payload, account_key, contest):
     """Reuse complete CSV/DOM validation, retaining exact account display fields."""
     parsed = parse_snapshot(payload, (), account_key, contest)
@@ -133,7 +197,8 @@ def parse_account_snapshot(payload, account_key, contest):
                        "average_price": _string(_number(detail.get("avgPx"), optional=True, nonnegative=True)),
                        "verified": order["verified"]})
     return {"verified": True, "account_key": account_key, "contest": contest,
-            "session_date": parsed["session_date"], "summary": summary, "holdings": holdings, "orders": orders}
+            "session_date": parsed["session_date"], "summary": summary, "holdings": holdings, "orders": orders,
+            "turnover": _guideline(payload.get("guideline"))}
 
 
 def _context(root):
@@ -172,7 +237,7 @@ def _saved(root):
     return value
 
 
-def _public_data(snapshot, jobs):
+def _public_data(snapshot, jobs, *, now=None):
     if not isinstance(snapshot, dict) or snapshot.get("verified") is not True:
         raise ValueError("account_snapshot_invalid")
     session_date = date.fromisoformat(snapshot["session_date"]).isoformat()
@@ -212,7 +277,8 @@ def _public_data(snapshot, jobs):
                        "system_owned": (identity, symbol, row["side"]) in owned})
     orders.sort(key=lambda row: (row["created_at"] or "", row["order_id"]), reverse=True)
     return {"account": {"name": "타임폴리오", "contest": _name(snapshot["contest"]), "session_date": session_date},
-            "summary": clean_summary, "holdings": holdings, "orders": orders}
+            "summary": clean_summary, "holdings": holdings, "orders": orders,
+            "turnover": _turnover(snapshot, now or datetime.now(timezone.utc))}
 
 
 class AccountCollector:
@@ -243,7 +309,7 @@ class AccountCollector:
                     or snapshot.get("contest") != context["binding"]["contest"]
                     or (_context(self.root) or {}).get("binding") != context["binding"]):
                 raise ValueError("binding_changed")
-            _public_data(snapshot, context["jobs"])
+            _public_data(snapshot, context["jobs"], now=self.now())
             saved = {"version": 1, "binding": context["binding"], "snapshot": snapshot,
                      "updated_at": self.now().astimezone(timezone.utc).isoformat(),
                      "last_attempt_at": attempted, "error_code": None}
@@ -265,7 +331,8 @@ def account_snapshot(root, *, now=None):
     current = now or datetime.now(timezone.utc)
     result = {"status": "waiting", "stale": True, "error": None, "updated_at": None,
               "last_attempt_at": None, "refresh_interval_seconds": INTERVAL,
-              "account": None, "summary": None, "holdings": [], "orders": []}
+              "account": None, "summary": None, "holdings": [], "orders": [],
+              "turnover": _turnover(None, current)}
     try:
         context, saved = _context(root), _saved(root)
         if context is None or not saved:
@@ -281,7 +348,7 @@ def account_snapshot(root, *, now=None):
         if (not isinstance(snapshot, dict) or snapshot.get("account_key") != context["binding"]["account_key"]
                 or snapshot.get("contest") != context["binding"]["contest"] or updated is None):
             raise ValueError("account_snapshot_invalid")
-        public = _public_data(snapshot, context["jobs"])
+        public = _public_data(snapshot, context["jobs"], now=current)
         process = _read(Path(root) / ".local" / "timefolio-mirror-state.json")
         heartbeat = _timestamp(process.get("updated_at"))
         stale = (not -5 <= (current - updated).total_seconds() < STALE_SECONDS
