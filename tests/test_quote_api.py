@@ -212,16 +212,18 @@ class RequestGateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             with request_spacing(path, interval=0.03):
                 raise RuntimeError("request failure")
-        ended = time.monotonic()
+        # Windows Python 3.12 monotonic() has a 15.625 ms tick. Measure this
+        # 30 ms wait with the high-resolution monotonic performance counter.
+        ended = time.perf_counter()
         with request_spacing(path, interval=0.03):
-            self.assertGreaterEqual(time.monotonic() - ended, 0.025)
+            self.assertGreaterEqual(time.perf_counter() - ended, 0.025)
 
     def test_corrupt_request_state_recovers_with_a_safe_delay(self):
         path = self.root / "request.lock"
         path.write_bytes(b"\0NaN")
-        started = time.monotonic()
+        started = time.perf_counter()
         with request_spacing(path, interval=0.03):
-            self.assertGreaterEqual(time.monotonic() - started, 0.025)
+            self.assertGreaterEqual(time.perf_counter() - started, 0.025)
 
 
 if __name__ == "__main__":

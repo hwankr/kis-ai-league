@@ -317,6 +317,42 @@ class TimefolioBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.evaluations, [])
         self.assertEqual(self.submit_clicks(), 0)
 
+    def test_product_validation_accepts_optional_api_prefix_for_buy_and_sell(self):
+        for prefix in ("", "/api"):
+            for side, entry in (("buy", "true"), ("sell", "false")):
+                with self.subTest(prefix=prefix, side=side):
+                    url = ORIGIN + prefix + "/Portfolio/ValidateProduct?d=2026-10-12&prodId=A005930&entry=" + entry
+                    self.page.response_candidates = [SimpleNamespace(
+                        url=url, request=SimpleNamespace(method="GET"), ok=True)]
+                    suggestion = Mock()
+                    self.browser._select_validated(FakeLocator(self.page, "dialog"), suggestion, "005930", side=side)
+                    suggestion.click.assert_called_once_with()
+                    self.assertEqual(self.page.responses[-1], url)
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_product_validation_rejects_wrong_origin_method_date_symbol_side_and_path(self):
+        for prefix in ("", "/api"):
+            path = prefix + "/Portfolio/ValidateProduct"
+            for side, entry, wrong_entry in (("buy", "true", "false"), ("sell", "false", "true")):
+                query = "?d=2026-10-12&prodId=A005930&entry=" + entry
+                for url, method in (
+                    ("https://example.invalid" + path + query, "GET"),
+                    ("http://contest.timefolio.net" + path + query, "GET"),
+                    (ORIGIN + path + query, "POST"),
+                    (ORIGIN + path + query.replace("2026-10-12", "2026-10-11"), "GET"),
+                    (ORIGIN + path + query.replace("A005930", "A000660"), "GET"),
+                    (ORIGIN + path + query.replace("entry=" + entry, "entry=" + wrong_entry), "GET"),
+                    (ORIGIN + path + query + "&prodId=A000660", "GET"),
+                    (ORIGIN + path.replace("ValidateProduct", "Other") + query, "GET"),
+                ):
+                    with self.subTest(prefix=prefix, side=side, url=url, method=method):
+                        self.page.response_candidates = [SimpleNamespace(
+                            url=url, request=SimpleNamespace(method=method), ok=True)]
+                        with self.assertRaises(TimeoutError):
+                            self.browser._select_validated(FakeLocator(self.page, "dialog"), Mock(), "005930", side=side)
+        self.assertEqual(self.page.responses, [])
+        self.assertEqual(self.submit_clicks(), 0)
+
     def test_submit_confirms_exact_new_receipt_with_one_click(self):
         self.browser.receipt_snapshot = Mock(return_value={"verified": True, "session_date": "2026-10-12", "account_key": "account", "contest": CONTEST,
                                                    "orders": [receipt("old"), receipt()]})
@@ -690,6 +726,173 @@ class TimefolioGridDOMBrowserTests(unittest.TestCase):
         result = self.page.locator("#outer").evaluate(GRID_DOM)
         self.assertFalse(result["filtered"])
         self.assertEqual(result["headers"], [{"id": "prodId", "text": "코드"}])
+
+    def _selected_order_form(self):
+        self.page.set_content("""<div role="dialog" aria-label="신규 주문">
+          <input type="text" placeholder="삼성SDI" value="A006400">
+          <input name="d" type="date" value="2026-10-12">
+          <input type="number" step="0.01" value="2.00">
+          <input type="radio" name="매수도" value="true" checked>
+          <input type="radio" name="prcTy" value="Opp" checked>
+          <input type="radio" name="isSlice" value="false" checked>
+          <input type="number" max="10" value="5">
+        </div>""")
+        adapter = TimefolioBrowser("unused-local-form-profile")
+        adapter.page = self.page
+        adapter._binding = Mock()
+        return adapter
+
+    def test_selected_stock_placeholder_is_a_label_and_actual_symbol_is_verified(self):
+        adapter = self._selected_order_form()
+        result = adapter._verify_form(proposal(symbol="006400"))
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["symbol"], "006400")
+
+    def test_account_snapshot_reads_nav_and_full_positions_without_receipt_only_fallback(self):
+        from tests.test_timefolio_account import observation
+        source = observation()
+        self.page.set_content("""<fieldset><legend>NAV</legend><span>1,000.08</span>
+          <span>0.08 (0.01%)</span><span>327위 / 2071명</span></fieldset>""")
+        adapter = TimefolioBrowser("unused-local-account-profile")
+        adapter.page, adapter._account_key = self.page, source["account_key"]
+        adapter._main, adapter._binding = Mock(), Mock()
+        adapter._date = Mock(return_value="2026-10-12")
+        adapter._table = Mock()
+        adapter._grid = Mock(side_effect=lambda table, kind: next(t for t in source["tables"] if t["kind"] == kind))
+        adapter._receipt_tables = Mock(return_value=[t for t in source["tables"] if t["kind"] in {"orders", "order_details"}])
+        # A local fixture is the only page; supply the expected origin as data, never navigate remotely.
+        with patch("backend.timefolio_account.parse_snapshot", return_value={"verified": True, "session_date": "2026-10-12", "orders": []}):
+            result = adapter.account_snapshot()
+            self.assertEqual(result["summary"]["nav"], "1000.08")
+            self.assertEqual(result["summary"]["rank"], 327)
+            self.assertEqual(result["holdings"][0]["market_value"], "300")
+            adapter._main.assert_called_once_with(receipts_only=False)
+            self.page.locator("fieldset").evaluate("e=>e.after(e.cloneNode(true))")
+            with self.assertRaisesRegex(ValueError, "account_nav_missing"):
+                adapter.account_snapshot()
+        with self.assertRaisesRegex(ValueError, "account_observation_requires_positions"):
+            adapter._observation(account_view=True, receipts_only=True)
+
+    def test_selected_form_rejects_wrong_missing_or_ambiguous_stock_and_missing_required_inputs(self):
+        for change in (
+            "document.querySelector('input[placeholder]').value='A005930'",
+            "document.querySelector('input[placeholder]').remove()",
+            "document.querySelector('[role=dialog]').appendChild(document.querySelector('input[placeholder]').cloneNode())",
+            "document.querySelector('input[name=d]').remove()",
+            "document.querySelector('input[step]').remove()",
+            "document.querySelector('input[step]').value=''",
+        ):
+            with self.subTest(change=change):
+                adapter = self._selected_order_form()
+                self.page.evaluate(change)
+                with self.assertRaisesRegex(MirrorBlocked, "destination_form_changed"):
+                    adapter._verify_form(proposal(symbol="006400"))
+
+    def test_receipt_tables_wait_for_expanded_details_rendered_on_animation_frames(self):
+        self.page.set_content("""<button>가이드라인 위반</button>
+          <table><thead><tr><th id="prodId">종목</th><th id="cancel">취소</th></tr></thead></table>
+          <table id="targets"><thead><tr><th id="w2o">미체결</th></tr></thead>
+          <tbody><tr><td data-colid="prodId">A006400</td><td>
+          <button onclick="requestAnimationFrame(() => requestAnimationFrame(() => {
+            document.querySelector('#targets tbody').insertAdjacentHTML('beforeend',
+              '<tr><td colspan=2><table><thead><tr><th id=avgPx>평균가</th></tr></thead>' +
+              '<tbody><tr><td>Done</td></tr></tbody></table></td></tr>');
+          }))">모두 열기</button></td></tr></tbody></table>
+          <table><thead><tr><th id="genT">주문시각</th></tr></thead></table>""")
+        adapter = TimefolioBrowser("unused-local-receipt-profile")
+        adapter.page = self.page
+        adapter._ui_query = Mock()
+        adapter._grid = Mock(side_effect=lambda table, kind, **kwargs: {"kind": kind, **kwargs})
+        self.assertEqual(self.page.locator('table:has(> thead th[id="avgPx"])').count(), 0)
+        tables = adapter._receipt_tables()
+        self.assertEqual(tables, [{"kind": "unaccepted"},
+                                 {"kind": "order_details", "parent_symbol": "006400"},
+                                 {"kind": "orders"}])
+
+    def test_receipt_tables_repeatedly_isolate_unaccepted_grid_from_seven_expanded_details(self):
+        symbols = ["006400", "036930", "042700", "043260", "096770", "240810", "403870"]
+        rows = "".join(f'<tr data-symbol="{symbol}"><td data-colid="prodId">A{symbol}</td></tr>' for symbol in symbols)
+        self.page.set_content("""<button>가이드라인 위반</button>
+          <table id="unaccepted"><thead><tr><th id="prodId">종목</th><th id="cancel">취소</th></tr></thead></table>
+          <table id="targets"><thead><tr><th id="w2o">미체결<button onclick="
+            if(!document.querySelector('#targets').dataset.expanded) {
+              document.querySelector('#targets').dataset.expanded='1';
+              requestAnimationFrame(() => Array.from(document.querySelectorAll('[data-symbol]')).forEach(row =>
+                row.insertAdjacentHTML('afterend', '<tr><td><table><thead><tr>' +
+                  '<th id=ls>조건</th><th id=state>상태</th><th id=avgPx>평균가</th><th id=cancel>정지</th>' +
+                  '</tr></thead><tbody><tr><td>Done</td></tr></tbody></table></td></tr>')));
+            }">모두 열기</button></th></tr></thead><tbody>""" + rows + """</tbody></table>
+          <table><thead><tr><th id="genT">주문시각</th></tr></thead></table>""")
+        adapter = TimefolioBrowser("unused-local-repeated-receipt-profile")
+        adapter.page = self.page
+        adapter._ui_query = Mock()
+        adapter._grid = Mock(side_effect=lambda table, kind, **kwargs: {"kind": kind, **kwargs})
+        self.assertEqual(self.page.locator('table:has(> thead th[id="cancel"])').count(), 1)
+        for _ in range(3):
+            tables = adapter._receipt_tables()
+            self.assertEqual(self.page.locator('table:has(> thead th[id="cancel"])').count(), 8)
+            self.assertEqual(adapter._table("cancel").get_attribute("id"), "unaccepted")
+            self.assertEqual([row["parent_symbol"] for row in tables if row["kind"] == "order_details"], symbols)
+            self.assertEqual(len(tables), 9)
+
+    def test_repeated_account_and_receipt_observations_remount_orders_and_refresh_full_period(self):
+        html = """<button onclick="selectTab('guide')">가이드라인 위반</button>
+          <button onclick="selectTab('orders')">주문 내역</button>
+          <table><thead><tr><th id="prodId">종목</th><th id="cancel">취소</th></tr></thead></table>
+          <table><thead><tr><th id="w2o">미체결</th></tr></thead></table>
+          <table><thead><tr><th id="pos">보유</th></tr></thead></table>
+          <fieldset><legend>NAV</legend><span>1000.00</span><span>0 (0%)</span><span>1위 / 2명</span></fieldset>
+          <div id="content"></div>
+          <script>
+          let active='guide', period;
+          async function refresh(p) {
+            const response=await fetch('/api/Portfolio/Orders?period='+p);
+            const data=await response.json();
+            document.querySelector('#orders').dataset.generation=data.generation;
+            document.querySelector('#orders').dataset.status=data.status;
+          }
+          function selectTab(tab) {
+            if(active===tab) return;
+            active=tab;
+            document.querySelector('#content').innerHTML='';
+            if(tab==='orders') {
+              period='D';
+              document.querySelector('#content').innerHTML='<label for="period_A" onclick="allPeriod()">전체 기간</label>'+
+                '<table id="orders"><thead><tr><th id="genT">주문시각</th></tr></thead></table>';
+              refresh(period);
+            }
+          }
+          function allPeriod() { if(period!=='A') { period='A'; refresh(period); } }
+          </script>"""
+        requests = []
+        def fulfill(route):
+            if route.request.url == ORIGIN + "/fixture":
+                route.fulfill(status=200, content_type="text/html; charset=utf-8", body=html)
+            elif route.request.url.startswith(ORIGIN + "/api/Portfolio/Orders?period="):
+                requests.append(route.request.url.rsplit("=", 1)[1])
+                route.fulfill(status=200, content_type="application/json",
+                              body='{"generation":%d,"status":"%s"}' % (
+                                  len(requests), "Done" if len(requests) >= 6 else "Working"))
+            else:
+                route.abort()
+        self.page.route("**/*", fulfill)
+        self.page.goto(ORIGIN + "/fixture")
+        adapter = TimefolioBrowser("unused-local-tab-profile")
+        adapter.page, adapter._account_key = self.page, "account"
+        adapter._main, adapter._binding = Mock(), Mock()
+        adapter._date = Mock(return_value="2026-10-12")
+        adapter._grid = Mock(side_effect=lambda table, kind, **kwargs: {
+            "kind": kind, **kwargs, **({"generation": table.get_attribute("data-generation"),
+                                       "status": table.get_attribute("data-status")} if kind == "orders" else {})})
+        with patch("backend.timefolio_account.parse_account_snapshot", side_effect=lambda payload, *args: payload), \
+             patch("backend.timefolio_dom.parse_receipts", side_effect=lambda payload, *args: payload):
+            for number, observe in enumerate((adapter.account_snapshot, adapter.receipt_snapshot,
+                                               adapter.account_snapshot), 1):
+                result = observe()
+                orders = next(table for table in result["tables"] if table["kind"] == "orders")
+                self.assertEqual(orders["generation"], str(number * 2))
+                self.assertEqual(orders["status"], "Done" if number == 3 else "Working")
+        self.assertEqual(requests, ["D", "A"] * 3)
 
     def test_lost_persistent_browser_is_detected_and_cleanup_is_idempotent(self):
         with tempfile.TemporaryDirectory() as profile:

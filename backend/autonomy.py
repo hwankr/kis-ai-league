@@ -240,7 +240,7 @@ class AutonomousMonitor:
                 "next_retry_at": engine.get("next_retry_at"),
                 "error": opened[0]["message"] if opened else None, "issues": issues,
                 "performance": self.performance(fingerprint) if include_history else None, "daily_reports": reports,
-                "last_cycle_at": engine.get("last_success_at"),
+                "last_cycle_at": engine.get("last_cycle_at"),
                 "last_monitor_at": self.store.setting("monitor_completed_at")}
 
     def answer(self, body):

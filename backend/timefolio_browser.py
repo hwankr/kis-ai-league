@@ -250,7 +250,11 @@ class TimefolioBrowser:
             "button", name=re.compile("신규 주문")).click())
 
     def _table(self, field):
-        table = self.page.locator(f'table:has(> thead th[id="{field}"])')
+        selector = f'table:has(> thead th[id="{field}"])'
+        if field == "cancel":
+            # Expanded order details also contain cancel; only unaccepted rows have a product column.
+            selector += ':has(> thead th[id="prodId"])'
+        table = self.page.locator(selector)
         if table.count() != 1:
             raise MirrorBlocked("destination_grid_missing_or_ambiguous_" + field)
         return table
@@ -368,7 +372,8 @@ class TimefolioBrowser:
             url = urlsplit(response.url)
             query = parse_qs(url.query)
             return (url.scheme == "https" and url.netloc == "contest.timefolio.net"
-                    and url.path == "/Portfolio/ValidateProduct" and response.request.method == "GET"
+                    and url.path in {"/Portfolio/ValidateProduct", "/api/Portfolio/ValidateProduct"}
+                    and response.request.method == "GET"
                     and query.get("d") == [day] and query.get("prodId") == ["A" + symbol]
                     and query.get("entry") == ["true" if side == "buy" else "false"])
         # Observe completion of the request caused by the UI, never send it or
@@ -382,11 +387,16 @@ class TimefolioBrowser:
         return values[0]
 
     def _receipt_tables(self):
+        # Re-entering Orders must mount a fresh view (including its default date
+        # range). Clicking an already active tab does not issue another GET.
+        self.page.get_by_role("button", name="가이드라인 위반", exact=True).click()
+        self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
         tables = [self._grid(self._table("cancel"), "unaccepted")]
         targets = self._table("w2o")
         expand = targets.get_by_role("button", name="모두 열기", exact=True)
         if expand.count():
             expand.click()
+            self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
         # Details are nested inside the target grid, one for each parent symbol.
         details = self.page.locator('table:has(> thead th[id="avgPx"])')
         for i in range(details.count()):
@@ -407,11 +417,21 @@ class TimefolioBrowser:
         tables.append(self._grid(self._table("genT"), "orders"))
         return tables
 
-    def _observation(self, *, symbols=(), receipts_only=False):
+    def _observation(self, *, symbols=(), receipts_only=False, account_view=False):
         from backend.timefolio_dom import parse_receipts, parse_snapshot
+        if account_view and receipts_only:
+            raise ValueError("account_observation_requires_positions")
         account = self._account_key or self.identity()
         self._main(receipts_only=receipts_only)
         session_date = self._date()
+        nav = None
+        if account_view:
+            nav = self.page.evaluate("""() => {
+              const fields=Array.from(document.querySelectorAll('fieldset')).filter(
+                e=>e.querySelector('legend')?.textContent.trim()==='NAV');
+              if(fields.length!==1) return null;
+              return Array.from(fields[0].children).filter(e=>e.tagName==='SPAN').map(e=>e.innerText.trim());
+            }""")
         tables = [] if receipts_only else [self._grid(self._table("pos"), "positions"),
                                            self._grid(self._table("w2o"), "targets")]
         tables.extend(self._receipt_tables())
@@ -423,6 +443,9 @@ class TimefolioBrowser:
                  if (job.get("receipt") or {}).get("order_id")}
         payload = {"url": self.page.url, "account_key": account, "contest": self.contest,
                    "session_date": session_date, "tables": tables, "known_receipts": known}
+        if account_view:
+            from backend.timefolio_account import parse_account_snapshot
+            return parse_account_snapshot({**payload, "nav": nav}, account, self.contest)
         if receipts_only:
             return parse_receipts(payload, account, self.contest)
         return parse_snapshot(payload, symbols, account, self.contest)
@@ -432,6 +455,9 @@ class TimefolioBrowser:
 
     def receipt_snapshot(self):
         return self._observation(receipts_only=True)
+
+    def account_snapshot(self):
+        return self._observation(account_view=True)
 
     def prepare(self, proposal):
         self._origin()
@@ -470,15 +496,19 @@ class TimefolioBrowser:
         errors = self._validation_errors(dialog)
         if errors:
             raise MirrorRejected(self._reason(errors))
-        fields = dialog.evaluate("""e=>({symbol:e.querySelector('[placeholder="종목 선택"]').value,
-          date:e.querySelector('[name=d]').value,weight:e.querySelector('[step="0.01"]').value,
+        fields = dialog.evaluate("""e=>{
+          const value=selector=>{const inputs=e.querySelectorAll(selector);
+            return inputs.length===1 ? inputs[0].value : null;};
+          return {symbol:value('input[placeholder]'),
+          date:value('input[name=d]'),weight:value('input[type=number][step="0.01"]'),
           side:e.querySelector('[name="매수도"]:checked')?.value,
           kind:e.querySelector('[name=prcTy]:checked')?.value,
           slice:e.querySelector('[name=isSlice]:checked')?.value,
           level:e.querySelector('input[max="10"]')?.value,
           exitAll:!!e.querySelector('input[type=checkbox]:checked'),
-          valid:Array.from(e.querySelectorAll('input')).every(i=>i.validity.valid)})""")
+          valid:Array.from(e.querySelectorAll('input')).every(i=>i.validity.valid)};}""")
         if (fields["symbol"] != "A" + proposal["symbol"] or fields["date"] != proposal["session_date"]
+                or not fields.get("weight")
                 or Decimal(fields["weight"]) != Decimal(proposal["weight"])
                 or fields["side"] != ("true" if proposal["side"] == "buy" else "false")
                 or fields["kind"] != "Opp" or fields["slice"] != "false" or fields["level"] != "5"

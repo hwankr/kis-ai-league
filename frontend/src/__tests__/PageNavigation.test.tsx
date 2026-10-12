@@ -6,6 +6,7 @@ import type { CandidateComparisonData, CandidateRow } from '../candidates';
 import type { ChartInterval, StockChartData } from '../types';
 import { catalog, element, marketData, response, snapshot, tradeHistory } from './fixtures';
 import { experiments } from './experiment-fixtures';
+import { timefolio } from './timefolio-fixtures';
 
 function candidates(): CandidateComparisonData {
   const common = { status: 'ok' as const, error: null, as_of: '2026-10-02', close: '1000',
@@ -44,6 +45,7 @@ function installFetch() {
     if (url.startsWith('/api/trades?')) return Promise.resolve(response(tradeHistory(url)));
     if (url === '/api/market') return Promise.resolve(response(marketData()));
     if (url === '/api/experiments') return Promise.resolve(response(experiments()));
+    if (url === '/api/timefolio') return Promise.resolve(response(timefolio()));
     if (url === '/api/operations') return Promise.resolve(response({
       dashboard: { status: 'ok', updated_at: null },
       mirror: { status: 'stopped', updated_at: null, reason: null, can_start: true, can_stop: false }, busy: false, error: null,
@@ -96,7 +98,7 @@ describe('page navigation', () => {
     expect(fetchMock.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false);
   });
 
-  it('exposes five menu destinations and only the active page content', async () => {
+  it('exposes six menu destinations and only the active page content', async () => {
     installFetch();
     window.history.replaceState(null, '', '#/account');
     render(<App/>);
@@ -105,8 +107,9 @@ describe('page navigation', () => {
       ['내 계좌', 'account', '총 평가금액'], ['거래 내역', 'trades', '체결 내역'],
       ['후보 탐색', 'candidates', '후보 종목 비교'], ['시세·차트', 'chart', '종목 차트'],
       ['운용실', 'experiments', 'AI 운용'],
+      ['타임폴리오', 'timefolio', '계좌 현황'],
     ] as const;
-    expect(menu().getAllByRole('link')).toHaveLength(5);
+    expect(menu().getAllByRole('link')).toHaveLength(6);
     for (const [label, route, heading] of destinations) {
       await userEvent.click(menu().getByRole('link', { name: label }));
       await waitFor(() => expect(screen.getByRole('heading', { level: 1 }).textContent).toBe(label));
@@ -119,6 +122,25 @@ describe('page navigation', () => {
         if (other !== route) expect(screen.queryByRole('heading', { level: 2, name: otherHeading })).toBeNull();
       }
     }
+  });
+
+  it('loads Timefolio only on its route and preserves the selected KIS account', async () => {
+    const fetchMock = installFetch();
+    window.history.replaceState(null, '', '#/account');
+    localStorage.setItem('kis-dashboard-account', 'league');
+    render(<App/>);
+    await ready();
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/timefolio')).toBe(false);
+    await userEvent.click(menu().getByRole('link', { name: '타임폴리오' }));
+    await screen.findByText('1,012.5');
+    expect(element('refresh-button').closest('[hidden]')).toBeTruthy();
+    expect(screen.queryByRole('combobox', { name: /계좌/ })).toBeNull();
+    expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/timefolio')).toHaveLength(1);
+    await userEvent.click(menu().getByRole('link', { name: '내 계좌' }));
+    expect(localStorage.getItem('kis-dashboard-account')).toBe('league');
+    expect(element('asset-history').dataset.accountId).toBe('league');
+    expect(screen.queryByRole('heading', { name: '계좌 현황' })).toBeNull();
+    expect(fetchMock.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false);
   });
 
   it('retains candidate search, market, selection, sort and page after opening a chart and returning', async () => {

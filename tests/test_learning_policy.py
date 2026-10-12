@@ -126,6 +126,21 @@ class FrameTests(unittest.TestCase):
         self.assertAlmostEqual(feature["close_sma20_pct"], (120 / 101 - 1) * 100)
         self.assertAlmostEqual(feature["close_sma60_pct"], (120 / (6020 / 60) - 1) * 100)
 
+    def test_cached_date_keys_and_string_keys_produce_identical_frames(self):
+        data = self.data()
+        expected = build_frame(data)
+        data['benchmarks'] = {board: {date.fromisoformat(day): value for day, value in values.items()}
+                              for board, values in data['benchmarks'].items()}
+        self.assertEqual(build_frame(data), expected)
+
+    def test_conflicting_date_aliases_do_not_choose_an_arbitrary_benchmark(self):
+        data = self.data()
+        day = data['as_of']
+        data['benchmarks']['KOSPI'][date.fromisoformat(day)] = 1000
+        self.assertEqual(build_frame(data)['benchmark_prices'], {'KOSPI': 1000})
+        data['benchmarks']['KOSPI'][date.fromisoformat(day)] = 999
+        self.assertEqual(build_frame(data)['benchmark_prices'], {})
+
     def test_future_bars_do_not_change_frame_and_before_close_is_rejected(self):
         data = self.data()
         before = build_frame(data)

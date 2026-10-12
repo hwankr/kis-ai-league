@@ -423,6 +423,10 @@ class DashboardServer(ThreadingHTTPServer):
         health = self.health()
         return {**payload, "dashboard": {key: health[key] for key in ("status", "updated_at")}}
 
+    def timefolio_snapshot(self):
+        from backend.timefolio_account import account_snapshot
+        return account_snapshot(ROOT)
+
     def health(self):
         service = self.experiment_service
         worker = getattr(service, "worker", None)
@@ -476,7 +480,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         path = url.path
-        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates", "/api/research", "/api/experiments", "/api/mirror", "/api/health", "/api/operations"):
+        if path in ("/api/account", "/api/accounts", "/api/trades", "/api/market", "/api/chart", "/api/candidates", "/api/research", "/api/experiments", "/api/mirror", "/api/timefolio", "/api/health", "/api/operations"):
             origin = self.headers.get("Origin")
             if (self.headers.get("X-KIS-Dashboard") != "1"
                     or (origin is not None and origin not in self.server.origins)
@@ -484,6 +488,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "대시보드에서 계좌를 조회하세요."})
                 return
             params = parse_qs(url.query, keep_blank_values=True)
+            if path == "/api/timefolio":
+                if params:
+                    self.json_response(400, {"error": "타임폴리오 계좌 조회에는 추가 조건을 지정할 수 없습니다."})
+                else:
+                    try:
+                        self.json_response(200, self.server.timefolio_snapshot())
+                    except Exception:
+                        self.json_response(503, {"error": "타임폴리오 계좌 기록을 읽지 못했습니다."})
+                return
             if path == "/api/operations":
                 if params:
                     self.json_response(400, {"error": "실행 상태 조회에는 추가 조건을 지정할 수 없습니다."})

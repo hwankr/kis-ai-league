@@ -217,7 +217,11 @@ def build_frame(data, baseline_signals=None):
     benchmark_prices = {}
     for board in ("KOSPI", "KOSDAQ"):
         try:
-            price = _number(benchmarks.get(board, {}).get(day), "invalid_benchmark", minimum=0)
+            matching = [_number(value, "invalid_benchmark", minimum=0)
+                        for key, value in benchmarks.get(board, {}).items() if _day(key) == day]
+            if not matching or len(set(matching)) != 1:
+                continue
+            price = matching[0]
             if price > 0:
                 benchmark_prices[board] = price
         except ValueError:

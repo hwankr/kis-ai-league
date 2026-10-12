@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -221,17 +222,24 @@ class MirrorRuntimeTests(unittest.TestCase):
     def test_unknown_response_never_reclicks_and_can_resolve_by_receipt(self):
         self.initialize()
         self.source.fill(2)
-        self.destination.submit_error = MirrorUnknown("response lost")
+        self.destination.submit_error = MirrorUnknown("response lost private-account-and-key")
         self.destination.lookup_unknown = True
         self.assertEqual(self.runtime.tick()["reason"], "unknown_destination_submission")
+        job = self.runtime.snapshot()["jobs"][0]
+        self.assertEqual(job["diagnostic"]["type"], "MirrorUnknown")
+        self.assertNotIn("private", json.dumps(job))
         self.runtime = self.make_runtime()
         self.runtime.tick()
         self.runtime.tick()
+        job = self.runtime.snapshot()["jobs"][0]
+        self.assertEqual(job["reason"], "destination_lookup_unresolved")
+        self.assertEqual(job["diagnostic"]["function"], "_receipt")
         self.assertEqual(len(self.destination.submissions), 1)
         self.destination.lookup_unknown = False
         self.destination.submit_error = None
         self.runtime.tick()
         self.assertEqual(self.runtime.snapshot()["jobs"][0]["status"], "working")
+        self.assertNotIn("diagnostic", self.runtime.snapshot()["jobs"][0])
         self.assertEqual(len(self.destination.submissions), 1)
 
     def test_crash_after_click_recovers_as_unknown_without_repeat(self):
@@ -422,6 +430,27 @@ class MirrorRuntimeTests(unittest.TestCase):
         self.source.read = fail
         self.assertEqual(self.runtime.tick()["reason"], "source_policy_changed")
 
+    def test_unexpected_adapter_diagnostic_excludes_exception_text_and_locals(self):
+        for error_type, reason in ((RuntimeError, "adapter_or_storage_error"),
+                                   (ValueError, "adapter_input_invalid")):
+            with self.subTest(error_type=error_type):
+                def fail(cursor):
+                    private_local = "private-account-and-key"
+                    raise error_type("https://private.example/?password=" + private_local)
+                self.source.read = fail
+                result = self.runtime.tick()
+                self.assertEqual(result["reason"], reason)
+                diagnostic = result["diagnostic"]
+                self.assertEqual(set(diagnostic), {"type", "file", "function", "line", "stack"})
+                self.assertEqual(diagnostic["type"], error_type.__name__)
+                self.assertEqual(diagnostic["file"], "backend/mirror_runtime.py")
+                self.assertEqual(diagnostic["function"], "tick")
+                self.assertGreater(diagnostic["line"], 0)
+                self.assertEqual(diagnostic["stack"], [{key: diagnostic[key] for key in ("file", "function", "line")}])
+                self.assertNotIn("private", json.dumps(result))
+                self.assertNotIn("password", json.dumps(result))
+                self.assertEqual(self.destination.submissions, [])
+
     def test_idle_and_paused_queue_need_no_browser_or_valuation(self):
         self.initialize()
         self.destination.calls.clear()
@@ -473,6 +502,20 @@ class MirrorRuntimeTests(unittest.TestCase):
         with self.store.connect() as db:
             self.assertEqual(db.execute("SELECT n FROM writes").fetchone()[0], 0)
 
+    def test_same_receipt_clears_stale_diagnostic_without_resubmitting(self):
+        self.initialize()
+        self.source.fill(2)
+        self.runtime.tick()
+        job = self.runtime.snapshot()["jobs"][0]
+        previous_receipt = deepcopy(job["receipt"])
+        job["diagnostic"] = {"type": "RuntimeError", "file": "backend/mirror_runtime.py", "function": "_reconcile", "line": 1}
+        self.runtime._save_job(job)
+        self.runtime.tick()
+        job = self.runtime.snapshot()["jobs"][0]
+        self.assertEqual(job["receipt"], previous_receipt)
+        self.assertNotIn("diagnostic", job)
+        self.assertEqual(len(self.destination.submissions), 1)
+
     def test_unknown_submission_does_not_block_another_symbol_or_repeat_itself(self):
         self.initialize()
         self.source.fill(2)
@@ -520,6 +563,7 @@ class MirrorRuntimeTests(unittest.TestCase):
         self.destination.submit = lambda proposal: {**submit(proposal), "weight": None}
         self.runtime.tick()
         self.assertEqual(self.runtime.snapshot()["jobs"][0]["status"], "unknown")
+        self.assertEqual(self.runtime.snapshot()["jobs"][0]["diagnostic"]["function"], "_decimal")
         self.runtime.tick()
         self.assertEqual(len(self.destination.submissions), 1)
 

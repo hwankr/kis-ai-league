@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
 import sys
@@ -26,10 +27,65 @@ PAPER_URL = "https://openapivts.koreainvestment.com:29443"
 KST = timezone(timedelta(hours=9))
 EXECUTION_MAX_DAYS = 90
 TOKEN_LOCK = threading.Lock()
+LOGGER = logging.getLogger(__name__)
+ERROR_BODY_LIMIT = 4096
+REQUEST_KINDS = {
+    "/oauth2/tokenP": "token",
+    "/uapi/domestic-stock/v1/quotations/inquire-price": "quote",
+    "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice": "stock_daily",
+    "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice": "index_daily",
+    "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice": "minutes",
+    "/uapi/domestic-stock/v1/trading/inquire-balance": "balance",
+    "/uapi/domestic-stock/v1/trading/inquire-daily-ccld": "orders",
+    "/uapi/domestic-stock/v1/trading/inquire-psbl-order": "buyability",
+    "/uapi/domestic-stock/v1/trading/order-cash": "order_submit",
+    "/uapi/domestic-stock/v1/trading/order-rvsecncl": "order_cancel",
+}
 
 
 class KisError(Exception):
     """비밀값을 포함하지 않는 사용자용 오류."""
+
+
+def _message_code(data):
+    code = data.get("msg_cd") if isinstance(data, dict) else None
+    return code if isinstance(code, str) and re.fullmatch(r"[A-Z]{3}[0-9]{5}", code) else None
+
+
+def _http_error_code(error):
+    # Read only a bounded error body; never retain or expose messages or headers.
+    try:
+        body = error.read(ERROR_BODY_LIMIT + 1)
+        return _message_code(json.loads(body)) if len(body) <= ERROR_BODY_LIMIT else None
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return None
+    finally:
+        try:
+            error.close()
+        except OSError:
+            pass
+
+
+class KisRequestError(KisError):
+    """허용된 요청 종류와 검증된 오류 코드만 담는 전송 진단."""
+
+    def __init__(self, message, path, *, http_status=None, message_code=None):
+        self.request_kind = REQUEST_KINDS.get(path, "unknown")
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        self.message_code = _message_code({"msg_cd": message_code})
+        self.occurred_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        self.attempts = 1
+        details = [self.request_kind]
+        if self.http_status is not None:
+            details.append(f"HTTP {self.http_status}")
+        if self.message_code:
+            details.append(self.message_code)
+        details.append(self.occurred_at)
+        super().__init__(message + " (" + ", ".join(details) + ")")
+
+    @property
+    def retryable(self):
+        return self.http_status in {500, 502, 503, 504} or self.message_code == "EGW00201"
 
 
 def _execution_today():
@@ -274,7 +330,8 @@ class PaperClient:
                 data = json.load(response)
                 response_headers = dict(response.headers.items())
         except HTTPError as error:
-            raise KisError(f"KIS 요청 실패 (HTTP {error.code}). 설정과 서비스 상태를 확인하세요.") from None
+            raise KisRequestError("KIS 요청 실패", path, http_status=error.code,
+                                  message_code=_http_error_code(error)) from None
         except (URLError, TimeoutError, OSError):
             raise KisError("KIS 연결 실패. 네트워크와 서비스 상태를 확인하세요.") from None
         except (ValueError, UnicodeError):
@@ -282,8 +339,12 @@ class PaperClient:
         if not isinstance(data, dict):
             raise KisError("KIS 응답 형식이 예상과 다릅니다.")
         if "rt_cd" in data and data["rt_cd"] != "0":
-            code = str(data.get("msg_cd", ""))
-            suffix = f" ({code})" if re.fullmatch(r"[A-Z]{3}[0-9]{5}", code) else ""
+            code = _message_code(data)
+            if body is None:
+                raise KisRequestError("KIS 업무 응답 오류", path, http_status=200,
+                                      message_code=code)
+            # Order mutation classification depends on this exact message contract.
+            suffix = f" ({code})" if code else ""
             raise KisError("KIS 업무 응답 오류" + suffix)
         return data, {key.lower(): value for key, value in response_headers.items()}
 
@@ -344,13 +405,35 @@ class PaperClient:
         return token
 
     def _get(self, path, tr_id, params, continuation=""):
-        data, headers = self._request(path, params=params, headers={
+        # Authentication is outside the read retry: tokens and mutations are never retried here.
+        request_headers = {
             "authorization": "Bearer " + self.token(),
             "appkey": self.settings.app_key, "appsecret": self.settings.app_secret,
             "tr_id": tr_id, "custtype": "P", "tr_cont": continuation,
-        })
-        if data.get("rt_cd") != "0":
-            raise KisError("KIS 응답에 성공 코드가 없습니다.")
+        }
+        for attempt in range(2):
+            try:
+                data, headers = self._request(path, params=params, headers=request_headers)
+                if data.get("rt_cd") != "0":
+                    raise KisError("KIS 응답에 성공 코드가 없습니다.")
+                if attempt:
+                    LOGGER.warning("KIS 읽기 재시도 복구 2/2 (%s, %s)", REQUEST_KINDS.get(path, "unknown"),
+                                   datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+                break
+            except KisRequestError as error:
+                error.attempts = attempt + 1
+                if attempt or not error.retryable:
+                    if attempt:
+                        error.args = (f"{error} · {error.attempts}회 시도",)
+                        LOGGER.warning("KIS 읽기 재시도 실패 2/2: %s", str(error))
+                    raise
+                LOGGER.warning("KIS 읽기 재시도 1/2: %s", str(error))
+                # Re-enter both guards so the next attempt observes shared spacing.
+            except KisError:
+                if attempt:
+                    LOGGER.warning("KIS 읽기 재시도 실패 2/2 (%s, %s)", REQUEST_KINDS.get(path, "unknown"),
+                                   datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+                raise
         return data, headers
 
     def quote(self, symbol):

@@ -4,6 +4,7 @@ import type { ChartInterval, ChartRequest } from './types';
 export const pages = [
   { id: 'experiments', label: '운용실' },
   { id: 'account', label: '내 계좌' },
+  { id: 'timefolio', label: '타임폴리오' },
   { id: 'trades', label: '거래 내역' },
   { id: 'candidates', label: '후보 탐색' },
   { id: 'chart', label: '시세·차트' },

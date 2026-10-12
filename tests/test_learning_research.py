@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from backend.experiment_analysis import AnalysisError, CodexLLM, CompatibleLLM
 from backend.learning_policy import BASELINE_POLICY, policy_id, validate_policy
@@ -163,6 +163,76 @@ class ResearchTests(unittest.TestCase):
                 self.assertEqual(a[key], b[key])
             for key in ("cash_reserve", "max_positions", "cancel_after_minutes"):
                 self.assertEqual(normal["policy"][key], hint["policy"][key])
+
+    def test_valid_llm_proposal_is_recorded_before_grammar_wins_development(self):
+        returned = rule()
+        returned["cancel_after_minutes"] = 60
+        recorded = []
+        def evaluate(policy, *args):
+            self.assertEqual(len(recorded), 1)
+            return metrics(1, .5) if policy.get("name") == returned["name"] else metrics(20, 18)
+        llm = SimpleNamespace(generate=lambda *args: returned)
+        with patch("backend.learning_research.portfolio_metrics", side_effect=evaluate):
+            result = propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [], llm,
+                                       on_llm_proposal=recorded.append)
+        self.assertEqual(result["method"], "grammar_development")
+        self.assertEqual(result["development"]["llm_status"], "valid")
+        expected = {**returned, "cancel_after_minutes": BASELINE_POLICY["cancel_after_minutes"]}
+        self.assertEqual(recorded, [validate_policy(expected)])
+        self.assertEqual(returned["cancel_after_minutes"], 60)
+
+    def test_llm_callback_mutation_cannot_change_proposal_or_selection(self):
+        returned = rule()
+        original = deepcopy(returned)
+        llm = SimpleNamespace(generate=lambda *args: returned)
+        def mutate(policy):
+            policy["name"] = "changed by callback"
+            policy["strategies"][0]["conditions"].clear()
+        with patch("backend.learning_research.portfolio_metrics", return_value=metrics()):
+            expected = propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [], llm)
+            actual = propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [], llm,
+                                       on_llm_proposal=mutate)
+        self.assertEqual(actual, expected)
+        self.assertEqual(returned, original)
+
+    def test_llm_proposal_storage_failure_propagates_before_evaluation(self):
+        callback = Mock(side_effect=OSError("storage unavailable"))
+        llm = SimpleNamespace(generate=lambda *args: rule())
+        with patch("backend.learning_research.portfolio_metrics") as evaluate:
+            with self.assertRaisesRegex(OSError, "storage unavailable"):
+                propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [], llm,
+                                  on_llm_proposal=callback)
+        callback.assert_called_once()
+        evaluate.assert_not_called()
+
+    def test_invalid_duplicate_and_failed_llm_proposals_are_not_recorded(self):
+        duplicate = rule()
+        renamed = deepcopy(duplicate)
+        renamed["name"] = "renamed duplicate"
+        renamed["strategies"][0].update(id="renamed", name="renamed")
+        cases = [({"invalid": True}, []), (duplicate, [{"policy": duplicate}]),
+                 (renamed, [{"policy": duplicate}]), (RuntimeError("unavailable"), [])]
+        for output, history in cases:
+            with self.subTest(output_type=type(output).__name__, duplicate=bool(history)):
+                callback = Mock()
+                def generate(*args):
+                    if isinstance(output, Exception):
+                        raise output
+                    return output
+                result = propose_candidate(BASELINE_POLICY, [], LIMITS, history,
+                    SimpleNamespace(generate=generate), on_llm_proposal=callback)
+                callback.assert_not_called()
+                self.assertTrue(result["method"].startswith("grammar_"))
+
+    def test_llm_recording_callback_keeps_return_value_unchanged(self):
+        llm = SimpleNamespace(generate=lambda *args: json.dumps(rule()))
+        with patch("backend.learning_research.portfolio_metrics", return_value=metrics()):
+            expected = propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [], llm)
+            callback = Mock()
+            actual = propose_candidate(BASELINE_POLICY, frames(3), LIMITS, [], llm,
+                                       on_llm_proposal=callback)
+        self.assertEqual(actual, expected)
+        callback.assert_called_once_with(expected["policy"])
 
     def test_unconfirmed_missing_or_invalid_execution_is_not_a_reward(self):
         expected = propose_candidate(BASELINE_POLICY, [], LIMITS, [])["policy"]

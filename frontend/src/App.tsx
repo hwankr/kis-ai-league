@@ -9,6 +9,7 @@ import CandidateComparison from './components/CandidateComparison';
 import ResearchObservation from './components/ResearchObservation';
 import ExperimentLab from './components/ExperimentLab';
 import OperationsPanel from './components/OperationsPanel';
+import TimefolioAccount from './components/TimefolioAccount';
 import { number, percent, signClass, timestamp } from './format';
 import useAccountDashboard from './useAccountDashboard';
 import useMarketData from './useMarketData';
@@ -26,6 +27,7 @@ export default function App() {
   const content = useRef<HTMLElement>(null);
   const previousPage = useRef(route.page);
   const accountPage = route.page === 'account' || route.page === 'trades';
+  const ownRefresh = route.page === 'experiments' || route.page === 'timefolio';
   const pageLoading = route.page === 'chart' ? market.loading : dashboard.loading;
   const account = dashboard.accounts.find(account => account.id === dashboard.selectedId);
   const summary = dashboard.snapshot?.summary;
@@ -91,8 +93,8 @@ export default function App() {
     <main id="main-content" ref={content} tabIndex={-1}>
       <div className="page-heading">
         <h1 id="page-title" tabIndex={-1}>{route.title}</h1>
-        <div className="refresh-controls" hidden={route.page === 'experiments'} inert={route.page === 'candidates' || route.page === 'experiments'} aria-hidden={route.page === 'candidates' || route.page === 'experiments'}
-          style={{ visibility: route.page === 'candidates' || route.page === 'experiments' ? 'hidden' : undefined }}>
+        <div className="refresh-controls" hidden={ownRefresh} inert={route.page === 'candidates' || ownRefresh} aria-hidden={route.page === 'candidates' || ownRefresh}
+          style={{ visibility: route.page === 'candidates' || ownRefresh ? 'hidden' : undefined }}>
           <label className="auto-refresh-control">
             <span>30초 자동 갱신</span>
             <input id="auto-refresh" type="checkbox" role="switch" checked={dashboard.autoRefresh} onChange={event => dashboard.setAutoRefresh(event.target.checked)}/>
@@ -149,6 +151,7 @@ export default function App() {
         <TradeHistory data={dashboard.trades.data} range={dashboard.trades.range} accountId={dashboard.trades.accountId}
           loading={dashboard.trades.loading} error={dashboard.trades.error} onQuery={dashboard.trades.query}/>
       </div>
+      {route.page === 'timefolio' ? <div className="app-page page-content"><TimefolioAccount/></div> : null}
       <div className="app-page page-content" hidden={route.page !== 'candidates'}>
         {route.page === 'candidates' ? <ResearchObservation onSelectSymbol={symbol => { void queryChart(symbol, 'day'); }}/> : null}
         <CandidateComparison data={candidates.data} loading={candidates.loading} error={candidates.error}

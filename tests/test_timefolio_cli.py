@@ -178,6 +178,36 @@ class TimefolioCliTests(unittest.TestCase):
             self.assertEqual(json.loads(state_path.read_text())["status"], "stopped")
             self.assertEqual(json.loads(state_path.read_text())["cursor"], 0)
 
+    def test_account_collection_follows_order_tick_and_respects_stop_request(self):
+        for stop in (False, True):
+            with self.subTest(stop=stop), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "config.toml"
+                local = Path(directory) / ".local"
+                db = local / "experiments" / "experiments.sqlite3"
+                db.parent.mkdir(parents=True)
+                db.touch()
+                browser, runtime, collector = Mock(), Mock(), Mock()
+                runtime.snapshot.return_value = {"jobs": []}
+                events = []
+                def order_tick():
+                    events.append("orders")
+                    if stop:
+                        state = json.loads((local / "timefolio-mirror-state.json").read_text())
+                        _write(local / "timefolio-mirror-stop.json", {"action": "stop",
+                            **{key: state[key] for key in ("instance", "pid", "started_at")}})
+                    return {"status": "idle"}
+                runtime.tick.side_effect = order_tick
+                collector.tick.side_effect = lambda: events.append("account")
+                with patch("backend.timefolio_browser.TimefolioBrowser", return_value=browser), \
+                        patch("backend.mirror_source.TimefolioMirrorSource"), \
+                        patch("backend.mirror_runtime.MirrorRuntime", return_value=runtime), \
+                        patch("backend.experiment_store.ExperimentStore"), \
+                        patch("backend.timefolio_account.AccountCollector", return_value=collector), \
+                        patch("backend.timefolio_mirror._wait_for_stop", return_value=True), \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["run", "--headless", "--config", str(config)]), 0)
+                self.assertEqual(events, ["orders"] if stop else ["orders", "account"])
+
     def test_run_failure_closes_browser_and_publishes_sanitized_error(self):
         for failure_at in ("open", "tick", "close"):
             with self.subTest(failure_at=failure_at), tempfile.TemporaryDirectory() as directory:
@@ -255,7 +285,13 @@ class TimefolioCliTests(unittest.TestCase):
             runtime = Mock()
             runtime.snapshot.return_value = {"jobs": []}
             runtime.tick.return_value = {"status": "blocked", "reason": "password=private-value",
-                                         "account_key": "private-hash", "csv": "private-csv", "cursor": 3}
+                                         "account_key": "private-hash", "csv": "private-csv", "cursor": 3,
+                                         "diagnostic": {"type": "TimeoutError", "file": "backend/timefolio_browser.py",
+                                             "function": "_observation", "line": 412,
+                                             "stack": [{"file": "backend/mirror_runtime.py", "function": "tick", "line": 311,
+                                                        "locals": {"key": "private-key"}}] * 10 +
+                                                      [{"file": "https://private.example", "function": "private", "line": 3}],
+                                             "message": "private-value", "locals": {"account_key": "private-hash"}}}
             with patch("backend.timefolio_browser.TimefolioBrowser", return_value=Mock()), \
                     patch("backend.mirror_source.TimefolioMirrorSource"), \
                     patch("backend.mirror_runtime.MirrorRuntime", return_value=runtime), \
@@ -269,6 +305,34 @@ class TimefolioCliTests(unittest.TestCase):
             self.assertEqual(tick["cursor"], 3)
             self.assertNotIn("account_key", tick)
             self.assertNotIn("csv", tick)
+            self.assertEqual(tick["diagnostic"], {"type": "TimeoutError", "file": "backend/timefolio_browser.py",
+                                                 "function": "_observation", "line": 412,
+                                                 "stack": [{"file": "backend/mirror_runtime.py", "function": "tick", "line": 311}] * 7})
+            self.assertNotIn("private", json.dumps(tick))
+            self.assertNotIn("diagnostic", write.call_args_list[-1].args[1])
+
+    def test_runtime_heartbeat_rejects_diagnostic_paths_or_values_containing_private_data(self):
+        safe = {"type": "TimeoutError", "file": "backend/timefolio_browser.py", "function": "_main", "line": 189}
+        for change in ({"file": "C:/private/account.py"}, {"file": "backend/../private.py"},
+                       {"type": "Error password=private"}, {"function": "https://private"}, {"line": True}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "config.toml"
+                db = Path(directory) / ".local" / "experiments" / "experiments.sqlite3"
+                db.parent.mkdir(parents=True)
+                db.touch()
+                runtime = Mock()
+                runtime.snapshot.return_value = {"jobs": []}
+                runtime.tick.return_value = {"status": "blocked", "reason": "adapter_or_storage_error",
+                                             "diagnostic": {**safe, **change}}
+                with patch("backend.timefolio_browser.TimefolioBrowser", return_value=Mock()), \
+                        patch("backend.mirror_source.TimefolioMirrorSource"), \
+                        patch("backend.mirror_runtime.MirrorRuntime", return_value=runtime), \
+                        patch("backend.experiment_store.ExperimentStore"), \
+                        patch("backend.timefolio_mirror._write") as write, \
+                        patch("backend.timefolio_mirror.time.sleep", side_effect=KeyboardInterrupt), \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["run", "--headless", "--config", str(config)]), 0)
+                self.assertNotIn("diagnostic", write.call_args_list[1].args[1])
 
     def test_stop_request_is_checked_during_interval_without_another_tick(self):
         with tempfile.TemporaryDirectory() as directory:

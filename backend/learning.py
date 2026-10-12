@@ -12,6 +12,7 @@ import threading
 
 from backend.experiment_store import encode
 from backend.kis import KST
+from backend.learning_compatibility import version_matches
 from backend.request_gate import file_lock
 
 def _hash(value):
@@ -106,15 +107,30 @@ class LearningService:
                 "last_evaluation": state.get("last_evaluation"), "last_change": state.get("last_change"),
                 "error": state.get("error")}
 
+    def _start_ready(self, as_of, context):
+        if context is None:
+            return True
+        book = context.get('initial_state')
+        return bool(book and not book.get('pending_orders') and not book.get('unresolved_orders')
+                    and book.get('as_of') == as_of
+                    and as_of == self.now().astimezone(KST).date().isoformat())
+
     def enqueue(self, data, baseline_signals, limits, *, source_id, context=None):
         if not self.enabled or self.stopping:
             return
-        # The input object belongs to an immutable completed analysis. Repeated
-        # polling does not create another LLM request, evaluation or database row.
+        fingerprint = limits.get('fingerprint') or (self.store.setting('policy') or {}).get('fingerprint')
+        from backend.learning_benchmarks import benchmark_signature
+        attempt = (source_id, self.version, fingerprint,
+                   tuple(str(limits[key]) for key in ('budget', 'order_cap', 'daily_buy_limit')),
+                   self._start_ready(str(data['as_of']), context),
+                   benchmark_signature(data, self.state().get('scorecard_start')))
+        # A settled book may unlock the same frozen daily input. Changes to cash
+        # alone must not reroll a candidate or duplicate a running proposal.
         with self.lock:
-            if self.attempted == source_id:
+            if self.attempted == attempt:
+                self.pending = None  # The latest state supersedes a queued handoff.
                 return
-            self.pending = (data, baseline_signals, limits, source_id, context)
+            self.pending = (data, baseline_signals, limits, attempt, context)
             if self.worker is None or not self.worker.is_alive():
                 self.worker = threading.Thread(target=self._work, daemon=True, name="policy-research")
                 self.worker.start()
@@ -137,6 +153,9 @@ class LearningService:
                 with file_lock(self.store.path.parent / "learning.lock", blocking=False):
                     self.process(data, baseline, limits, context=context)
             except BlockingIOError:
+                with self.lock:
+                    self.attempted = None
+                    self.worker = None
                 return
             except Exception:
                 # Research failure is visible but never changes order permission.
@@ -167,6 +186,13 @@ class LearningService:
                     payload['comparisons'] = state.get('scorecard')
                     db.execute('UPDATE learning_daily SET payload=? WHERE fingerprint=? AND day=? AND payload!=?',
                                (encode(payload), fingerprint, day, encode(payload)))
+                account_key = 'learning_account:' + fingerprint
+                row = db.execute('SELECT value FROM settings WHERE key=?', (account_key,)).fetchone()
+                if row:
+                    account = json.loads(row[0])
+                    account['comparisons'] = state.get('scorecard')
+                    db.execute('UPDATE settings SET value=? WHERE key=? AND value!=?',
+                               (encode(account), account_key, encode(account)))
 
     @staticmethod
     def _cohort_error(frames, data):
@@ -226,7 +252,7 @@ class LearningService:
             score.update(baseline_return_pct=0., status='ready')
         elif score['status'] != 'invalid':
             previous = next((item for item in frames if item['as_of'] == state.get('scorecard_day')), None)
-            if previous is None or state.get('scorecard_engine') != self.version:
+            if previous is None or not version_matches(state.get('scorecard_engine'), self.version):
                 score.update(status='invalid', baseline_return_pct=None, error='최초 정책 비교 자료 또는 평가 버전 변경')
             else:
                 result = portfolio_metrics(BASELINE_POLICY, [previous, frame], state['scorecard_limits'],
@@ -254,9 +280,11 @@ class LearningService:
         from backend.learning_policy import BASELINE_POLICY, build_frame, policy_id, portfolio_metrics, validate_policy
         from backend.learning_research import propose_candidate
         from backend.learning_evaluation import make_evaluation_spec, evaluate_candidate, evaluate_scenarios
+        from backend.learning_benchmarks import refresh_market_comparison
         if not self.enabled or self.stopping:
             return
         production_context = context is not None
+        start_ready = self._start_ready(str(data['as_of']), context)
         context = context or {}
         fingerprint = limits.get('fingerprint') or (self.store.setting('policy') or {}).get('fingerprint')
         limits = {key: str(limits[key]) for key in ('budget', 'order_cap', 'daily_buy_limit')}
@@ -266,33 +294,52 @@ class LearningService:
         digest = _hash({key: value for key, value in frame.items() if key not in {'observed_at', 'captured_at'}})
         state = self.state()
         with self.store.connect() as db:
-            prior = db.execute('SELECT digest FROM learning_frames WHERE day=?', (frame['as_of'],)).fetchone()
+            prior = db.execute('SELECT digest,payload FROM learning_frames WHERE day=?', (frame['as_of'],)).fetchone()
             if prior is None:
                 db.execute('INSERT INTO learning_frames VALUES (?,?,?)', (frame['as_of'], digest, encode(frame)))
         trial = state.get('trial')
         if prior and prior[0] != digest:
-            state.update(status='error', error='동일 거래일 관측이 변경됐습니다. 원본과 평가 종료일은 유지합니다.')
-            if trial:
-                trial.update(invalid_reason=state['error'], decision='invalid')
-            self._save(state, trial)
-            return
+            frozen = json.loads(prior[1])
+            ignored = {'observed_at', 'captured_at', 'benchmark_prices'}
+            old_prices, new_prices = frozen.get('benchmark_prices', {}), frame.get('benchmark_prices', {})
+            reporting_only = (version_matches(state.get('engine_version'), self.version)
+                and (not trial or version_matches(trial.get('engine_version'), self.version))
+                and {key: value for key, value in frozen.items() if key not in ignored}
+                    == {key: value for key, value in frame.items() if key not in ignored}
+                and all(new_prices.get(key) == value for key, value in old_prices.items())
+                and bool(new_prices.keys() - old_prices.keys()))
+            if not reporting_only:
+                state.update(status='error', error='동일 거래일 관측이 변경됐습니다. 원본과 평가 종료일은 유지합니다.')
+                if trial:
+                    trial.update(invalid_reason=state['error'], decision='invalid')
+                self._save(state, trial)
+                return
+            # New reporting evidence is kept separately. Never rewrite frozen
+            # trial inputs, their digest, or the candidate's original version.
+            frame = frozen
         if (state.get('processed_day') == frame['as_of'] and state.get('limits') == limits
-                and state.get('engine_version') == self.version):
+                and version_matches(state.get('engine_version'), self.version) and state.get('fingerprint') == fingerprint
+                and not (state.get('status') == 'waiting' and not trial and start_ready)):
+            changed = refresh_market_comparison(self.store, state, data, self._timestamp())
+            if changed or state.get('engine_version') != self.version:
+                state['engine_version'] = self.version
+                self._save(state)
             return
         frames = self.frames()
         if not frames or frames[-1]['as_of'] != frame['as_of']:
             return
         state.setdefault('champion', {'policy': deepcopy(BASELINE_POLICY), 'adopted_at': None})
         model = deepcopy(context.get('execution_model') or {'mode': 'daily_open'})
-        state.update(error=None, limits=limits)
+        state.update(error=None, limits=limits, fingerprint=fingerprint)
         if not production_context or context.get('initial_state'):
             self._scorecard(state, frames, limits, model, fingerprint, context.get('initial_state'))
+            refresh_market_comparison(self.store, state, data, self._timestamp())
         if trial:
             trial.setdefault('sequence', state.get('trial_sequence', 1))
             state['trial_sequence'] = max(state.get('trial_sequence', 0), trial['sequence'])
             trial.setdefault('evaluation_spec', make_evaluation_spec(trial['sequence']))
             trial.setdefault('execution_model', model)
-            if trial.get('engine_version') != self.version:
+            if not version_matches(trial.get('engine_version'), self.version):
                 trial['invalid_reason'] = '평가 코드 버전 변경'
             if trial['limits'] != limits or trial.get('fingerprint') != fingerprint:
                 trial['invalid_reason'] = '운용 계좌 또는 한도 변경'
@@ -358,8 +405,7 @@ class LearningService:
         state.pop('guard', None)  # Relative rollback must earn a new fixed-window comparison.
         if not state.get('trial'):
             book = context.get('initial_state')
-            if production_context and (not book or book.get('pending_orders') or book.get('unresolved_orders')
-                    or book.get('as_of') != frame['as_of'] or frame['as_of'] != self.now().astimezone(KST).date().isoformat()):
+            if production_context and not start_ready:
                 state.update(status='waiting', error=context.get('book_error'), processed_day=frame['as_of'])
                 self._save(state)
                 return

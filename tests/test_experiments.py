@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 from backend.experiment_store import ExperimentStore, encode
 from backend.experiments import ExperimentService, FEE, ALL_STRATEGIES
-from backend.kis import KST, KisError
+from backend.kis import KST, KisError, KisRequestError
 from backend.paper_broker import BrokerUnknown, BrokerRejected
 from backend.request_gate import file_lock
 
@@ -815,6 +815,9 @@ class ExperimentsTests(unittest.TestCase):
         self.assertFalse(self.service._retry_due())
         restarted = self.make_service()
         self.assertFalse(restarted._retry_due())
+        self.assertEqual(restarted.snapshot()["status"], "error")
+        self.assertEqual(restarted.snapshot()["error"], "일시 조회 실패")
+        self.assertEqual(restarted.store.setting("autonomy_status")["last_error_operation"], "cycle")
         with patch.object(restarted, "_launch") as launch:
             restarted.tick()
             launch.assert_not_called()
@@ -844,9 +847,151 @@ class ExperimentsTests(unittest.TestCase):
         issue = self.service.store.setting("issues")[0]
         self.assertTrue(issue["question"])
         self.assertFalse(issue["blocking"])
+        health = self.service.store.setting("autonomy_status")
         self.service._work("analyze", {})
+        after_analysis = self.service.store.setting("autonomy_status")
+        for key in ("next_retry_at", "consecutive_failures", "last_error", "last_error_operation"):
+            self.assertEqual(after_analysis[key], health[key])
+        self.assertIsNone(after_analysis.get("last_cycle_at"))
+        self.assertEqual(self.service.snapshot()["status"], "error")
+        self.service._work("cycle", {})
         self.assertEqual(next(item for item in self.service.store.setting("issues")
                               if item["id"] == "temporary_failure")["state"], "resolved")
+
+    def test_automatic_records_cycle_failure_once_despite_successful_analysis(self):
+        self.enable()
+        with patch.object(self.service, "_cycle", side_effect=KisError("체결 조회 실패")), \
+                patch.object(self.service, "_analyze") as analyze:
+            self.service._work("automatic", {})
+        analyze.assert_called_once_with(automatic_retry=True)
+        health = self.service.store.setting("autonomy_status")
+        self.assertEqual(health["last_error_operation"], "cycle")
+        self.assertEqual(health["consecutive_failures"], 1)
+        self.assertFalse(self.service._retry_due())
+        self.assertIsNone(health.get("last_cycle_at"))
+        self.assertEqual(self.service.snapshot()["error"], "체결 조회 실패")
+
+    def test_successful_automatic_without_cycle_preserves_trading_failure(self):
+        self.service._failure(KisError("거래 조회 실패"), "cycle")
+        before = self.service.store.setting("autonomy_status")
+        with patch.object(self.service, "_cycle") as cycle, patch.object(self.service, "_analyze"):
+            self.service._work("automatic", {})
+        cycle.assert_not_called()
+        health = self.service.store.setting("autonomy_status")
+        self.assertEqual(health["next_retry_at"], before["next_retry_at"])
+        self.assertEqual(health["last_error_operation"], "cycle")
+        self.assertIsNone(health.get("last_cycle_at"))
+
+    def test_independent_operation_failures_require_each_operation_to_recover(self):
+        self.enable()
+        with patch.object(self.service, "_cycle", side_effect=KisError("체결 조회 실패")), \
+                patch.object(self.service, "_analyze", side_effect=KisError("분석 실패")):
+            self.service._work("automatic", {})
+        health = self.service.store.setting("autonomy_status")
+        self.assertEqual(set(health["operation_failures"]), {"cycle", "analyze"})
+        with patch.object(self.service, "_analyze"):
+            self.service._work("analyze", {})
+        health = self.service.store.setting("autonomy_status")
+        self.assertEqual(health["last_error_operation"], "cycle")
+        self.assertEqual(health["last_error"], "체결 조회 실패")
+        issue = next(item for item in self.service.store.setting("issues") if item["id"] == "temporary_failure")
+        self.assertEqual(issue["message"], "체결 조회 실패")
+        self.assertEqual(issue["state"], "open")
+        with patch.object(self.service, "_cycle"):
+            self.service._work("cycle", {})
+        health = self.service.store.setting("autonomy_status")
+        self.assertEqual(health["operation_failures"], {})
+        self.assertIsNone(health["last_error"])
+        self.assertIsNone(health["next_retry_at"])
+
+    def test_analysis_failure_does_not_erase_completed_cycle_timestamp(self):
+        self.enable()
+        with patch.object(self.service, "_cycle"), \
+                patch.object(self.service, "_analyze", side_effect=KisError("분석 실패")):
+            self.service._work("automatic", {})
+        completed = self.service.store.setting("autonomy_status")["last_cycle_at"]
+        self.assertEqual(completed, self.service._timestamp())
+        self.current += timedelta(minutes=1)
+        with patch.object(self.service, "_analyze"):
+            self.service._work("analyze", {})
+        health = self.service.store.setting("autonomy_status")
+        self.assertEqual(health["last_cycle_at"], completed)
+        self.assertNotEqual(health["last_success_at"], completed)
+        self.assertIsNone(health["last_error"])
+
+    def test_safe_request_diagnostics_are_durable_and_cleared_only_on_recovery(self):
+        error = KisRequestError("KIS 요청 실패", "/uapi/domestic-stock/v1/trading/inquire-balance",
+                                http_status=500, message_code="EGW00201")
+        self.service._failure(error, "cycle")
+        restarted = self.make_service()
+        health = restarted.snapshot()["autonomy"]
+        self.assertEqual(health["last_error_request"], {
+            "request_kind": "balance", "http_status": 500, "message_code": "EGW00201",
+            "occurred_at": error.occurred_at, "attempts": 1})
+        with patch.object(restarted, "_analyze"):
+            restarted._work("analyze", {})
+        self.assertEqual(restarted.snapshot()["autonomy"]["last_error_request"], health["last_error_request"])
+        with patch.object(restarted, "_cycle"):
+            restarted._work("cycle", {})
+        self.assertIsNone(restarted.snapshot()["autonomy"]["last_error_request"])
+
+    def test_legacy_failure_is_not_inferred_recovered_from_analysis(self):
+        self.service.store.save_setting("autonomy_status", {
+            "last_error": "과거 요청 실패", "last_error_at": self.service._timestamp(),
+            "consecutive_failures": 2, "next_retry_at": (self.current + timedelta(minutes=1)).isoformat()})
+        restarted = self.make_service()
+        with patch.object(restarted, "_analyze"):
+            restarted._work("analyze", {})
+        self.assertEqual(restarted.snapshot()["error"], "과거 요청 실패")
+        restarted.store.save_setting("enabled", True)
+        with patch.object(restarted, "_cycle"), patch.object(restarted, "_analyze"):
+            restarted._work("automatic", {})
+        self.assertIsNone(restarted.snapshot()["error"])
+
+    def test_cancel_failure_clears_after_reconciliation_with_unknown_order_still_protected(self):
+        order = self.submit()
+        self.broker.cancel_error = BrokerUnknown("응답 없음")
+        self.service._work("cancel", {"order_id": order["id"]})
+        self.service.store.save_setting("enabled", False)
+        self.service._work("automatic", {})
+        self.assertIsNone(self.service.snapshot()["error"])
+        self.assertEqual(self.service.store.orders()[0]["status"], "cancel_pending")
+        self.assertTrue(self.service._blocked())
+        self.assertEqual(len(self.broker.cancellations), 1)
+        self.broker.remote[0].update(status="cancelled", remaining_quantity=0)
+        self.service._work("automatic", {})
+        self.assertEqual(self.service.store.orders()[0]["status"], "cancelled")
+        self.assertFalse(self.service._blocked())
+        self.assertEqual(len(self.broker.cancellations), 1)
+
+    def test_paused_cancel_race_does_not_leave_permanent_error_without_active_orders(self):
+        order = self.submit()
+        self.service.store.save_setting("enabled", False)
+        self.broker.remote[0].update(status="cancelled", remaining_quantity=0)
+        self.service._work("cancel", {"order_id": order["id"]})
+        self.assertEqual(self.service.snapshot()["status"], "error")
+        self.assertEqual(self.service.store.orders()[0]["status"], "cancelled")
+        self.service._work("automatic", {})
+        self.assertIsNone(self.service.snapshot()["error"])
+        self.assertEqual(self.broker.cancellations, [])
+        self.assertFalse(self.service.store.setting("enabled"))
+
+    def test_expired_intraday_quote_failure_is_retired_without_quote_or_cycle_success(self):
+        self.service._failure(KisError("관측 조회 실패"), "learning_quotes")
+        self.current = self.current.replace(hour=18)
+        with patch.object(self.service, "_observe_learning_quotes") as quotes:
+            self.service._work("automatic", {})
+        quotes.assert_not_called()
+        health = self.service.store.setting("autonomy_status")
+        self.assertIsNone(health["last_error"])
+        self.assertIsNone(health.get("last_cycle_at"))
+        self.assertEqual(health["last_success_operation"], "analyze")
+
+    def test_unexpected_outer_automatic_failure_is_durable(self):
+        with patch.object(self.service, "_automatic", side_effect=ValueError("private")):
+            self.service._work("automatic", {})
+        self.assertEqual(self.service.store.setting("autonomy_status")["last_error_operation"], "automatic")
+        self.assertNotIn("private", self.make_service().snapshot()["error"])
 
     def test_missing_preopen_analysis_is_visible_and_resolves_when_available(self):
         self.enable()

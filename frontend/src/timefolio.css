@@ -1,0 +1,39 @@
+.timefolio-account { min-width: 0; }
+.timefolio-toolbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; }
+.timefolio-toolbar h2 { margin: 0; font-size: 20px; letter-spacing: -.5px; }
+.timefolio-contest { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 10px 0 0; color: var(--secondary); font-size: 13px; }
+.timefolio-contest span { color: var(--muted); }
+.timefolio-status { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 22px; color: var(--muted); font-size: 12px; }
+.timefolio-status .status-badge { margin: 0; }
+.timefolio-error { margin: 18px 0 0; }
+.timefolio-summary { display: grid; grid-template-columns: 1.1fr .8fr 1fr 1fr; gap: 28px; padding: 30px 0 32px; margin: 0; border-bottom: 1px solid var(--border); }
+.timefolio-summary dt { color: var(--secondary); font-size: 13px; }
+.timefolio-summary dd { margin: 12px 0 0; font-size: 24px; font-weight: 650; letter-spacing: -.5px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.timefolio-summary .timefolio-nav dd:first-of-type { font-size: 32px; }
+.timefolio-summary .timefolio-nav-change, .timefolio-summary .timefolio-summary-return { margin-top: 8px; font-size: 14px; font-weight: 500; letter-spacing: 0; }
+.timefolio-nav-change span { margin-left: 6px; }
+.timefolio-unit { margin-left: 5px; font-size: 13px; font-weight: 500; }
+.timefolio-rank-total { color: var(--muted); font-size: 13px; font-weight: 400; letter-spacing: 0; }
+.timefolio-table-panel { min-width: 0; margin-top: 32px; }
+.timefolio-table-panel + .timefolio-table-panel { padding-top: 28px; border-top: 1px solid var(--border); }
+.timefolio-table-panel table { width: 100%; }
+.timefolio-holdings-table { min-width: 840px; }
+.timefolio-orders-table { min-width: 850px; }
+.timefolio-table-panel td { white-space: nowrap; }
+.timefolio-order-time { max-width: 164px; color: var(--secondary); font-size: 12px; line-height: 1.6; white-space: normal !important; }
+.timefolio-order-status { color: var(--secondary); font-size: 12px; }
+.timefolio-order-id { max-width: 150px; white-space: normal; overflow-wrap: anywhere; }
+.timefolio-empty { margin: 0; padding: 38px 18px; border-radius: 8px; background: #f9fafb; color: var(--muted); text-align: center; font-size: 14px; }
+@media (max-width: 1000px) {
+  .timefolio-summary { grid-template-columns: 1fr 1fr; gap: 26px 32px; }
+}
+@media (max-width: 800px) {
+  .timefolio-toolbar { flex-direction: column; gap: 20px; }
+  .timefolio-toolbar .refresh-controls { width: 100%; justify-content: space-between; }
+}
+@media (max-width: 520px) {
+  .timefolio-summary { gap: 26px 18px; }
+  .timefolio-summary dd { font-size: 21px; }
+  .timefolio-summary .timefolio-nav dd:first-of-type { font-size: 28px; }
+  .timefolio-table-panel { margin-top: 26px; }
+}

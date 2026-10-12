@@ -14,7 +14,7 @@ from backend.competition_deadline import KIS_LAST_DAY, KIS_ENDED_MESSAGE, ended
 from backend.eligibility import EligibilityService, assess_master
 from backend.experiment_store import ExperimentStore, encode
 from backend.history import series_for_profile
-from backend.kis import KST, ROOT, KisError, load_profiles
+from backend.kis import KST, ROOT, KisError, KisRequestError, load_profiles
 from backend.request_gate import file_lock
 from backend.universe import load_universe
 
@@ -92,8 +92,9 @@ class ExperimentService:
         self.worker = None
         self.worker_started_at = None
         self.next_tick = 0
-        self.error = None
-        self.updated_at = None
+        health = self.store.setting("autonomy_status", {})
+        self.error = health.get("last_error")
+        self.updated_at = health.get("last_success_at")
         self._llm = None
         self._shadow_sources = None
         self.stopping = False
@@ -111,7 +112,8 @@ class ExperimentService:
             raise KisError('학습 운용 최대 낙폭은 0 초과 100 이하로 설정하세요.')
         self.learning = LearningService(self.store,
             enabled=settings.get("learning", {}).get("enabled", self.autonomous) is True,
-            now=self.now, llm_factory=self._get_llm, development_reader=self._development_inputs)
+            now=self.now, llm_factory=self._get_llm, development_reader=self._development_inputs,
+            proposer=self._propose_learning)
         # Never resubmit a mutation interrupted between durable intent and response.
         try:
             with file_lock(self.directory / "runner.lock", blocking=False):
@@ -207,22 +209,82 @@ class ExperimentService:
         value = self.store.setting(setting, {}).get("next_retry_at")
         return not value or self.now() >= stamp(value)
 
-    def _failure(self, error, operation):
-        self.error = str(error) if isinstance(error, KisError) else "실험 조회·처리를 완료하지 못했습니다. 자동 재시도합니다."
+    def _operation_failures(self):
         health = self.store.setting("autonomy_status", {})
-        failures = health.get("consecutive_failures", 0) + 1
+        if "operation_failures" in health:
+            return health["operation_failures"]
+        # Old releases did not retain the failing stage. Only a complete
+        # automatic pass can establish recovery of that legacy failure.
+        if health.get("last_error"):
+            return {health.get("last_error_operation") or "automatic": {
+                key: health.get(key) for key in ("last_error", "last_error_at", "next_retry_at",
+                                                "consecutive_failures", "last_error_request")}}
+        return {}
+
+    def _save_operation_health(self, failures, **changes):
+        latest = max(reversed(list(failures.items())), key=lambda item: item[1].get("last_error_at") or "", default=None)
+        value = latest[1] if latest else {}
+        self.error = value.get("last_error")
+        retries = [item["next_retry_at"] for item in failures.values() if item.get("next_retry_at")]
+        self._health(operation_failures=failures, last_error=self.error,
+                     last_error_operation=latest[0] if latest else None,
+                     last_error_request=value.get("last_error_request"),
+                     consecutive_failures=max((item.get("consecutive_failures") or 0 for item in failures.values()), default=0),
+                     next_retry_at=max(retries, key=stamp) if retries else None, **changes)
+
+    def _success(self, operation, *, completed=True):
+        failures = self._operation_failures()
+        failures.pop(operation, None)
+        if operation == "cycle":
+            failures.pop("reconcile", None)  # Every cycle completes reconciliation first.
+        if operation in {"cycle", "reconcile"}:
+            # Command errors end after account/order checks resume. Ambiguous
+            # mutations remain protected by their separate durable order issues.
+            for command in ("cancel", "resolve"):
+                failures.pop(command, None)
+        changes = {}
+        if completed:
+            self.updated_at = self._timestamp()
+            changes.update(last_success_at=self.updated_at, last_success_operation=operation)
+            if operation == "cycle":
+                changes["last_cycle_at"] = self.updated_at
+            if operation in {"cycle", "automatic"}:
+                changes["recovering"] = False
+        self._save_operation_health(failures, **changes)
+        temporary = [item for item in failures.values() if item.get("issue_code", "temporary_failure") == "temporary_failure"]
+        if not temporary:
+            self._resolve_issue("temporary_failure")
+        else:
+            latest = max(reversed(temporary), key=lambda item: item.get("last_error_at") or "")
+            issue = next((item for item in self.store.setting("issues", [])
+                          if item["id"] == "temporary_failure" and item["state"] == "open"), None)
+            if issue and issue["message"] != latest["last_error"]:
+                self._issue("temporary_failure", latest["last_error"], blocking=False, question=issue.get("question"))
+
+    def _failure(self, error, operation):
+        message = str(error) if isinstance(error, KisError) else "실험 조회·처리를 완료하지 못했습니다. 자동 재시도합니다."
+        pending = self._operation_failures()
+        failures = (pending.get(operation, {}).get("consecutive_failures") or 0) + 1
         delay = min(900, 30 * 2 ** min(failures - 1, 5))
-        self._health(last_error_at=self._timestamp(), consecutive_failures=failures,
-                     next_retry_at=(self.now() + timedelta(seconds=delay)).isoformat(), last_error=self.error)
+        at = self._timestamp()
+        request = ({key: getattr(error, key) for key in
+                    ("request_kind", "http_status", "message_code", "occurred_at", "attempts")}
+                   if isinstance(error, KisRequestError) else None)
+        pending.pop(operation, None)
+        pending[operation] = {"last_error": message, "last_error_at": at,
+                              "consecutive_failures": failures, "last_error_request": request,
+                              "issue_code": error.code if isinstance(error, OperationalBlock) else "temporary_failure",
+                              "next_retry_at": (self.now() + timedelta(seconds=delay)).isoformat()}
+        self._save_operation_health(pending, last_error_at=at)
         if isinstance(error, OperationalBlock):
-            self._issue(error.code, self.error, question=error.question)
+            self._issue(error.code, message, question=error.question)
         else:
             previous = next((item for item in self.store.setting("issues", [])
                              if item["id"] == "temporary_failure" and item["state"] == "open"), None)
             question = ("이 PC의 네트워크와 KIS 모의 API 연결 상태를 확인해 주세요."
                         if previous and (self.now() - stamp(previous["first_seen"])).total_seconds() >= 1800 else None)
-            self._issue("temporary_failure", self.error, blocking=False, question=question)
-        self._event("error", self.error)
+            self._issue("temporary_failure", message, blocking=False, question=question)
+        self._event("error", f"{operation}: {message}")
 
     def _initialize_policy(self):
         policy = self._policy()
@@ -284,6 +346,17 @@ class ExperimentService:
     def _get_llm(self):
         from backend.experiment_analysis import make_llm
         return (self.llm_factory or make_llm)(self.config_path)
+
+    def _propose_learning(self, champion, frames, limits, history, llm=None):
+        from backend.learning_proposals import proposal_context, save_llm_proposal
+        from backend.learning_research import propose_candidate
+        # Freeze the research account before the provider call; current order
+        # settings can change while the response is being generated.
+        context = proposal_context(champion, frames, limits, history,
+                                   self.learning.state(), llm, self._timestamp())
+        return propose_candidate(champion, frames, limits, history, llm=llm,
+            on_llm_proposal=lambda policy: save_llm_proposal(
+                self.store, policy, context=context, captured_at=self._timestamp()))
 
     def _policy(self):
         return self.store.setting("policy", {key: None for key in POLICY_KEYS})
@@ -483,12 +556,16 @@ class ExperimentService:
             self.worker.start()
 
     def _work(self, operation, body):
+        self._automatic_failure_recorded = False
         try:
             with file_lock(self.directory / "runner.lock", blocking=False):
                 if operation == "analyze":
                     self._analyze(retry_llm=True)
                 elif operation == "automatic":
-                    self._automatic()
+                    if self._automatic():
+                        self._success(operation)
+                    elif self.store.setting("autonomy_status", {}).get("recovering"):
+                        self._health(recovering=False)
                 elif operation == "cycle":
                     self._cycle()
                 elif operation == "reconcile":
@@ -497,17 +574,13 @@ class ExperimentService:
                     self._cancel(body["order_id"])
                 elif operation == "resolve":
                     self._resolve(body)
-                self.error = None
-                self.updated_at = self._timestamp()
-                self._health(last_success_at=self.updated_at, consecutive_failures=0,
-                             next_retry_at=None, last_error=None, recovering=False)
-                self._resolve_issue("temporary_failure")
-        except (KisError, ValueError) as error:
-            self._failure(error, operation)
+                if operation != "automatic":
+                    self._success(operation)
         except BlockingIOError:
             self.error = "다른 서버에서 실험 작업이 진행 중입니다."
-        except Exception:
-            self._failure(KisError("실험 작업을 완료하지 못했습니다. 저장된 기록으로 자동 재시도합니다."), operation)
+        except Exception as error:
+            if operation != "automatic" or not self._automatic_failure_recorded:
+                self._failure(error, operation)
         finally:
             self.worker_started_at = None
 
@@ -528,29 +601,52 @@ class ExperimentService:
             self._launch("automatic")
 
     def _automatic(self):
-        self._enforce_deadline()
         failure = None
+        cycle_completed = analysis_completed = False
+        operation = "initialize"
         try:
+            self._enforce_deadline()
             policy = self._initialize_policy()
+            if operation in self._operation_failures():
+                self._success(operation, completed=False)
             # Reconciliation continues during a user pause, without changing intent.
             if policy.get("account_id"):
                 if self.store.setting("enabled", False):
+                    operation = "cycle"
                     self._cycle()
-                elif any(item["status"] in ACTIVE for item in self._owned_orders(policy)):
+                    self._success(operation)
+                    cycle_completed = True
+                elif (any(item["status"] in ACTIVE for item in self._owned_orders(policy))
+                      or {"reconcile", "cancel", "resolve"} & self._operation_failures().keys()):
+                    operation = "reconcile"
                     self._reconcile(policy)
+                    self._success(operation)
                 if self.learning.enabled and self._market_open():
+                    operation = "learning_quotes"
                     self._observe_learning_quotes(policy)
+                    self._success(operation)
+                elif "learning_quotes" in self._operation_failures():
+                    # Intraday observations are no longer due; retain the error
+                    # event without claiming a successful quote observation.
+                    self._success("learning_quotes", completed=False)
         except Exception as error:
             failure = error
+            self._failure(error, operation)
+            self._automatic_failure_recorded = True
         try:
             candidate = self.candidate_service.snapshot() if self.candidate_service else None
             if not self.stopping and (candidate is None or candidate["status"] == "complete" and not candidate.get("stale")):
                 self._analyze(automatic_retry=True)
-        except Exception:
+                self._success("analyze")
+                analysis_completed = True
+        except Exception as error:
+            self._failure(error, "analyze")
+            self._automatic_failure_recorded = True
             if failure is None:
                 raise
         if failure is not None:
             raise failure
+        return cycle_completed and analysis_completed
 
     def _read_input(self):
         candidates = self.config_path.parent / ".local" / "candidates"
@@ -1035,7 +1131,8 @@ class ExperimentService:
             from backend.learning_policy import BASELINE_POLICY, policy_id
             if policy_id(run.get("learning_policy") or BASELINE_POLICY) != policy_id(adopted):
                 return  # New policy needs its own completed pre-open signals.
-            if adopted["kind"] == "rules" and run.get("learning_engine_version") != self.learning.version:
+            from backend.learning_compatibility import version_matches
+            if adopted["kind"] == "rules" and not version_matches(run.get("learning_engine_version"), self.learning.version):
                 return
         execution = run.get("learning_policy") if policy["execution_strategy"] == ALL_STRATEGIES else None
         learned = execution and execution["kind"] == "rules" and self.learning.enabled

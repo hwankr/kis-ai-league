@@ -73,6 +73,13 @@ class AutonomyTests(unittest.TestCase):
         self.assertIsNone(health["performance"])
         self.assertEqual(health["daily_reports"], [])
 
+    def test_cycle_time_uses_only_explicit_cycle_completion(self):
+        self.store.save_setting("autonomy_status", {"last_success_at": "2026-10-06T02:00:00+00:00"})
+        self.assertIsNone(self.monitor.snapshot(include_history=False)["last_cycle_at"])
+        self.store.save_setting("autonomy_status", {
+            "last_success_at": "2026-10-06T02:00:00+00:00", "last_cycle_at": "2026-10-06T01:00:00+00:00"})
+        self.assertEqual(self.monitor.snapshot(include_history=False)["last_cycle_at"], "2026-10-06T01:00:00+00:00")
+
     def test_normal_checks_do_not_rewrite_resolved_issues(self):
         with patch.object(self.store, "save_setting", wraps=self.store.save_setting) as save:
             self.monitor._issue("account")

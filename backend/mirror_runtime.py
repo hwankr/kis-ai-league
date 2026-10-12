@@ -7,6 +7,7 @@ Source checkpoints are observations, separate from destination order receipts.
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
+from pathlib import Path
 import re
 from uuid import uuid4
 
@@ -29,6 +30,25 @@ class MirrorRejected(RuntimeError):
 
 ACTIVE = {"pending", "blocked", "submitting", "unknown", "working"}
 TERMINAL = {"filled", "completed", "cancelled", "rejected", "unchanged"}
+
+
+def _diagnostic(error):
+    """Only code coordinates, never exception text, arguments, or frame locals."""
+    result = {"type": type(error).__name__, "stack": []}
+    directory = Path(__file__).resolve().parent
+    frame = error.__traceback__
+    while frame is not None:
+        try:
+            relative = Path(frame.tb_frame.f_code.co_filename).resolve().relative_to(directory)
+        except (OSError, ValueError):
+            pass
+        else:
+            location = {"file": "backend/" + relative.as_posix(),
+                        "function": frame.tb_frame.f_code.co_name, "line": frame.tb_lineno}
+            result.update(location)
+            result["stack"] = (result["stack"] + [location])[-8:]
+        frame = frame.tb_next
+    return result
 
 
 def _text(value, reason):
@@ -236,8 +256,10 @@ class MirrorRuntime:
         clean.update(filled_weight=filled_weight, filled_quantity=filled_quantity)
         clean["verified"] = True
         reason = receipt.get("reason") if receipt["status"] == "rejected" else None
-        if job.get("receipt") != clean or job["status"] != receipt["status"] or job.get("reason") != reason:
+        if (job.get("receipt") != clean or job["status"] != receipt["status"]
+                or job.get("reason") != reason or "diagnostic" in job):
             job.update(status=receipt["status"], receipt=clean, reason=reason, updated_at=self._stamp())
+            job.pop("diagnostic", None)
             self._save_job(job)
 
     def _reconcile(self, destination, jobs):
@@ -246,10 +268,10 @@ class MirrorRuntime:
                 continue
             try:
                 self._receipt(job, self.destination.lookup(job, snapshot=destination))
-            except Exception:
+            except Exception as error:
                 # An acknowledged order remains acknowledged if a later read
                 # fails. Both working and unknown still serialize this symbol.
-                job.update(reason="destination_lookup_unresolved")
+                job.update(reason="destination_lookup_unresolved", diagnostic=_diagnostic(error))
                 self._save_job(job)
 
     def _manual_symbols(self, destination, state):
@@ -382,16 +404,16 @@ class MirrorRuntime:
                 except MirrorRejected as error:
                     job.update(status="rejected", reason=str(error))
                     self._save_job(job)
-                except Exception:
-                    job.update(status="unknown", reason="submission_outcome_unknown")
+                except Exception as error:
+                    job.update(status="unknown", reason="submission_outcome_unknown", diagnostic=_diagnostic(error))
                     self._save_job(job)
                 else:
                     try:
                         self._receipt(job, receipt)
-                    except Exception:
+                    except Exception as error:
                         # Receipt validation follows the click; even a numeric
                         # validation error here must never allow another click.
-                        job.update(status="unknown", reason="submission_outcome_unknown")
+                        job.update(status="unknown", reason="submission_outcome_unknown", diagnostic=_diagnostic(error))
                         self._save_job(job)
             jobs = self._jobs(active_only=True)
             if any(job["status"] == "unknown" for job in jobs):
@@ -405,6 +427,8 @@ class MirrorRuntime:
             return {"status": "blocked", "reason": str(error)}
         except ValueError as error:
             reason = str(error)
-            return {"status": "blocked", "reason": reason if re.fullmatch(r"[a-z][a-z0-9_]{0,120}", reason) else "adapter_input_invalid"}
-        except Exception:
-            return {"status": "blocked", "reason": "adapter_or_storage_error"}
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,120}", reason):
+                return {"status": "blocked", "reason": reason}
+            return {"status": "blocked", "reason": "adapter_input_invalid", "diagnostic": _diagnostic(error)}
+        except Exception as error:
+            return {"status": "blocked", "reason": "adapter_or_storage_error", "diagnostic": _diagnostic(error)}

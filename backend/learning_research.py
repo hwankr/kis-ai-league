@@ -464,7 +464,7 @@ def _public_feedback(history):
     return result
 
 
-def propose_candidate(champion, frames, limits, history, llm=None):
+def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_proposal=None):
     """Return a novel frozen rule hypothesis; inputs are never mutated."""
     champion = validate_policy(deepcopy(champion or BASELINE_POLICY))
     frames, limits, history = deepcopy(frames), deepcopy(limits), deepcopy(history or [])
@@ -532,6 +532,10 @@ def propose_candidate(champion, frames, limits, history, llm=None):
             llm_state = "valid" if candidates else "invalid_or_duplicate"
         except Exception:
             llm_state = "unavailable"
+        # Persist the validated LLM proposal before evaluation can select a
+        # different candidate. Storage failures must remain visible to research.
+        if llm_state == "valid" and on_llm_proposal is not None:
+            on_llm_proposal(deepcopy(candidates[0][0]))
     for policy in _grammar(champion, summaries, mode, execution_hint, families):
         add(policy, "grammar")
         if len(candidates) >= MAX_CANDIDATES:

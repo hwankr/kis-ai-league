@@ -88,6 +88,19 @@ def _wait_for_stop(seconds, requested):
     return requested()
 
 
+def _code_location(value):
+    if not isinstance(value, dict):
+        return None
+    safe = {key: value.get(key) for key in ("file", "function", "line")}
+    if (isinstance(safe["file"], str)
+            and re.fullmatch(r"backend/(?:[A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*\.py", safe["file"])
+            and isinstance(safe["function"], str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}|<lambda>|<module>", safe["function"])
+            and type(safe["line"]) is int and 0 < safe["line"] <= 1_000_000):
+        return safe
+    return None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="KIS AI 체결 → 타임폴리오 자동 주문 (직접 실행용)")
     parser.add_argument("command", nargs="?", choices=("status", "login", "run"), default="status")
@@ -113,6 +126,7 @@ def main(argv=None):
     from backend.mirror_runtime import MirrorBlocked, MirrorRuntime
     from backend.mirror_source import TimefolioMirrorSource
     from backend.timefolio_browser import TimefolioBrowser
+    from backend.timefolio_account import AccountCollector
     browser = TimefolioBrowser(directory / "timefolio-browser",
                               executable_path=args.browser_executable, headless=args.headless)
     state = None
@@ -127,10 +141,20 @@ def main(argv=None):
             status = "error"
         state = {**state, "status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
         state.pop("reason", None)
+        state.pop("diagnostic", None)
         if result.get("reason") is not None:
             reason = result["reason"]
             state["reason"] = reason if isinstance(reason, str) and re.fullmatch(
                 r"[a-z][a-z0-9_]{0,120}", reason) else "mirror_error"
+        diagnostic = result.get("diagnostic")
+        if isinstance(diagnostic, dict):
+            location, error_type = _code_location(diagnostic), diagnostic.get("type")
+            if location and isinstance(error_type, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", error_type):
+                state["diagnostic"] = {"type": error_type, **location}
+                stack = diagnostic.get("stack")
+                if isinstance(stack, list):
+                    state["diagnostic"]["stack"] = [location for value in stack[-8:]
+                                                      if (location := _code_location(value))]
         if type(result.get("cursor")) is int and 0 <= result["cursor"] <= 2**63 - 1:
             state["cursor"] = result["cursor"]
         _write(directory / "timefolio-mirror-state.json", state)
@@ -163,6 +187,7 @@ def main(argv=None):
                     return 0
                 source = TimefolioMirrorSource(args.dashboard, args.config)
                 runtime = MirrorRuntime(ExperimentStore(db_path), source, browser)
+                account_collector = AccountCollector(args.config.resolve().parent, browser)
                 # Each snapshot must include receipts learned earlier in this
                 # same tick, not only the jobs present when the loop started.
                 browser.jobs_reader = lambda: runtime.snapshot()["jobs"]
@@ -181,6 +206,8 @@ def main(argv=None):
                     if current != previous:
                         print(current, flush=True)
                         previous = current
+                    if not stop_requested():
+                        account_collector.tick()
                     if _wait_for_stop(args.interval, stop_requested):
                         break
                 publish({"status": "stopping"})
