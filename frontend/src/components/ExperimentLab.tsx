@@ -64,6 +64,7 @@ function ResolveOrder({ id, name, disabled, onExecute }: { id: string; name: str
 function DailyLearning({ daily, fallbackPolicy }: { daily: DailyLearningData; fallbackPolicy: string }) {
   const decision = daily.last_decision;
   const candidateName = decision?.candidate_name !== daily.pending?.name ? decision?.candidate_name : null;
+  const followup = daily.forward_comparisons?.find(item => item.effective_day === daily.active?.effective_day);
   return <div className="lab-daily-learning">
     <dl className="lab-learning-strategies"><div><dt>현재 적용 정책</dt><dd>{daily.active?.name ?? fallbackPolicy}</dd>
       {daily.active?.effective_day ? <dd className="lab-learning-time">적용 거래일 <time dateTime={daily.active.effective_day}>{daily.active.effective_day}</time></dd>
@@ -77,6 +78,21 @@ function DailyLearning({ daily, fallbackPolicy }: { daily: DailyLearningData; fa
         decision.change_family ? changeFamilies[decision.change_family] ?? decision.change_family : null].filter(Boolean).join(' · ')}</p> : null}
       <p className="lab-learning-reason">{decision.reason}</p>
     </div> : <p className="lab-learning-reason lab-subtle">심사 기록 없음</p>}
+    {followup ? <div className="lab-daily-decision">
+      <div className="lab-learning-result"><strong>적용 후 비교 모형</strong>
+        <span>{followup.status === 'ready' ? `${followup.start_day} ~ ${followup.end_day} · ${followup.intervals}구간`
+          : followup.status === 'waiting' ? '관측 대기' : '비교 자료 확인 필요'}</span></div>
+      {followup.status === 'ready' ? <>
+        <dl className="lab-learning-strategies">
+          <div><dt>기존 유지</dt><dd>{percent(followup.unchanged.net_return_pct)}</dd></div>
+          <div><dt>적용 정책</dt><dd>{percent(followup.candidate.net_return_pct)}</dd></div>
+          <div><dt>수익률 차이</dt><dd>{percent(followup.delta_net_return_pp)}p</dd></div>
+          <div><dt>비용 스트레스 차이</dt><dd>{percent(followup.delta_stress_return_pp)}p</dd></div>
+        </dl>
+        {followup.worst_delta_net_return_pp !== undefined && followup.best_delta_net_return_pp !== undefined
+          ? <p className="lab-learning-time">집행 시나리오 차이 {percent(followup.worst_delta_net_return_pp)}p ~ {percent(followup.best_delta_net_return_pp)}p</p> : null}
+      </> : null}
+    </div> : null}
   </div>;
 }
 

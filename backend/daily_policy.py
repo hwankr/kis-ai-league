@@ -39,6 +39,8 @@ class DailyPolicyService:
         self.fallback_policy, self.proposer, self.evaluator = fallback_policy, proposer, evaluator
         self.stopping = stopping or (lambda: False)
         self.engine_version = source_version(DAILY_SOURCES)
+        from backend.daily_comparison import ensure_tables
+        ensure_tables(store)
         with store.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS daily_policy_decisions '
                        '(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, day TEXT NOT NULL, '
@@ -138,6 +140,7 @@ class DailyPolicyService:
         if prior and prior.get('decision') != 'error':
             return
         book = (context or {}).get('initial_state')
+        evaluation_context = deepcopy((context or {}).get('daily_evaluation'))
         current = self.now().astimezone(KST)
         if (day != current.date().isoformat() or current.time() < time(16)
                 or not book or book.get('as_of') != day or book.get('pending_orders') or book.get('unresolved_orders')):
@@ -145,7 +148,8 @@ class DailyPolicyService:
                 self.note('waiting', (context or {}).get('book_error'), fingerprint=fingerprint)
             return
         if prior and (prior.get('research_input_hash') != _hash(frames)
-                      or prior.get('limits') != frozen_limits or prior.get('engine_version') != self.engine_version):
+                      or prior.get('limits') != frozen_limits or prior.get('engine_version') != self.engine_version
+                      or prior.get('evaluation_context') != evaluation_context):
             self.note('blocked', '재시도 중 평가 자료·한도·코드 변경', fingerprint=fingerprint)
             return
         parent = self.policy()
@@ -170,22 +174,40 @@ class DailyPolicyService:
                       'proposal': deepcopy(proposal), 'candidate_name': candidate['name'],
                       'change_family': proposal.get('change_family'), 'decision': 'error',
                       'reason': '일일 개선 평가 재시도 대기', 'metrics': None,
-                      'book_hash': _hash(book), 'basis': 'development_only'}
+                      'book_hash': _hash(book), 'basis': 'development_only',
+                      'evaluation_context': evaluation_context}
+            seed = deepcopy(prior.get('comparison_seed')) if prior else None
+            if prior is None:
+                seed = {'parent_policy': deepcopy(parent), 'candidate_policy': deepcopy(candidate),
+                        'initial_state': deepcopy(book),
+                        'execution_model': deepcopy((context or {}).get('execution_model') or {'mode': 'daily_open'}),
+                        'observed_at': self._timestamp(), 'limits': deepcopy(frozen_limits), 'signal_day': day}
+            if seed is not None:
+                record['comparison_seed'] = seed
             with self.store.connect() as db:
                 db.execute('INSERT INTO daily_policy_decisions VALUES (?,?,?,?) '
                            'ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
                            (decision_id, fingerprint, day, encode(record)))
-            from backend.daily_evaluation import evaluate_daily_candidate
-            result = (self.evaluator or evaluate_daily_candidate)(parent, proposal, frames, frozen_limits)
+            from backend.daily_evaluation import select_daily_candidate
+            proposal, result = select_daily_candidate(parent, proposal, frames, frozen_limits,
+                evaluator=self.evaluator, evaluation_context=evaluation_context)
+            candidate = validate_policy(proposal['policy'])
             if self.stopping():
                 return
             record.update({key: result.get(key) for key in ('decision', 'reason', 'metrics', 'changes')})
+            record.update(proposal=deepcopy(proposal), candidate_name=candidate['name'],
+                          change_family=proposal.get('change_family'))
+            if seed is not None:
+                seed['candidate_policy'] = deepcopy(candidate)
+                record['comparison_seed'] = deepcopy(seed)
             record['evaluated_at'] = self._timestamp()
             pending = {'decision_id': decision_id, 'policy': candidate, 'candidate_id': policy_id(candidate),
                        'signal_day': day, 'parent_id': parent_id, 'revision': revision,
                        'fingerprint': fingerprint, 'limits': frozen_limits, 'market_input_hash': digest,
                        'engine_version': self.engine_version,
                        'prepared_at': None}
+            if seed is not None:
+                pending['comparison_seed'] = deepcopy(seed)
             fallback_id = policy_id(self.fallback_policy())
             with self.store.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
@@ -296,6 +318,13 @@ class DailyPolicyService:
                 record = json.loads(record_row[0])
                 record['activation'] = {name: active[name] for name in ('adopted_at', 'effective_day', 'run_id', 'revision')}
                 db.execute('UPDATE daily_policy_decisions SET payload=? WHERE id=?', (encode(record), stored['decision_id']))
+                seed = record.get('comparison_seed')
+                if seed is not None:
+                    followup = {'comparison_seed': deepcopy(seed), 'id': stored['decision_id'],
+                                'fingerprint': stored['fingerprint'], 'effective_day': effective_day,
+                                'adopted_at': active['adopted_at'], 'engine_version': self.engine_version}
+                    db.execute('INSERT OR IGNORE INTO daily_policy_followups VALUES (?,?,?)',
+                               (stored['decision_id'], stored['fingerprint'], encode(followup)))
             return True
         except (KeyError, TypeError, ValueError):
             return False

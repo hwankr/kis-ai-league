@@ -43,6 +43,8 @@ class LearningService:
                     (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL);
             """)
         from backend.daily_policy import DailyPolicyService
+        from backend.daily_comparison import ensure_tables
+        ensure_tables(store)
         self.daily = DailyPolicyService(store, enabled=enabled and daily_enabled, now=now,
                                        fallback_policy=self.champion, evaluator=daily_evaluator,
                                        stopping=lambda: self.stopping)
@@ -77,6 +79,9 @@ class LearningService:
         from backend.learning_policy import policy_id
         history = self.history()
         if self.daily.enabled:
+            from backend.daily_comparison import followup_summaries
+            followups = {item['decision_id']: item for item in followup_summaries(
+                self.store, (self.store.setting('policy') or {}).get('fingerprint'))}
             pending = self.daily.pending() or {}
             daily_history = []
             for item in self.daily.history():
@@ -95,7 +100,8 @@ class LearningService:
                     'candidate_id': policy_id(item['proposal']['policy']), 'decision': item['decision'],
                     'daily_evaluation': {key: deepcopy(item.get(key)) for key in
                         ('as_of', 'decision', 'reason', 'basis', 'metrics')},
-                    'activation': activation})
+                    'activation': activation,
+                    'forward_comparison': followups.get(item['id'])})
             history = daily_history + history
         fingerprint = (self.store.setting("policy") or {}).get("fingerprint")
         groups = {}
@@ -124,6 +130,8 @@ class LearningService:
         from backend.learning_policy import policy_id
         state, policy = self.state(), self.champion()
         trial = state.get("trial")
+        from backend.daily_comparison import followup_summaries
+        followups = followup_summaries(self.store, (self.store.setting('policy') or {}).get('fingerprint')) if self.daily.enabled else []
         return {"enabled": self.enabled,
                 "status": "disabled" if not self.enabled else state.get("status", "waiting"),
                 "champion": {"id": policy_id(policy), "name": policy["name"],
@@ -132,7 +140,8 @@ class LearningService:
                                "started_at": trial["created_at"],
                                "sessions": trial.get('elapsed_intervals', 0)} if trial else None,
                 "last_evaluation": state.get("last_evaluation"), "last_change": state.get("last_change"),
-                "error": state.get("error"), **({'daily': self.daily.snapshot()} if self.daily.enabled else {})}
+                "error": state.get("error"), **({'daily': {**self.daily.snapshot(), 'forward_comparisons': followups}}
+                                               if self.daily.enabled else {})}
 
     def _start_ready(self, as_of, context):
         if context is None:
@@ -496,6 +505,8 @@ class LearningService:
         from backend.learning_policy import build_frame
         from backend.learning_research import propose_candidate
         from backend.learning_benchmarks import refresh_market_comparison
+        from backend.learning_history import enrich_selection
+        from backend.daily_comparison import freeze_context, evaluation_context, update_followups
         if not self.enabled or self.stopping:
             return
         current = self.now().astimezone(KST)
@@ -512,7 +523,8 @@ class LearningService:
         if prior:
             frozen = json.loads(prior[0])
             ignored = {'observed_at', 'captured_at', 'benchmark_prices'}
-            if ({key: value for key, value in frozen.items() if key not in ignored}
+            comparable = enrich_selection(frozen, frame)
+            if ({key: value for key, value in comparable.items() if key not in ignored}
                     != {key: value for key, value in frame.items() if key not in ignored}
                     or any(frame.get('benchmark_prices', {}).get(key) != value
                            for key, value in frozen.get('benchmark_prices', {}).items())):
@@ -525,17 +537,30 @@ class LearningService:
         state = self.state()
         book = (context or {}).get('initial_state')
         fingerprint = limits.get('fingerprint') or (self.store.setting('policy') or {}).get('fingerprint')
+        context = deepcopy(context or {})
+        derived_frames = {frame['as_of']: frame}
+        historical = []
+        if self.development_reader:
+            historical = self.development_reader(data)
+            derived_frames.update({item['as_of']: item for item in historical})
+            derived_frames[frame['as_of']] = frame
+        frames = [enrich_selection(item, derived_frames.get(item['as_of'])) for item in frames]
         if book:
             model = deepcopy((context or {}).get('execution_model') or {'mode': 'daily_open'})
+            freeze_context(self.store, fingerprint, frame, book, model, limits,
+                           self._timestamp(), self.daily.engine_version)
             self._scorecard(state, frames, limits, model, fingerprint, book)
             refresh_market_comparison(self.store, state, data, self._timestamp())
             self._save(state)
         development = frames
         if self.development_reader:
-            historical = self.development_reader(data)
             combined = {item['as_of']: item for item in historical if item['as_of'] <= frame['as_of']}
             combined.update({item['as_of']: item for item in frames})
             development = [combined[day] for day in sorted(combined)][-120:]
+        anchor = evaluation_context(self.store, fingerprint, frames, limits, self.daily.engine_version)
+        if anchor:
+            context['daily_evaluation'] = anchor
+        update_followups(self.store, fingerprint, frames, self.daily.engine_version)
         self.daily.process(data, development, limits, self._research_history(), context=context,
                            proposer=self.proposer or propose_candidate,
                            llm=self.llm_factory() if self.llm_factory else None)

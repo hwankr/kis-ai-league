@@ -134,6 +134,44 @@ class DailyPolicyTests(unittest.TestCase):
         self.assertIsNone(self.service.pending())
         self.assertEqual(self.service.policy(), self.parent)
 
+    def test_pool_winner_is_persisted_and_prepared_with_matching_metadata(self):
+        alternate = deepcopy(self.candidate)
+        alternate['name'] = '수익 우위 후보'
+        alternate['strategies'][0]['holding_sessions'] = 6
+        original = {'policy': self.candidate, 'method': 'llm_development',
+                    'development': {'net_return_pct': 2}, 'change_family': 'exit'}
+        winning = {'policy': alternate, 'method': 'grammar_development',
+                   'development': {'net_return_pct': 3}, 'change_family': 'exit'}
+        self.proposer.return_value = {**original, 'candidate_pool': [original, winning]}
+        def evaluate(parent, proposal, frames, limits):
+            score = proposal['development']['net_return_pct']
+            return {'decision': 'apply', 'reason': 'test', 'metrics': {
+                'selection_return_pct': score, 'selection_stress_return_pct': score - .1}, 'changes': []}
+        self.evaluator.side_effect = evaluate
+        self.process()
+        saved = self.service.history()[0]
+        self.assertEqual(saved['candidate_name'], alternate['name'])
+        self.assertEqual(saved['proposal']['method'], 'grammar_development')
+        self.assertEqual(saved['proposal']['development'], {'net_return_pct': 3})
+        self.assertEqual(saved['proposal']['candidate_pool'][0], original)
+        self.assertEqual(saved['metrics']['selection']['candidates_evaluated'], 2)
+        self.assertEqual(self.service.pending()['candidate_id'], policy_id(alternate))
+        self.assertEqual(self.service.pending()['policy'], alternate)
+
+    def test_frozen_evaluation_context_is_preserved_on_retry_and_cannot_change(self):
+        self.context['daily_evaluation'] = {'maximum_drawdown_pct': 10}
+        self.evaluator.side_effect = RuntimeError('offline failure')
+        with self.assertRaises(RuntimeError):
+            self.process()
+        saved = self.service.history()[0]
+        self.assertEqual(saved['evaluation_context'], {'maximum_drawdown_pct': 10})
+        self.context['daily_evaluation']['maximum_drawdown_pct'] = 12
+        self.evaluator.reset_mock()
+        self.process()
+        self.evaluator.assert_not_called()
+        self.assertEqual(self.service.snapshot()['status'], 'blocked')
+        self.assertEqual(self.service.history()[0], saved)
+
     def test_evaluation_failure_preserves_model_response_for_retry_without_reprompting(self):
         self.evaluator.side_effect = RuntimeError('offline evaluator failure')
         with self.assertRaisesRegex(RuntimeError, 'offline evaluator'):

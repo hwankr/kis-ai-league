@@ -48,11 +48,16 @@ class SourceVersionTests(unittest.TestCase):
 
     def test_reviewed_scorecard_migrations_do_not_validate_old_trials_or_runs(self):
         current = source_version(LEARNING_SOURCES)
+        reviewed = 'py-lf-v1:4d07d05ba03cc65e975844877bd5b2a7596d70f337cf4e9ccacaf7626aa8db03'
         for old in LEGACY_SCORECARDS:
             with self.subTest(old=old):
-                self.assertTrue(scorecard_version_matches(old, current))
+                self.assertTrue(scorecard_version_matches(old, reviewed))
+                self.assertFalse(version_matches(old, reviewed))
+                # Allocation, exits and inherited risk are now materially different.
+                self.assertFalse(scorecard_version_matches(old, current))
                 self.assertFalse(version_matches(old, current))
                 self.assertFalse(scorecard_version_matches(current, old))
+        self.assertFalse(scorecard_version_matches(reviewed, current))
         self.assertFalse(scorecard_version_matches('unreviewed', current))
 
     def test_cost_and_comparison_changes_reject_old_and_current_versions(self):

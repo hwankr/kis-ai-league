@@ -876,8 +876,11 @@ class ExperimentService:
                     book = owned_book(policy, positions, metrics, orders, prices,
                                       as_of=str(data['as_of']), session_days=days)
                     context['initial_state'] = book
-                    self.learning_account.observe(policy, book, self._timestamp(), limit=self.risk_limit, daily=True,
-                                                  comparisons=self.learning.state().get('scorecard'))
+                    value = self.learning_account.observe(policy, book, self._timestamp(), limit=self.risk_limit, daily=True,
+                                                          comparisons=self.learning.state().get('scorecard'))
+                    if value:
+                        book['account_protection'] = {'units': value['units'], 'peak': value['risk']['peak'],
+                            'active': value['risk']['active'], 'limit_pct': self.risk_limit}
                 except ValueError:
                     context['book_error'] = 'AI 보유 평가가격 확인 필요'
             self.learning.enqueue(data, baseline, policy, source_id=run["collection_hash"], context=context)
@@ -1274,6 +1277,9 @@ class ExperimentService:
         if master.get("status") != "ok" or master.get("stale"):
             raise KisError("현재 종목 상태 목록 확인 필요")
         decisions, caps = self._entry_plan(policy, run, today)
+        if learned and execution.get("allocation_mode", "legacy") != "legacy":
+            self._allocated_entries(policy, execution, run, decisions, broker, today, allowed, master)
+            return
         for decision in decisions:
             if not self.store.setting("enabled", False) or self.stopping or self._blocked():
                 break
@@ -1339,10 +1345,153 @@ class ExperimentService:
         self._save_learning_quote(symbol, result, buy_eligible=buy_eligible)
         return result
 
+    def _allocation_limits(self, policy, execution, orders, account, today):
+        """Current fee-inclusive money available to the pure entry planner."""
+        positions, results = self._portfolio(orders)
+        weights = {item["id"]: Decimal(str(item["weight"])) for item in execution["strategies"]}
+        reserved, daily = Decimal(0), Decimal(0)
+        strategy_used = dict.fromkeys(weights, Decimal(0))
+        for position in positions:
+            if position["strategy_id"] in strategy_used:
+                strategy_used[position["strategy_id"]] += decimal(position["cost"])
+        for order in orders:
+            if order["side"] != "buy":
+                continue
+            pending = (decimal(order["limit_price"]) * order.get("remaining_quantity", order["quantity"])
+                       * (1 + FEE) if order["status"] in ACTIVE else Decimal(0))
+            reserved += pending
+            if order["strategy_id"] in strategy_used:
+                strategy_used[order["strategy_id"]] += pending
+            if order["order_date"] == today.isoformat():
+                daily += decimal(order["filled_amount"]) * (1 + FEE) + pending
+        used = sum((decimal(item["cost"]) for item in positions), Decimal(0)) + reserved
+        budget = decimal(policy["budget"])
+        floor = budget * Decimal(str(execution["cash_reserve"]))
+        cash = budget + sum((Decimal(item["realized_pnl"]) for item in results), Decimal(0)) - used
+        held = {item["symbol"] for item in positions}
+        pending_symbols = {item["symbol"] for item in orders if item["side"] == "buy" and item["status"] in ACTIVE}
+        return {"available_cash": max(Decimal(0), min(decimal(account["cash"]) - reserved, cash) - floor),
+                "daily_remaining": max(Decimal(0), decimal(policy["daily_buy_limit"]) - daily),
+                "portfolio_remaining": max(Decimal(0), budget - floor - used),
+                "order_cap": decimal(policy["order_cap"]), "strategy_weights": weights,
+                "strategy_remaining": {key: max(Decimal(0), budget * weight - strategy_used[key])
+                                       for key, weight in weights.items()},
+                "max_new_positions": max(0, execution["max_positions"] - len(held | pending_symbols))}
+
+    def _allocated_entries(self, policy, execution, run, decisions, broker, today, allowed, master):
+        """Prepare all executable unique candidates before opt-in allocation."""
+        from backend.portfolio_plan import plan_entries
+        orders = self._owned_orders(policy)
+        positions, _ = self._portfolio(orders)
+        account = broker.snapshot()
+        excluded = {item["symbol"] for item in positions} | {
+            item["symbol"] for item in orders if item["status"] in ACTIVE or
+            item["side"] == "buy" and item["order_date"] == today.isoformat()}
+        candidates, quotes, sources = [], {}, {}
+        for decision in decisions:
+            if not self.store.setting("enabled", False) or self.stopping or self._blocked():
+                return
+            symbol = decision["symbol"]
+            if (symbol in excluded or symbol not in allowed or account["holdings"].get(symbol, {}).get("quantity", 0)
+                    or assess_master(master["rows"].get(symbol), allowed[symbol]["board"])["status"] != "pass"):
+                continue
+            if symbol not in quotes:
+                price = self._symbol_quote(broker, symbol)
+                if price is None or price > decimal(decision["reference_close"], positive=True) * (
+                        1 + Decimal(str(execution["entry_slippage_bps"])) / 10000):
+                    excluded.add(symbol)
+                    continue
+                quotes[symbol] = price, broker.buyability(symbol, str(price))
+            price, buying = quotes[symbol]
+            candidate = {"symbol": symbol, "strategy_id": decision["strategy_id"], "price": price,
+                         "quantity_cap": buying["quantity"], "cash_cap": buying["cash"]}
+            if "rank" in decision:
+                candidate["rank"] = decision["rank"]
+            candidates.append(candidate)
+            sources.setdefault((symbol, decision["strategy_id"]), decision)
+        plans, needs_plan = [], True
+        while candidates:
+            if not self.store.setting("enabled", False) or self.stopping or self._blocked():
+                break
+            orders = self._owned_orders(policy)
+            positions, _ = self._portfolio(orders)
+            account = broker.snapshot()
+            excluded = {row["symbol"] for row in positions} | {
+                row["symbol"] for row in orders if row["status"] in ACTIVE or
+                row["side"] == "buy" and row["order_date"] == today.isoformat()} | {
+                symbol for symbol, holding in account["holdings"].items() if holding.get("quantity", 0)}
+            retained = [row for row in candidates if row["symbol"] not in excluded]
+            needs_plan = needs_plan or len(retained) != len(candidates)
+            candidates = retained
+            if needs_plan:
+                plans = plan_entries(candidates, mode=execution["allocation_mode"], fee_rate=FEE,
+                                     **self._allocation_limits(policy, execution, orders, account, today))
+                needs_plan = False
+            if not plans:
+                break
+            item = plans[0]
+            symbol, strategy = item["symbol"], item["strategy_id"]
+            decision = sources[(symbol, strategy)]
+            # Refresh before each order. Replan only not-yet-attempted symbols
+            # so changed quotes/caps cannot strand the original cash allocation.
+            price = self._symbol_quote(broker, symbol)
+            if price is None or price > decimal(decision["reference_close"], positive=True) * (
+                    1 + Decimal(str(execution["entry_slippage_bps"])) / 10000):
+                candidates = [row for row in candidates if row["symbol"] != symbol]
+                needs_plan = True
+                continue
+            buying = broker.buyability(symbol, str(price))
+            account = broker.snapshot()
+            if account["holdings"].get(symbol, {}).get("quantity", 0):
+                candidates = [row for row in candidates if row["symbol"] != symbol]
+                needs_plan = True
+                continue
+            limits = self._allocation_limits(policy, execution, orders, account, today)
+            if not limits["max_new_positions"]:
+                break
+            for row in candidates:
+                if row["symbol"] == symbol:
+                    row.update(price=price, quantity_cap=buying["quantity"], cash_cap=buying["cash"])
+            planned_cost = sum((decimal(row["estimated_cost"]) for row in plans), Decimal(0))
+            strategy_cost = {key: sum((decimal(row["estimated_cost"]) for row in plans if row["strategy_id"] == key), Decimal(0))
+                             for key in limits["strategy_remaining"]}
+            changed = (price != decimal(item["price"]) or buying["quantity"] < item["quantity"]
+                or decimal(buying["cash"]) < decimal(item["estimated_cost"])
+                or planned_cost > min(limits["available_cash"], limits["daily_remaining"], limits["portfolio_remaining"])
+                or len(plans) > limits["max_new_positions"]
+                or any(amount > limits["strategy_remaining"][key] for key, amount in strategy_cost.items()))
+            if changed:
+                plans = plan_entries(candidates, mode=execution["allocation_mode"], fee_rate=FEE, **limits)
+            item = next((row for row in plans if row["symbol"] == symbol), None)
+            candidates = [row for row in candidates if row["symbol"] != symbol]
+            plans = [row for row in plans if row["symbol"] != symbol]
+            if item:
+                decision = sources[(symbol, item["strategy_id"])]
+                self._submit(policy, broker, decision, "buy", item["quantity"], price,
+                             f"entry:{policy['fingerprint']}:{today.isoformat()}:{symbol}", run_id=run["id"])
+
     def _exit_due(self, position, days, today):
         if position.get('exit_pending'):
             return True
         rule = position.get("exit_policy") or {"holding_sessions": 5}
+        if rule.get("exit_mode") == "signal_extension":
+            from backend.learning_policy import position_exit_due
+            age = sum(position["entry_date"] <= day < today.isoformat() for day in days)
+            prior = [day for day in days if day < today.isoformat()]
+            if not prior or position["entry_date"] > prior[-1]:
+                return age >= rule["holding_sessions"]
+            frame = next((item for item in reversed(self.learning.frames()) if item["as_of"] == prior[-1]), None)
+            bar = next((item for item in (frame or {}).get("rows", []) if item["symbol"] == position["symbol"]), None)
+            if bar is None:
+                cache = HistoryCache(self.config_path.parent / ".local" / "candidates" / "history")
+                bars = cache._read(cache._path("stock", position["symbol"]), "stock", position["symbol"])
+                bar = (bars or {}).get(date.fromisoformat(prior[-1]))
+            if bar is None:
+                return age >= rule["holding_sessions"]
+            return position_exit_due(rule, symbol=position["symbol"], held_sessions=age,
+                entry_price=decimal(position["average_price"], positive=True) / (1 + FEE),
+                last_close=bar["close"], quantity=position["quantity"], cost=position["cost"],
+                frame=frame, fee_rate=FEE, tax_rate=TAX)
         if sum(position["entry_date"] <= day < today.isoformat() for day in days) >= rule["holding_sessions"]:
             return True
         if not rule.get("stop_loss_pct") and not rule.get("take_profit_pct"):

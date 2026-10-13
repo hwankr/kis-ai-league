@@ -25,7 +25,7 @@ class DailyLearningTests(unittest.TestCase):
             self.calls.append(deepcopy((parent, frames, history)))
             return {'policy': candidate(), 'change_family': 'bootstrap'}
         self.learner = LearningService(self.store, enabled=True, daily_enabled=True, now=lambda: self.now,
-            proposer=propose, daily_evaluator=lambda *args: {'decision': 'apply', 'reason': 'test', 'metrics': None})
+            proposer=propose, daily_evaluator=lambda *args, **kwargs: {'decision': 'apply', 'reason': 'test', 'metrics': None})
         self.addCleanup(self.learner.close)
         self.context = {'initial_state': {'as_of': self.data['as_of'], 'cash': '1000000',
             'equity': '1000000', 'positions': [], 'pending_orders': [], 'unresolved_orders': []}}
@@ -201,11 +201,12 @@ class DailyLearningTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertIsNotNone(self.learner.daily.pending())
 
-    def test_scorecard_migration_preserves_start_book_but_does_not_validate_old_trial(self):
-        from backend.learning_compatibility import version_matches
+    def test_replay_change_preserves_anchor_but_invalidates_old_scorecard_and_trial(self):
+        from backend.learning_compatibility import scorecard_version_matches, version_matches
         self.process()
         state = self.learner.state()
         original_start = state['scorecard_start']
+        original_book = deepcopy(state['scorecard_book'])
         old = '3c4aab6471f3d2453474a289cb7cb8c74f8cbf015d7f97d2f872639ef5f94655'
         state['scorecard_engine'] = old
         self.store.save_setting('learning', state)
@@ -214,9 +215,12 @@ class DailyLearningTests(unittest.TestCase):
         self.context['initial_state']['as_of'] = self.data['as_of']
         self.process()
         updated = self.learner.state()
-        self.assertEqual(updated['scorecard']['status'], 'ready')
+        self.assertEqual(updated['scorecard']['status'], 'invalid')
+        self.assertIsNone(updated['scorecard']['baseline_return_pct'])
         self.assertEqual(updated['scorecard_start'], original_start)
+        self.assertEqual(updated['scorecard_book'], original_book)
         self.assertEqual(updated['scorecard_engine'], old)
+        self.assertFalse(scorecard_version_matches(old, self.learner.version))
         self.assertFalse(version_matches(old, self.learner.version))
 
 

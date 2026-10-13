@@ -6,6 +6,7 @@ the returned frames as the independent forward cohort used to adopt a policy.
 No live cache, account, LLM, or network is read or started by this module.
 """
 from datetime import date, datetime, timezone
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -18,6 +19,25 @@ from backend.learning_policy import build_frame
 STATUSES = {"complete", "ready", "ok"}
 INDICES = {"KOSPI": "0001", "KOSDAQ": "1001"}
 FIELDS = ("open", "high", "low", "close", "volume", "turnover")
+
+
+def enrich_selection(frozen, derived):
+    """Attach derived scope metadata only to exactly matching frozen prices/features.
+
+    The stored observation, eligibility, decisions and capture time never change.
+    Missing or revised prices leave metadata absent and scoped replay unavailable.
+    """
+    result = deepcopy(frozen)
+    if not derived or result.get('as_of') != derived.get('as_of'):
+        return result
+    rows = {row['symbol']: row for row in derived.get('rows', [])}
+    for row in result.get('rows', []):
+        other = rows.get(row['symbol'])
+        if ('selection' not in row and other and 'selection' in other
+                and all(row.get(key) == other.get(key) for key in
+                        ('open', 'high', 'low', 'close', 'volume', 'features', 'board'))):
+            row['selection'] = deepcopy(other['selection'])
+    return result
 
 
 def _json(path):

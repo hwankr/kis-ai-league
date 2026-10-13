@@ -43,6 +43,14 @@ export interface DailyLearningData {
       checks: Record<string, boolean>; loss_reduction_only: boolean } | null;
   } | null;
   error: string | null;
+  forward_comparisons?: ({ decision_id: string; effective_day: string } & (
+    { status: 'waiting' | 'unavailable' } |
+    { status: 'ready'; basis: 'post_activation_paired_model'; start_day: string; end_day: string; intervals: number;
+      unchanged: { net_return_pct: number; stress_return_pct: number };
+      candidate: { net_return_pct: number; stress_return_pct: number };
+      delta_net_return_pp: number; delta_stress_return_pp: number;
+      worst_delta_net_return_pp?: number; best_delta_net_return_pp?: number }
+  ))[];
 }
 export interface LearningData {
   enabled: boolean; status: 'disabled' | 'waiting' | 'researching' | 'evaluating' | 'error';
@@ -112,6 +120,17 @@ function validDailyLearning(value: unknown): boolean {
   if (!object(value) || typeof value.enabled !== 'boolean'
     || !['waiting', 'researching', 'prepared', 'active', 'keep', 'blocked', 'error'].includes(String(value.status))
     || !nullableText(value.error)) return false;
+  if (value.forward_comparisons !== undefined && !list(value.forward_comparisons, row => {
+    if (!text(row.decision_id) || !day(row.effective_day)) return false;
+    if (row.status === 'waiting' || row.status === 'unavailable') return true;
+    const returns = (item: unknown) => object(item) && finiteNumber(item.net_return_pct) && finiteNumber(item.stress_return_pct);
+    return row.status === 'ready' && row.basis === 'post_activation_paired_model'
+      && day(row.start_day) && day(row.end_day) && count(row.intervals)
+      && returns(row.unchanged) && returns(row.candidate)
+      && finiteNumber(row.delta_net_return_pp) && finiteNumber(row.delta_stress_return_pp)
+      && (row.worst_delta_net_return_pp === undefined && row.best_delta_net_return_pp === undefined
+        || finiteNumber(row.worst_delta_net_return_pp) && finiteNumber(row.best_delta_net_return_pp));
+  })) return false;
   const { active, pending, last_decision: decision } = value;
   if (!(active === null || object(active) && text(active.id) && text(active.name)
     && nullableDailyTime(active.adopted_at) && nullableDay(active.signal_day) && nullableDay(active.effective_day))

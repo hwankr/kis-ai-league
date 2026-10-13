@@ -22,6 +22,8 @@ BASELINE_POLICY = {"kind": "legacy", "name": "기존 네 전략", "strategies": 
                    "cash_reserve": 0.0, "max_positions": 20,
                    "entry_slippage_bps": 100, "cancel_after_minutes": 10}
 LEGACY_IDS = ("trend-breakout-v1", "pullback-recovery-v1", "relative-strength-v1", "llm-evidence-v1")
+POLICY_OPTIONS = {"allocation_mode", "candidate_scope"}
+STRATEGY_OPTIONS = {"exit_mode", "max_holding_sessions"}
 KST = timezone(timedelta(hours=9))
 FEE, TAX = Decimal("0.000140527"), Decimal("0.002")
 
@@ -77,7 +79,8 @@ def _symbol(value):
 
 def validate_policy(policy):
     """Return a canonical JSON policy; reject arbitrary code and unknown fields."""
-    if not isinstance(policy, dict) or set(policy) != set(BASELINE_POLICY):
+    if (not isinstance(policy, dict) or not set(BASELINE_POLICY) <= set(policy)
+            or set(policy) - set(BASELINE_POLICY) - POLICY_OPTIONS):
         raise ValueError("invalid_policy_fields")
     if policy["kind"] not in {"legacy", "rules"}:
         raise ValueError("invalid_policy_kind")
@@ -91,16 +94,24 @@ def validate_policy(policy):
     if not isinstance(strategies, list):
         raise ValueError("invalid_strategies")
     if policy["kind"] == "legacy":
-        if strategies or any(result[key] != BASELINE_POLICY[key] for key in result if key != "name"):
+        if (strategies or set(policy) & POLICY_OPTIONS
+                or any(result[key] != BASELINE_POLICY[key] for key in result if key != "name")):
             raise ValueError("legacy_policy_is_fixed")
         return result
     if not 1 <= len(strategies) <= 20:
         raise ValueError("invalid_strategy_count")
+    for key, allowed in (("allocation_mode", {"legacy", "equal_eligible", "score_rank"}),
+                         ("candidate_scope", {"unrestricted", "liquid_top20", "liquid_all"})):
+        if key in policy:
+            if policy[key] not in allowed:
+                raise ValueError("invalid_" + key)
+            result[key] = policy[key]
     fields = {"id", "name", "weight", "conditions", "rank_by", "descending", "top_n",
               "holding_sessions", "stop_loss_pct", "take_profit_pct"}
     identities = set()
     for strategy in strategies:
-        if not isinstance(strategy, dict) or set(strategy) != fields:
+        if (not isinstance(strategy, dict) or not fields <= set(strategy)
+                or set(strategy) - fields - STRATEGY_OPTIONS):
             raise ValueError("invalid_strategy_fields")
         identity = _text(strategy["id"], "invalid_strategy_id", 100)
         if identity in LEGACY_IDS:
@@ -127,6 +138,16 @@ def validate_policy(policy):
             "holding_sessions": _integer(strategy["holding_sessions"], 1, 20, "invalid_holding_sessions"),
             "stop_loss_pct": _number(strategy["stop_loss_pct"], "invalid_stop_loss", minimum=0, maximum=20),
             "take_profit_pct": _number(strategy["take_profit_pct"], "invalid_take_profit", minimum=0, maximum=100)})
+        if "exit_mode" in strategy:
+            if strategy["exit_mode"] not in {"fixed", "signal_extension"}:
+                raise ValueError("invalid_exit_mode")
+            result["strategies"][-1]["exit_mode"] = strategy["exit_mode"]
+        if "max_holding_sessions" in strategy:
+            result["strategies"][-1]["max_holding_sessions"] = _integer(
+                strategy["max_holding_sessions"], result["strategies"][-1]["holding_sessions"], 20,
+                "invalid_max_holding_sessions")
+        if strategy.get("exit_mode") == "signal_extension" and "max_holding_sessions" not in strategy:
+            raise ValueError("missing_max_holding_sessions")
     if sum(Decimal(str(item["weight"])) for item in result["strategies"]) > 1 - Decimal(str(result["cash_reserve"])):
         raise ValueError("weights_exceed_investable_budget")
     return result
@@ -212,8 +233,19 @@ def build_frame(data, baseline_signals=None):
                     features["excess_20d_pp"] = features["return_20d_pct"] - (end / start - 1) * 100
             except ValueError:
                 pass
+        selection = {"complete_61": item["board"] in sessions and window(61) is not None, "positive_volume_20": False,
+                     "turnover_20d_mean": None}
+        recent = window(20)
+        if recent and item["board"] in sessions:
+            selection["positive_volume_20"] = all(value["volume"] > 0 for value in recent)
+            try:
+                selection["turnover_20d_mean"] = sum(
+                    _number(series[value].get("turnover"), minimum=0) for value in days[-20:]) / 20
+            except ValueError:
+                pass
         rows.append({"symbol": symbol, "name": str(item.get("name", symbol)), "board": item["board"], **bar,
-                     "features": features, "learning_eligible": item.get("learning_eligible", True) is True})
+                     "features": features, "selection": selection,
+                     "learning_eligible": item.get("learning_eligible", True) is True})
     benchmark_prices = {}
     for board in ("KOSPI", "KOSDAQ"):
         try:
@@ -243,6 +275,17 @@ def signals(policy, frame):
     policy = validate_policy(policy)
     identity = policy_id(policy)
     rows = {row["symbol"]: row for row in frame["rows"]}
+    scope = policy.get("candidate_scope", "unrestricted")
+    if scope != "unrestricted":
+        if any("selection" not in row for row in rows.values()):
+            raise ValueError("candidate_scope_metadata_missing")
+        liquid = [row for row in rows.values() if row.get("learning_eligible", True)
+                  and row["selection"].get("complete_61") is True
+                  and row["selection"].get("positive_volume_20") is True
+                  and row["selection"].get("turnover_20d_mean") is not None
+                  and _number(row["selection"]["turnover_20d_mean"], minimum=0) >= 10_000_000_000]
+        liquid.sort(key=lambda row: (-row["selection"]["turnover_20d_mean"], row["symbol"]))
+        rows = {row["symbol"]: row for row in (liquid[:20] if scope == "liquid_top20" else liquid)}
     result = []
     strategies = _strategies(policy)
     # Match the legacy executor's rotating priority, without sorting rule ranks away.
@@ -281,6 +324,13 @@ def signals(policy, frame):
                 "exit_policy": {key: strategy[key] for key in ("holding_sessions", "stop_loss_pct", "take_profit_pct")},
                 "policy_id": identity, "reference_close": row["close"]})
         candidates.sort(key=lambda item: ((-item["score"] if strategy.get("descending", True) else item["score"]), item["symbol"]))
+        for rank, candidate in enumerate(candidates, 1):
+            if policy.get("allocation_mode", "legacy") != "legacy":
+                candidate["rank"] = rank
+            if strategy.get("exit_mode") == "signal_extension":
+                candidate["exit_policy"].update(exit_mode="signal_extension",
+                    max_holding_sessions=strategy["max_holding_sessions"],
+                    continuation_policy=deepcopy(policy), continuation_strategy=strategy["id"])
         groups.append(candidates if policy["kind"] == "legacy" else candidates[:strategy["top_n"]])
     for index in range(max((len(group) for group in groups), default=0)):
         result.extend(group[index] for group in groups if index < len(group))
@@ -308,16 +358,49 @@ def _decimal_text(value):
 def _exit_policy(value):
     if not isinstance(value, dict):
         raise ValueError("invalid_initial_exit_policy")
-    return {"holding_sessions": _integer(value.get("holding_sessions"), 1, 20, "invalid_initial_exit_policy"),
+    result = {"holding_sessions": _integer(value.get("holding_sessions"), 1, 20, "invalid_initial_exit_policy"),
             "stop_loss_pct": _number(value.get("stop_loss_pct"), minimum=0, maximum=20),
             "take_profit_pct": _number(value.get("take_profit_pct"), minimum=0, maximum=100)}
+    if value.get("exit_mode", "fixed") not in {"fixed", "signal_extension"}:
+        raise ValueError("invalid_initial_exit_mode")
+    if value.get("exit_mode") == "signal_extension":
+        frozen = validate_policy(value.get("continuation_policy"))
+        strategy = value.get("continuation_strategy")
+        if frozen["kind"] != "rules" or strategy not in {item["id"] for item in frozen["strategies"]}:
+            raise ValueError("invalid_continuation_policy")
+        result.update(exit_mode="signal_extension", continuation_policy=frozen, continuation_strategy=strategy,
+                      max_holding_sessions=_integer(value.get("max_holding_sessions"),
+                          result["holding_sessions"], 20, "invalid_max_holding_sessions"))
+    return result
+
+
+def position_exit_due(exit_policy, *, symbol, held_sessions, entry_price, last_close, quantity,
+                      cost, frame=None, fee_rate=FEE, tax_rate=TAX):
+    """Use the entry's frozen rule and the preceding completed close only."""
+    rule = _exit_policy(exit_policy)
+    change = (_decimal(last_close) / _decimal(entry_price) - 1) * 100
+    if ((rule["stop_loss_pct"] > 0 and change <= -_decimal(rule["stop_loss_pct"]))
+            or (rule["take_profit_pct"] > 0 and change >= _decimal(rule["take_profit_pct"]))):
+        return True
+    if held_sessions < rule["holding_sessions"]:
+        return False
+    if rule.get("exit_mode") != "signal_extension" or held_sessions >= rule["max_holding_sessions"]:
+        return True
+    if not frame or _decimal(quantity) * _decimal(last_close) * (1 - _decimal(fee_rate) - _decimal(tax_rate)) <= _decimal(cost):
+        return True
+    try:
+        maintained = signals(rule["continuation_policy"], frame)
+    except (ValueError, KeyError, TypeError):
+        return True
+    return not any(item["symbol"] == symbol and item["strategy_id"] == rule["continuation_strategy"]
+                   for item in maintained)
 
 
 def _execution_model(value):
     value = {} if value is None else value
     allowed = {"mode", "fill_ratio", "buy_fill_ratio", "sell_fill_ratio", "fee_rate", "tax_rate",
                "slippage_bps", "stress_slippage_bps", "stress_fee_rate", "stress_fill_ratio",
-               "sell_delay_sessions", "adverse_buy"}
+               "sell_delay_sessions", "adverse_buy", "daily_buy_caps"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("invalid_execution_model")
     mode = value.get("mode", "daily_open")
@@ -326,6 +409,10 @@ def _execution_model(value):
     ratio = _number(value.get("fill_ratio", 1), "invalid_execution_model", minimum=0, maximum=1)
     fee = value.get("fee_rate", FEE)
     result = {"mode": mode}
+    caps = value.get("daily_buy_caps", {})
+    if not isinstance(caps, dict):
+        raise ValueError("invalid_daily_buy_caps")
+    result["daily_buy_caps"] = {_day(day): _state_decimal(cap) for day, cap in caps.items()}
     result["sell_delay_sessions"] = _integer(value.get("sell_delay_sessions", 0), 0, 20, "invalid_sell_delay")
     if type(value.get("adverse_buy", False)) is not bool:
         raise ValueError("invalid_adverse_buy")
@@ -352,6 +439,23 @@ def _initial_state(value, budget, first_day):
     reserved = _state_decimal(value.get("reserved_cash", 0))
     if reserved > cash or not isinstance(value.get("positions", []), list):
         raise ValueError("invalid_initial_state")
+    if "reserved_entries" in value:
+        entries, seen = value["reserved_entries"], set()
+        if not isinstance(entries, list):
+            raise ValueError("invalid_reserved_entries")
+        total = Decimal(0)
+        for item in entries:
+            if not isinstance(item, dict) or set(item) != {"symbol", "strategy_id", "cost"}:
+                raise ValueError("invalid_reserved_entries")
+            symbol = _symbol(item["symbol"])
+            _text(item["strategy_id"], "invalid_initial_strategy")
+            cost = _state_decimal(item["cost"])
+            if symbol in seen or cost <= 0:
+                raise ValueError("invalid_reserved_entries")
+            seen.add(symbol)
+            total += cost
+        if total != reserved:
+            raise ValueError("reserved_entries_cost_mismatch")
     positions = {}
     for item in value.get("positions", []):
         symbol = _symbol(item.get("symbol"))
@@ -380,6 +484,26 @@ def _initial_state(value, budget, first_day):
 def _replay(policy, frames, limits, model, initial_state, *, stress=False, execution_stress=False, support=None):
     budget, order_cap, daily_limit = (limits[key] for key in ("budget", "order_cap", "daily_buy_limit"))
     cash, reserved, positions, saved = _initial_state(initial_state, budget, frames[0]["as_of"])
+    protection = deepcopy((saved or {}).get("account_protection"))
+    if protection is not None:
+        if (not isinstance(protection, dict) or type(protection.get("active")) is not bool
+                or set(protection) != {"units", "peak", "active", "limit_pct"}):
+            raise ValueError("invalid_account_protection")
+        for key in ("units", "peak"):
+            protection[key] = _state_decimal(protection[key])
+            if protection[key] <= 0:
+                raise ValueError("invalid_account_protection")
+        protection["limit_pct"] = _decimal(_number(protection["limit_pct"],
+            "invalid_account_protection", minimum=.000001, maximum=100))
+    def observe_protection(equity):
+        if protection is None:
+            return
+        unit = equity / protection["units"]
+        protection["peak"] = max(protection["peak"], unit)
+        if (1 - unit / protection["peak"]) * 100 >= protection["limit_pct"]:
+            protection["active"] = True
+    reserved_entries = (saved or {}).get("reserved_entries", [])
+    reserved_symbols = {item["symbol"] for item in reserved_entries}
     slip = model["stress_slippage_bps" if stress else "slippage_bps"] / 10000
     fee, tax = model["stress_fee_rate" if stress else "fee_rate"], model["tax_rate"]
     ratios = {side: model[side + "_fill_ratio"] for side in ("buy", "sell")}
@@ -415,6 +539,8 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
     for index, frame in enumerate(frames):
         rows = {row["symbol"]: row for row in frame["rows"]}
         bars = {}
+        protection_observed_at = None
+        protection_was_active = bool(protection and protection["active"])
         def bar_for(symbol):
             if symbol not in bars:
                 if symbol not in rows:
@@ -437,6 +563,9 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                 observed = _instant(quote.get("observed_at"))
                 if observed.astimezone(KST).date().isoformat() != frame["as_of"] or observed > _instant(frame["observed_at"]):
                     raise ValueError("execution_quote_outside_session")
+                if (not protection_was_active and protection_observed_at is not None
+                        and observed < protection_observed_at):
+                    raise ValueError("protection_quote_after_decision")
                 if not quote["eligible"] or side == "buy" and not quote.get("buy_eligible", True):
                     diagnostics["ineligible_quotes"] += 1
                     diagnostics["unfilled_orders"] += 1
@@ -484,17 +613,49 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             if quantity < requested:
                 diagnostics["partial_orders" if quantity else "unfilled_orders"] += 1
             return quantity
+        # The live account checks its durable NAV peak before exits and entries.
+        # Intraday observations are only modelled where a frozen quote exists.
+        if index and protection is not None:
+            marked = Decimal(0)
+            for symbol, position in positions.items():
+                bar = bar_for(symbol)
+                price = bar["open"]
+                if model["mode"] == "observed_quotes":
+                    quote = frame.get("execution_quotes", {}).get(symbol)
+                    if not isinstance(quote, dict) or quote.get("price") is None:
+                        raise ValueError("protection_quote_missing")
+                    observed = _instant(quote.get("observed_at"))
+                    if (observed.astimezone(KST).date().isoformat() != frame["as_of"]
+                            or observed > _instant(frame["observed_at"])):
+                        raise ValueError("execution_quote_outside_session")
+                    price = _decimal(quote["price"])
+                    if price <= 0:
+                        raise ValueError("invalid_execution_quote")
+                    protection_observed_at = max(protection_observed_at or observed, observed)
+                marked += position["quantity"] * price * (1 - fee - tax)
+            if protection_observed_at is not None and not protection_was_active:
+                for signal in pending:
+                    if signal["symbol"] in positions:
+                        continue
+                    quote = frame.get("execution_quotes", {}).get(signal["symbol"])
+                    if (isinstance(quote, dict) and quote.get("eligible") is True
+                            and quote.get("buy_eligible", True) is True and quote.get("price") is not None
+                            and _instant(quote.get("observed_at")) < protection_observed_at):
+                        # A later holding quote cannot decide whether an earlier
+                        # entry should be blocked, even if protection now trips.
+                        raise ValueError("protection_quote_after_decision")
+            observe_protection(cash + marked)
         for symbol, position in list(positions.items()):
             bar_for(symbol)  # Suspensions still have a close for valuation.
             if not index:
                 continue
             position["held_sessions"] += 1
-            change = (position["last_close"] / position["entry_price"] - 1) * 100
             exit_policy = position["exit_policy"]
-            timed = position["held_sessions"] >= exit_policy["holding_sessions"]
-            stopped = exit_policy["stop_loss_pct"] > 0 and change <= -_decimal(exit_policy["stop_loss_pct"])
-            taken = exit_policy["take_profit_pct"] > 0 and change >= _decimal(exit_policy["take_profit_pct"])
-            if position["exit_pending"] or timed or stopped or taken:
+            due = position_exit_due(exit_policy, symbol=symbol, held_sessions=position["held_sessions"],
+                entry_price=position["entry_price"], last_close=position["last_close"],
+                quantity=position["quantity"], cost=position["cost"], frame=frames[index - 1],
+                fee_rate=fee, tax_rate=tax)
+            if position["exit_pending"] or due or protection is not None and protection["active"]:
                 position["exit_pending"] = True
                 price = execution_price(symbol, "sell", position=position)
                 quantity = fill_quantity(position["quantity"], "sell", position) if price is not None else 0
@@ -517,8 +678,38 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                       for key in ordering]
             pending = [group[number] for number in range(max((len(group) for group in groups), default=0))
                        for group in groups if number < len(group)]
+        if protection is not None and protection["active"]:
+            pending = []
         counts = {key: sum(item["strategy_id"] == key for item in pending) for key in weights}
         spent, strategy_spent = Decimal(0), dict.fromkeys(weights, Decimal(0))
+        session_limit = min(daily_limit, model["daily_buy_caps"].get(frame["as_of"], daily_limit))
+        planned = None
+        if policy.get("allocation_mode", "legacy") != "legacy":
+            from backend.portfolio_plan import plan_entries
+            if reserved and "reserved_entries" not in (saved or {}):
+                raise ValueError("reserved_entries_required")
+            candidates = []
+            quoted = {}
+            for signal in pending:
+                symbol = signal["symbol"]
+                if symbol in positions or symbol in reserved_symbols:
+                    continue
+                if symbol not in quoted:
+                    limit = _decimal(signal["reference_close"]) * (1 + _decimal(policy["entry_slippage_bps"]) / 10000)
+                    quoted[symbol] = execution_price(symbol, "buy", limit)
+                if quoted[symbol] is not None:
+                    candidates.append({**signal, "price": quoted[symbol], "quantity_cap": 10**12})
+            used = sum((position["cost"] for position in positions.values()), Decimal(0)) + reserved
+            remaining = {key: max(Decimal(0), budget * weight - sum((position["cost"] for position in positions.values()
+                         if position["strategy_id"] == key), Decimal(0)) - sum((_state_decimal(item["cost"])
+                         for item in reserved_entries if item["strategy_id"] == key), Decimal(0))) for key, weight in weights.items()}
+            plan = plan_entries(candidates, mode=policy["allocation_mode"], available_cash=max(Decimal(0), cash-reserved-reserve),
+                daily_remaining=session_limit, portfolio_remaining=max(Decimal(0), budget-reserve-used), order_cap=order_cap,
+                strategy_remaining=remaining, strategy_weights=weights, fee_rate=fee,
+                max_new_positions=max(0, policy["max_positions"]-len(set(positions) | reserved_symbols)))
+            planned = {item["symbol"]: item for item in plan}
+            by_key = {(item["symbol"], item["strategy_id"]): item for item in pending}
+            pending = [by_key[(item["symbol"], item["strategy_id"])] for item in plan]
         for signal in pending:
             symbol, strategy = signal["symbol"], signal["strategy_id"]
             if symbol in positions or policy["kind"] != "legacy" and len(positions) >= policy["max_positions"]:
@@ -526,18 +717,21 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             used = sum((position["cost"] for position in positions.values()), Decimal(0))
             strategy_used = sum((position["cost"] for position in positions.values() if position["strategy_id"] == strategy), Decimal(0))
             capacity = min(order_cap, daily_limit * weights[strategy] / max(1, counts[strategy]),
-                           budget - reserve - used, daily_limit - spent, cash - reserved - reserve,
+                           budget - reserve - used, session_limit - spent, cash - reserved - reserve,
                            budget * weights[strategy] - strategy_used,
                            daily_limit * weights[strategy] - strategy_spent[strategy])
+            if planned is not None:
+                capacity = _decimal(planned[symbol]["estimated_cost"])
             if capacity <= 0:
                 continue
             limit = (None if policy["kind"] == "legacy" else _decimal(signal["reference_close"]) *
                      (1 + _decimal(policy["entry_slippage_bps"]) / 10000))
-            price = execution_price(symbol, "buy", limit)
+            price = _decimal(planned[symbol]["price"]) if planned is not None else execution_price(symbol, "buy", limit)
             if price is None:
                 continue
             unit_cost = price * (1 + fee)
-            requested = max(0, int((capacity / unit_cost).to_integral_value(rounding=ROUND_FLOOR)))
+            requested = (planned[symbol]["quantity"] if planned is not None else
+                         max(0, int((capacity / unit_cost).to_integral_value(rounding=ROUND_FLOOR))))
             quantity = fill_quantity(requested, "buy") if requested else 0
             if not quantity:
                 continue
@@ -556,8 +750,11 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
         equity = cash + position_value
         if equity <= 0:
             raise ValueError("nonpositive_equity")
-        curve.append({"as_of": frame["as_of"], "equity": float(equity), "cash": float(cash),
-                      "position_value": float(position_value), "reserved_cash": float(reserved)})
+        observe_protection(cash + sum((position["quantity"] * position["last_close"] * (1-fee-tax)
+                                      for position in positions.values()), Decimal(0)))
+        curve.append({"as_of": frame["as_of"], "equity": float(equity), "cash": float(cash), "buy_cost": float(spent),
+                      "position_value": float(position_value), "reserved_cash": float(reserved),
+                      **({"protection_active": protection["active"]} if protection is not None else {})})
         pending = signals(policy, frame)
         if not index and saved and saved.get("policy_id") == identity and "pending_entries" in saved:
             supplied = saved["pending_entries"]
@@ -585,7 +782,10 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                                                 float((equities[-1] / midpoint - 1) * 100)],
             "equity_curve": curve, "daily_log_returns": [math.log(float(after / before)) for before, after in zip(equities, equities[1:])],
             "final_state": {"as_of": frames[-1]["as_of"], "policy_id": identity, "cash": _decimal_text(cash),
-                            "reserved_cash": _decimal_text(reserved), "positions": state_positions, "pending_entries": pending},
+                            "reserved_cash": _decimal_text(reserved), "positions": state_positions, "pending_entries": pending,
+                            **({"account_protection": {key: _decimal_text(value) if isinstance(value, Decimal) else value
+                                                      for key, value in protection.items()}} if protection is not None else {}),
+                            **({"reserved_entries": deepcopy(reserved_entries)} if "reserved_entries" in (saved or {}) else {})},
             "diagnostics": diagnostics, "support": coverage}
 
 

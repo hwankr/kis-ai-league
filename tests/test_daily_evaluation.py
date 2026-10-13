@@ -1,10 +1,11 @@
 """Daily provisional selection with synthetic data; no broker or storage calls."""
 from copy import deepcopy
 import json
+import math
 import unittest
 from unittest.mock import Mock
 
-from backend.daily_evaluation import VERSION, evaluate_daily_candidate
+from backend.daily_evaluation import VERSION, evaluate_daily_candidate, select_daily_candidate
 from backend.learning_evaluation import daily_metrics
 from backend.learning_policy import BASELINE_POLICY, LEGACY_IDS, portfolio_metrics
 from tests.test_learning_policy import LIMITS, frames, policy
@@ -72,11 +73,122 @@ class DailyEvaluationTests(unittest.TestCase):
         self.assertTrue(result["metrics"]["checks"]["normal_improvement"])
         self.assertFalse(result["metrics"]["checks"]["stress_improvement"])
 
-    def test_any_cost_scenario_drawdown_worsening_vetoes(self):
+    def test_relative_drawdown_worsening_is_diagnostic_within_absolute_cap(self):
         result = self.evaluate(evidence([.001] * 6), evidence([.003] * 6, [-.005] + [.004] * 5))
-        self.assertEqual(result["decision"], "keep")
+        self.assertEqual(result["decision"], "apply")
         self.assertTrue(result["metrics"]["checks"]["stress_improvement"])
         self.assertFalse(result["metrics"]["checks"]["drawdown_not_worse"])
+        self.assertTrue(result["metrics"]["checks"]["drawdown_within_limit"])
+
+    def test_high_return_cannot_bypass_either_cost_drawdown_cap(self):
+        for stress in (False, True):
+            bad = [math.log(1.3), math.log(.84), math.log(1.3)]
+            normal = [.01, .01, .01] if stress else bad
+            result = self.evaluate(evidence([0.] * 3), evidence(normal, bad))
+            self.assertEqual(result["decision"], "keep")
+            self.assertTrue(result["metrics"]["checks"]["normal_improvement"])
+            self.assertFalse(result["metrics"]["checks"]["drawdown_within_limit"])
+
+    def test_frozen_book_uses_its_own_anchor_and_same_model_for_both_policies(self):
+        observations = frames(4)
+        context = {"initial_state": {"as_of": observations[1]["as_of"], "cash": "10000", "positions": []},
+                   "execution_model": {"mode": "daily_open", "buy_fill_ratio": .5},
+                   "observed_at": observations[1]["observed_at"]}
+        original = deepcopy(context)
+        calls = []
+        def evaluate(candidate, supplied, limits, **options):
+            calls.append(deepcopy((supplied, options)))
+            options["initial_state"]["cash"] = "1"
+            return daily_metrics([0., 0.] if len(calls) == 1 else [.001, .001], first_day=supplied[0]["as_of"])
+        result = evaluate_daily_candidate(policy(), changed(), observations, LIMITS,
+                                          evaluator=evaluate, evaluation_context=context)
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(calls[0][0], observations[1:])
+        self.assertEqual(result["metrics"]["replay_basis"], "frozen_book_execution_model")
+        self.assertEqual(context, original)
+
+    def test_current_book_cannot_be_inserted_into_older_comparison(self):
+        observations = frames(4)
+        context = {"initial_state": {"as_of": observations[-1]["as_of"], "cash": "10000"},
+                   "execution_model": {"mode": "daily_open"}, "observed_at": observations[-1]["observed_at"]}
+        for kind in ("today", "late_capture", "missing_anchor", "pending"):
+            supplied = deepcopy(context)
+            if kind == "late_capture":
+                supplied["initial_state"]["as_of"] = observations[0]["as_of"]
+            elif kind == "missing_anchor":
+                supplied["initial_state"]["as_of"] = "2020-01-01"
+            elif kind == "pending":
+                supplied["initial_state"]["pending_orders"] = ["unresolved"]
+            evaluate = Mock()
+            result = evaluate_daily_candidate(policy(), changed(), observations, LIMITS,
+                                              evaluator=evaluate, evaluation_context=supplied)
+            self.assertEqual(result["decision"], "blocked", kind)
+            evaluate.assert_not_called()
+
+    def test_comparison_cap_cannot_weaken_fifteen_percent_protection(self):
+        for value in (15.1, 0, True, float("nan")):
+            evaluate = Mock()
+            result = evaluate_daily_candidate(policy(), changed(), frames(3), LIMITS,
+                evaluator=evaluate, evaluation_context={"maximum_drawdown_pct": value})
+            self.assertEqual(result["decision"], "blocked")
+            evaluate.assert_not_called()
+
+    def test_all_execution_scenarios_must_pass_instead_of_representative_only(self):
+        observations = frames(4)
+        context = {"initial_state": {"as_of": observations[0]["as_of"], "cash": "10000"},
+                   "execution_model": {"scenarios": [{"id": "good"}, {"id": "bad"}]},
+                   "observed_at": observations[0]["observed_at"]}
+        parent = evidence([0.] * 3)
+        candidate = evidence([.002] * 3)
+        parent["scenario_results"] = {"good": evidence([0.] * 3), "bad": evidence([0.] * 3)}
+        candidate["scenario_results"] = {"good": evidence([.002] * 3), "bad": evidence([-.001] * 3)}
+        result = evaluate_daily_candidate(policy(), changed(), observations, LIMITS,
+            evaluator=Mock(side_effect=[parent, candidate]), evaluation_context=context)
+        self.assertEqual(result["decision"], "keep")
+        self.assertTrue(result["metrics"]["checks"]["normal_improvement"])
+        self.assertFalse(result["metrics"]["scenario_comparisons"]["bad"]["eligible"])
+
+    def test_pool_selects_best_eligible_candidate_and_its_own_metadata(self):
+        parent, first, second = policy(name="parent"), changed()["policy"], changed()["policy"]
+        first["name"], second["name"] = "A", "B"
+        second["strategies"][0]["holding_sessions"] = 6
+        pool = [{"policy": first, "method": "llm_development", "development": {"score": 8}},
+                {"policy": second, "method": "grammar_development", "development": {"score": 3}}]
+        proposal = {**pool[0], "candidate_pool": pool}
+        originals = deepcopy((parent, proposal))
+        outcomes = {"parent": evidence([0., 0., 0.]),
+                    "A": evidence([math.log(1.3), math.log(.8), math.log(1.3)]),
+                    "B": evidence([.02, -.0025, .02])}
+        calls = []
+        def evaluate(parent, item, observations, limits):
+            calls.append(item["policy"]["name"])
+            return evaluate_daily_candidate(parent, item, observations, limits,
+                evaluator=lambda candidate, *_: deepcopy(outcomes[candidate["name"]]))
+        selected, result = select_daily_candidate(parent, proposal, frames(4), LIMITS, evaluator=evaluate)
+        self.assertEqual(calls, ["A", "B"])
+        self.assertEqual(result["decision"], "apply")
+        self.assertEqual(selected["policy"], second)
+        self.assertEqual(selected["method"], "grammar_development")
+        self.assertEqual(selected["development"], {"score": 3})
+        self.assertEqual(result["metrics"]["selection"]["candidates_evaluated"], 2)
+        self.assertEqual(result["metrics"]["selection"]["eligible_candidates"], 1)
+        self.assertFalse(result["metrics"]["selection"]["prospective"])
+        self.assertEqual((parent, proposal), originals)
+
+    def test_equal_returns_choose_same_policy_when_candidate_pool_order_changes(self):
+        a, b = changed()["policy"], changed()["policy"]
+        b["strategies"][0]["holding_sessions"] = 6
+        first = {"policy": a, "method": "llm_development"}
+        second = {"policy": b, "method": "grammar_development"}
+        def evaluate(*args):
+            return {"decision": "apply", "metrics": {"selection_return_pct": 2., "selection_stress_return_pct": 1.5}}
+        winners = []
+        for pool in ([first, second], [second, first]):
+            selected, _ = select_daily_candidate(policy(), {**first, "candidate_pool": pool}, frames(3), LIMITS,
+                                                 evaluator=evaluate)
+            winners.append(selected["policy"])
+        self.assertEqual(winners[0], winners[1])
 
     def test_recent_relative_reversal_is_a_diagnostic_not_an_extra_gate(self):
         result = self.evaluate(evidence([.002] * 6), evidence([.004] * 4 + [.001] * 2))

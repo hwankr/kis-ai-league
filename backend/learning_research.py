@@ -44,12 +44,21 @@ Only cohorts of at least five terminal orders may support an execution hint.
 Unknown or unresolved orders are not successes or failures. Such a hint may
 suggest liquidity, top_n or entry-gap changes, never cancellation-time changes.
 History separates development scores, daily_evaluation and actual activation.
+forward_comparison is a paired post-activation model comparison from its frozen
+book. It is separate from broker/account returns and the development score; use
+its supported aggregates as feedback, never as a replacement development reward.
 feedback_mode uses development or completed-trial scoring, never a short daily
 comparison alone. A daily apply is provisional: activation can still be pending,
 prepared or unknown when activation evidence is missing. Only activated records
 confirm a policy change; none proves forward improvement. Keep, blocked and
 error are distinct and not_activated.
 The proposal itself grants no adoption or order permission.
+allocation_mode (legacy/equal_eligible/score_rank) belongs to allocation;
+candidate_scope (unrestricted/liquid_top20/liquid_all) belongs to conditions.
+exit_mode (fixed/signal_extension) and max_holding_sessions belong to exit.
+Preserve absent-option behavior with legacy/unrestricted/fixed defaults; for
+fixed exits set max_holding_sessions equal to holding_sessions. Signal extension
+may extend a profitable still-qualified holding only up to the explicit maximum.
 """
 
 
@@ -75,7 +84,11 @@ POLICY_SCHEMA = _object({
         "rank_by": {"type": "string", "enum": list(FEATURES)},
         "descending": {"type": "boolean"}, "top_n": _numeric(1, 20, "integer"),
         "holding_sessions": _numeric(1, 20, "integer"),
-        "stop_loss_pct": _numeric(0, 20), "take_profit_pct": _numeric(0, 100)})},
+        "stop_loss_pct": _numeric(0, 20), "take_profit_pct": _numeric(0, 100),
+        "exit_mode": {"type": "string", "enum": ["fixed", "signal_extension"]},
+        "max_holding_sessions": _numeric(1, 20, "integer")})},
+    "allocation_mode": {"type": "string", "enum": ["legacy", "equal_eligible", "score_rank"]},
+    "candidate_scope": {"type": "string", "enum": ["unrestricted", "liquid_top20", "liquid_all"]},
     "cash_reserve": _numeric(0, .9), "max_positions": _numeric(1, 20, "integer"),
     "entry_slippage_bps": _numeric(0, 200), "cancel_after_minutes": _numeric(5, 60, "integer")})
 
@@ -94,9 +107,15 @@ def _behavior_id(policy):
     """Names and identifiers cannot disguise a previously tested behavior."""
     value = deepcopy(policy)
     value.pop("name", None)
+    for key, default in (("allocation_mode", "legacy"), ("candidate_scope", "unrestricted")):
+        if value.get(key, default) == default:
+            value.pop(key, None)
     for strategy in value.get("strategies", []):
         strategy.pop("id", None)
         strategy.pop("name", None)
+        if strategy.get("exit_mode", "fixed") == "fixed":
+            strategy.pop("exit_mode", None)
+            strategy.pop("max_holding_sessions", None)
         conditions = {}
         for condition in strategy.get("conditions", []):
             key, threshold = (condition["feature"], condition["op"]), condition["value"]
@@ -261,10 +280,20 @@ def _policy_changes(parent, policy):
             families.add(family)
             changes.append({"path": prefix + key, "before": deepcopy(before[key]), "after": deepcopy(after[key])})
 
+    for key, family, default in (("allocation_mode", "allocation", "legacy"),
+                                  ("candidate_scope", "conditions", "unrestricted")):
+        compare({key: parent.get(key, default)}, {key: policy.get(key, default)}, key, family)
+
     for key, family in (("cash_reserve", "allocation"), ("max_positions", "allocation"),
                         ("entry_slippage_bps", "execution")):
         compare(parent, policy, key, family)
     for index, (before, after) in enumerate(zip(parent["strategies"], policy["strategies"])):
+        mode_before, mode_after = before.get("exit_mode", "fixed"), after.get("exit_mode", "fixed")
+        compare({"exit_mode": mode_before}, {"exit_mode": mode_after}, "exit_mode", "exit", f"strategies[{index}].")
+        if mode_before == "signal_extension" or mode_after == "signal_extension":
+            compare({"max_holding_sessions": before.get("max_holding_sessions", before["holding_sessions"])},
+                    {"max_holding_sessions": after.get("max_holding_sessions", after["holding_sessions"])},
+                    "max_holding_sessions", "exit", f"strategies[{index}].")
         for key, family in (("conditions", "conditions"), ("rank_by", "ranking"), ("descending", "ranking"),
                             ("weight", "allocation"), ("top_n", "allocation"),
                             ("holding_sessions", "exit"), ("stop_loss_pct", "exit"), ("take_profit_pct", "exit")):
@@ -371,7 +400,15 @@ def _grammar(champion, summaries, mode, execution_hint=False, families=FAMILIES)
             for family in families:
                 candidate = deepcopy(champion)
                 candidate["name"] = "근거 반영 규칙 후보"
-                if family == "execution":
+                if family == "allocation" and variant in (1, 2):
+                    candidate["allocation_mode"] = ("equal_eligible", "score_rank")[variant - 1]
+                elif family == "conditions" and variant in (1, 2):
+                    candidate["candidate_scope"] = ("liquid_top20", "liquid_all")[variant - 1]
+                elif family == "exit" and variant == 1:
+                    for strategy in candidate["strategies"]:
+                        strategy["exit_mode"] = "signal_extension"
+                        strategy["max_holding_sessions"] = min(20, strategy["holding_sessions"] + 3)
+                elif family == "execution":
                     values = (50, 150, 25, 175, 0, 200, 75, 125)
                     candidate["entry_slippage_bps"] = values[variant % len(values)]
                 elif family == "allocation":
@@ -409,6 +446,8 @@ def _grammar(champion, summaries, mode, execution_hint=False, families=FAMILIES)
                             low, high = (1, 20) if key == "holding_sessions" else (0, 20 if key == "stop_loss_pct" else 100)
                             delta = (1 + variant // 3) * (1 if mode == "cost_sensitive" else -1)
                             strategy[key] = max(low, min(high, strategy[key] + delta))
+                            if "max_holding_sessions" in strategy and key == "holding_sessions":
+                                strategy["max_holding_sessions"] = max(strategy["max_holding_sessions"], strategy[key])
                 yield candidate
         return
     for variant in range(21):
@@ -428,10 +467,20 @@ def _grammar(champion, summaries, mode, execution_hint=False, families=FAMILIES)
                     "top_n": 2 + (variant % 4), "holding_sessions": min(20, holding + variant % 5),
                     "stop_loss_pct": (3 if defensive else 5) + variant % 3,
                     "take_profit_pct": (9 if defensive else 15) + variant % 5})
-            yield execution_variant({"kind": "rules", "name": name + " 후보", "strategies": strategies,
+            candidate = execution_variant({"kind": "rules", "name": name + " 후보", "strategies": strategies,
                    "cash_reserve": cash, "max_positions": (4 if defensive else 8) + variant % 3,
                    "entry_slippage_bps": (50 if defensive else 100) + (variant % 3) * 25,
                    "cancel_after_minutes": cancel})
+            if variant == 1:
+                if index < 2:
+                    candidate["allocation_mode"] = ("equal_eligible", "score_rank")[index]
+                elif index == 2:
+                    candidate["candidate_scope"] = "liquid_all"
+                else:
+                    for strategy in candidate["strategies"]:
+                        strategy.update(exit_mode="signal_extension",
+                                        max_holding_sessions=min(20, strategy["holding_sessions"] + 3))
+            yield candidate
 
 
 def _public_policy(policy):
@@ -472,6 +521,8 @@ def _public_feedback(history):
             pass
         if isinstance(item.get("execution"), dict):
             entry["execution"] = _execution_values(item["execution"])
+        if isinstance(item.get("forward_comparison"), dict):
+            entry["forward_comparison"] = _public_forward_comparison(item["forward_comparison"])
         attribution = _attribution(item.get("attribution"))
         if attribution is not None:
             entry["attribution"] = attribution
@@ -479,6 +530,43 @@ def _public_feedback(history):
             entry["change_family"] = item["change_family"]
         result.append(entry)
     return result
+
+
+def _public_forward_comparison(value):
+    """Only finite performance aggregates; never send the seed, book, or ledger."""
+    from datetime import date
+    summary = {"status": value.get("status") if value.get("status") in
+               {"ready", "waiting", "unavailable"} else "unknown",
+               "basis": "post_activation_paired_model"}
+    if type(value.get("intervals")) is int and value["intervals"] >= 0:
+        summary["intervals"] = value["intervals"]
+    for key in ("start_day", "end_day", "effective_day"):
+        raw = value.get(key)
+        try:
+            if isinstance(raw, str) and date.fromisoformat(raw).isoformat() == raw:
+                summary[key] = raw
+        except ValueError:
+            pass
+    for key in ("delta_net_return_pp", "delta_stress_return_pp"):
+        summary[key] = _number(value.get(key))
+        for prefix in ("worst_", "best_"):
+            if prefix + key in value:
+                summary[prefix + key] = _number(value[prefix + key])
+    if type(value.get("scenario_count")) is int and 1 <= value["scenario_count"] <= 8:
+        summary["scenario_count"] = value["scenario_count"]
+    if type(value.get("execution_supported")) is bool:
+        summary["execution_supported"] = value["execution_supported"]
+    for side in ("unchanged", "candidate"):
+        raw = value.get(side)
+        if not isinstance(raw, dict):
+            continue
+        summary[side] = {key: _number(raw.get(key)) for key in
+                         ("net_return_pct", "stress_return_pct", "max_drawdown_pct",
+                          "stress_drawdown_pct", "closed_trades")}
+        costs = raw.get("costs")
+        if isinstance(costs, dict):
+            summary[side]["costs"] = {key: _number(costs.get(key)) for key in ("fees_paid", "taxes_paid")}
+    return summary
 
 
 def _public_daily_evaluation(value):
@@ -501,6 +589,17 @@ def _public_daily_evaluation(value):
             summary[key] = metrics[key][:10]
     if metrics.get("source_basis") == "observed_legacy_suffix":
         summary["source_basis"] = metrics["source_basis"]
+    if metrics.get("replay_basis") in {"cash_daily_open", "frozen_book_execution_model"}:
+        summary["replay_basis"] = metrics["replay_basis"]
+    if type(metrics.get("account_protection_inherited")) is bool:
+        summary["account_protection_inherited"] = metrics["account_protection_inherited"]
+    if _number(metrics.get("maximum_drawdown_pct")) is not None:
+        summary["maximum_drawdown_pct"] = _number(metrics["maximum_drawdown_pct"])
+    selection = metrics.get("selection")
+    if isinstance(selection, dict):
+        summary["selection"] = {"basis": "reused_development_data", "prospective": False,
+            **{key: selection[key] for key in ("candidates_evaluated", "eligible_candidates")
+               if type(selection.get(key)) is int and selection[key] >= 0}}
     if type(metrics.get("loss_reduction_only")) is bool:
         summary["loss_reduction_only"] = metrics["loss_reduction_only"]
     for key in ("champion", "candidate", "delta"):
@@ -510,7 +609,7 @@ def _public_daily_evaluation(value):
                  "recent_stress_return_pct")}
     if isinstance(metrics.get("checks"), dict):
         summary["checks"] = {key: metrics["checks"][key] for key in
-            ("normal_improvement", "stress_improvement", "drawdown_not_worse", "recent_improvement")
+            ("normal_improvement", "stress_improvement", "drawdown_not_worse", "drawdown_within_limit", "recent_improvement")
             if type(metrics["checks"].get(key)) is bool}
     result["metrics"] = summary
     return result
@@ -633,8 +732,33 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         except (ValueError, TypeError, KeyError, ArithmeticError):
             pass
     development["parent_comparison"] = comparison
-    return {"policy": deepcopy(policy), "rationale": rationale, "parent_id": parent_id,
+    result = {"policy": deepcopy(policy), "rationale": rationale, "parent_id": parent_id,
             "change_family": family, "changes": changes,
             "hypothesis": _hypothesis(family, attribution, execution_hint),
             "hypothesis_test": _hypothesis_test(family, attribution, history),
             "method": method + ("_development" if evaluations else "_bootstrap"), "development": development}
+    by_id = {policy_id(item[1]): (item[0], item[5]) for item in evaluations}
+    pool = []
+    for candidate, candidate_method, candidate_family, candidate_changes in candidates:
+        identity = policy_id(candidate)
+        candidate_score, candidate_metrics = by_id.get(identity, (None, {}))
+        compact = {key: deepcopy(candidate_metrics.get(key)) for key in
+                   (*METRICS, "stress_drawdown_pct", "half_returns", "valid", "error")}
+        compact.update(score=candidate_score, candidates_tested=len(candidates), role="development_only",
+                       llm_status=llm_state, execution_hint=execution_hint)
+        # The pool is bounded and contains no equity curves. The daily decision
+        # recomputes each candidate on the same frozen comparison inputs.
+        pool.append({"policy": deepcopy(candidate), "rationale": "동일 기준의 일일 비교를 위한 개발 후보입니다.",
+            "parent_id": parent_id, "change_family": candidate_family, "changes": deepcopy(candidate_changes),
+            "hypothesis": _hypothesis(candidate_family, attribution, execution_hint),
+            "hypothesis_test": _hypothesis_test(candidate_family, attribution, history),
+            "method": candidate_method + ("_development" if candidate_score is not None else "_bootstrap"),
+            "development": compact})
+    # Preserve the selected development record exactly; selecting a different
+    # candidate later replaces all its associated method/metrics/hypothesis too.
+    for index, item in enumerate(pool):
+        if policy_id(item["policy"]) == policy_id(result["policy"]):
+            pool[index] = deepcopy(result)
+            break
+    result["candidate_pool"] = pool
+    return result

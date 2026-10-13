@@ -346,7 +346,15 @@ class ResearchTests(unittest.TestCase):
             for key in ("cash_reserve", "max_positions", "entry_slippage_bps"):
                 if champion[key] != candidate[key]:
                     changed.add("execution" if key == "entry_slippage_bps" else "allocation")
+            for key, default, family in (("allocation_mode", "legacy", "allocation"),
+                                          ("candidate_scope", "unrestricted", "conditions")):
+                if champion.get(key, default) != candidate.get(key, default):
+                    changed.add(family)
             a, b = champion["strategies"][0], candidate["strategies"][0]
+            if (a.get("exit_mode", "fixed") != b.get("exit_mode", "fixed")
+                    or b.get("exit_mode") == "signal_extension" and
+                    a.get("max_holding_sessions", a["holding_sessions"]) != b["max_holding_sessions"]):
+                changed.add("exit")
             for key in ("conditions", "rank_by", "descending", "weight", "top_n", "holding_sessions", "stop_loss_pct", "take_profit_pct"):
                 if a[key] != b[key]:
                     changed.add("conditions" if key == "conditions" else "ranking" if key in {"rank_by", "descending"}
@@ -357,6 +365,76 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(result["changes"], [{"path": "strategies[0].conditions",
                          "before": champion["strategies"][0]["conditions"],
                          "after": result["policy"]["strategies"][0]["conditions"]}])
+
+    def test_bounded_pool_includes_independent_allocation_scope_and_extension_choices(self):
+        with patch("backend.learning_research.portfolio_metrics", return_value=metrics()):
+            result = propose_candidate(rule(), frames(3), LIMITS, [])
+        pool = result["candidate_pool"]
+        self.assertLessEqual(len(pool), MAX_CANDIDATES)
+        self.assertEqual({item["policy"].get("allocation_mode") for item in pool}
+                         & {"equal_eligible", "score_rank"}, {"equal_eligible", "score_rank"})
+        self.assertEqual({item["policy"].get("candidate_scope") for item in pool}
+                         & {"liquid_top20", "liquid_all"}, {"liquid_top20", "liquid_all"})
+        extension = [item for item in pool if item["policy"]["strategies"][0].get("exit_mode") == "signal_extension"]
+        self.assertTrue(extension)
+        self.assertTrue(all(item["change_family"] == "exit" for item in extension))
+        self.assertEqual(len({policy_id(item["policy"]) for item in pool}), len(pool))
+        self.assertTrue(all("candidate_pool" not in item for item in pool))
+        selected = next(item for item in pool if policy_id(item["policy"]) == policy_id(result["policy"]))
+        self.assertEqual(selected["development"], result["development"])
+
+    def test_explicit_default_options_do_not_fake_new_behavior_or_change_family(self):
+        from backend.learning_research import _behavior_id, _policy_changes
+        original = rule()
+        explicit = deepcopy(original)
+        explicit.update(allocation_mode="legacy", candidate_scope="unrestricted")
+        for strategy in explicit["strategies"]:
+            strategy.update(exit_mode="fixed", max_holding_sessions=strategy["holding_sessions"])
+        self.assertEqual(_behavior_id(original), _behavior_id(explicit))
+        self.assertEqual(_policy_changes(original, explicit), (None, []))
+        changed = deepcopy(explicit)
+        changed.update(allocation_mode="equal_eligible", candidate_scope="liquid_all")
+        self.assertIsNone(_policy_changes(original, changed)[0])
+
+    def test_forward_feedback_is_safe_model_aggregation_and_does_not_change_development_reward(self):
+        from backend.learning_research import _feedback, _public_feedback, _score, _metrics
+        source = {'policy': rule(), 'development': metrics(12, 11, 1), 'decision': 'apply',
+                  'daily_evaluation': {'decision': 'apply', 'metrics': {'intervals': 2}}}
+        original = deepcopy(source)
+        source['forward_comparison'] = {
+            'status': 'ready', 'basis': 'post_activation_paired_model', 'intervals': 3,
+            'start_day': '2026-10-12', 'end_day': '2026-10-15', 'effective_day': '2026-10-13',
+            'delta_net_return_pp': -.4, 'delta_stress_return_pp': -.5,
+            'unchanged': {'net_return_pct': 1.1, 'stress_return_pct': 1., 'closed_trades': 2,
+                          'costs': {'fees_paid': 100, 'taxes_paid': 200, 'secret': 'private-cost'}},
+            'candidate': {'net_return_pct': .7, 'stress_return_pct': .5, 'closed_trades': 1,
+                          'costs': {'fees_paid': 120, 'taxes_paid': 250}, 'symbol': 'private-symbol'},
+            'initial_state': {'cash': 'private-cash'}, 'comparison_seed': {'secret': 'private-seed'},
+            'ledger': ['private-ledger'], 'input_hash': 'private-hash', 'error': 'private-error'}
+        public = _public_feedback([source])[0]
+        forward = public['forward_comparison']
+        self.assertEqual(forward['status'], 'ready')
+        self.assertEqual(forward['intervals'], 3)
+        self.assertEqual(forward['delta_net_return_pp'], -.4)
+        self.assertEqual(forward['candidate']['costs'], {'fees_paid': 120, 'taxes_paid': 250})
+        self.assertNotIn('private', json.dumps(public))
+        self.assertEqual(_feedback([source]), _feedback([original]))
+        self.assertEqual(_score(_metrics(source)), _score(_metrics(original)))
+        self.assertEqual(public['development']['net_return_pct'], 12)
+
+    def test_forward_feedback_drops_nonfinite_values_and_non_date_text(self):
+        from backend.learning_research import _public_feedback
+        source = {'forward_comparison': {'status': 'ready', 'intervals': True,
+            'start_day': 'private-date', 'end_day': '20261015', 'delta_net_return_pp': float('nan'),
+            'delta_stress_return_pp': 'private-value',
+            'candidate': {'net_return_pct': float('inf'), 'costs': {'fees_paid': float('nan')}}}}
+        forward = _public_feedback([source])[0]['forward_comparison']
+        self.assertNotIn('intervals', forward)
+        self.assertNotIn('start_day', forward)
+        self.assertNotIn('end_day', forward)
+        self.assertIsNone(forward['delta_net_return_pp'])
+        self.assertIsNone(forward['candidate']['net_return_pct'])
+        self.assertNotIn('private', json.dumps(forward, allow_nan=False))
 
     def test_attributed_failure_changes_allowed_mutations_and_selected_family(self):
         champion = rule()

@@ -325,6 +325,27 @@ describe('experiment lab', () => {
 });
 
 describe('daily learning display', () => {
+  it('shows the active adoption comparison separately from development and validates returns', () => {
+    const comparison = { decision_id: 'decision-1', effective_day: '2026-10-12', status: 'ready' as const,
+      basis: 'post_activation_paired_model' as const, start_day: '2026-10-09', end_day: '2026-10-13', intervals: 2,
+      unchanged: { net_return_pct: 1, stress_return_pct: .8 }, candidate: { net_return_pct: 1.2, stress_return_pct: .9 },
+      delta_net_return_pp: .2, delta_stress_return_pp: .1, worst_delta_net_return_pp: -.1, best_delta_net_return_pp: .2 };
+    const data = experiments({ learning: learning({ daily: dailyLearning({ forward_comparisons: [comparison] }) }) });
+    expect(readExperiments(data)).toBe(data);
+    const { rerender } = render(<ExperimentLabPanel {...props} data={data}/>);
+    const section = screen.getByText('적용 후 비교 모형').closest('.lab-daily-decision')!;
+    expect(section.textContent).toContain('2026-10-09 ~ 2026-10-13 · 2구간');
+    expect(section.textContent).toContain('기존 유지+1.00%적용 정책+1.20%수익률 차이+0.20%p');
+    expect(section.textContent).toContain('집행 시나리오 차이 -0.10%p ~ +0.20%p');
+    const waiting = experiments({ learning: learning({ daily: dailyLearning({ forward_comparisons: [
+      { decision_id: 'decision-1', effective_day: '2026-10-12', status: 'unavailable' }] }) }) });
+    rerender(<ExperimentLabPanel {...props} data={waiting}/>);
+    expect(screen.getByText('비교 자료 확인 필요')).toBeTruthy();
+    expect(screen.queryByText('+0.20%p')).toBeNull();
+    comparison.delta_net_return_pp = NaN;
+    expect(() => readExperiments(data)).toThrow('일일 개선 응답 형식 확인 필요');
+  });
+
   it('waits for completed signals before showing next-session application as prepared', () => {
     const daily = dailyLearning({ active: null, pending: { ...dailyLearning().pending!, prepared_at: null } });
     const { rerender } = render(<ExperimentLabPanel {...props} data={experiments({ learning: learning({ daily }) })}/>);

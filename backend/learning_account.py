@@ -37,10 +37,19 @@ def owned_book(policy, positions, metrics, orders, prices, *, as_of, session_day
                 {'holding_sessions': 5, 'stop_loss_pct': 0, 'take_profit_pct': 0})})
     reserve = sum((number(order['limit_price']) * order.get('remaining_quantity', order['quantity']) * (1 + FEE)
         for order in orders if order['side'] == 'buy' and order['status'] in ACTIVE), Decimal(0))
+    reserved_entries = {}
+    for order in orders:
+        if order['side'] == 'buy' and order['status'] in ACTIVE:
+            cost = number(order['limit_price']) * order.get('remaining_quantity', order['quantity']) * (1 + FEE)
+            if cost > 0:
+                key = (order['symbol'], order['strategy_id'])
+                reserved_entries[key] = reserved_entries.get(key, Decimal(0)) + cost
     value = sum((number(row['last_close']) * row['quantity'] for row in lots), Decimal(0))
     # Compare marked NAV consistently net of estimated liquidation charges.
     equity = cash + value * (1 - FEE - TAX)
     return {'as_of': as_of, 'cash': str(cash), 'reserved_cash': str(reserve), 'positions': lots,
+            'reserved_entries': [{'symbol': symbol, 'strategy_id': strategy, 'cost': str(cost)}
+                                 for (symbol, strategy), cost in sorted(reserved_entries.items())],
             'pending_entries': [], 'equity': str(equity), 'budget': str(budget),
             'unresolved_orders': sum(order['status'] in {'submitting', 'unknown', 'cancel_pending'} for order in orders),
             'pending_orders': sum(order['status'] in ACTIVE for order in orders)}
