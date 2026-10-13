@@ -1,5 +1,6 @@
 """Local experiment runner: analysis, paper execution and durable reconciliation."""
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from datetime import date, datetime, time as daytime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -79,7 +80,8 @@ class ExperimentObserver:
 class ExperimentService:
     def __init__(self, config_path=ROOT / "config.local.toml", *, directory=None,
                  candidate_service=None, now=None, broker_factory=None,
-                 input_reader=None, analyzer=None, llm_factory=None, master_reader=None):
+                 input_reader=None, analyzer=None, llm_factory=None, master_reader=None,
+                 competition_reader=None):
         self.config_path = Path(config_path)
         self.directory = Path(directory or self.config_path.parent / ".local" / "experiments")
         self.store = ExperimentStore(self.directory / "experiments.sqlite3")
@@ -88,6 +90,7 @@ class ExperimentService:
         self.broker_factory = broker_factory
         self.input_reader = input_reader or self._read_input
         self.analyzer, self.llm_factory = analyzer, llm_factory
+        self.competition_reader = competition_reader
         self.master_reader = master_reader or EligibilityService().master_snapshot
         self.lock = threading.RLock()
         self._pause_requests_lock = threading.Lock()
@@ -393,11 +396,35 @@ class ExperimentService:
         if daily is not None and daily.enabled:
             research_state = {**research_state, "fingerprint": self._policy().get("fingerprint"),
                               "engine_version": daily.engine_version}
+        competition = self._competition_research_context()
         context = proposal_context(champion, frames, limits, history,
-                                   research_state, llm, self._timestamp())
-        return propose_candidate(champion, frames, limits, history, llm=llm,
+                                   research_state, llm, self._timestamp(), competition_context=competition)
+        return propose_candidate(champion, frames, limits, history, llm=llm, competition_context=competition,
             on_llm_proposal=lambda policy: save_llm_proposal(
                 self.store, policy, context=context, captured_at=self._timestamp()))
+
+    def _competition_research_context(self):
+        """Whole-account eligibility evidence is separate from simulated returns."""
+        policy = self._policy()
+        if policy.get('account_id') != 'competition':
+            return None
+        reader = getattr(self, 'competition_reader', None)
+        if reader is None:
+            return {'status': 'unavailable'}
+        try:
+            self._profile(policy)
+            result = reader()
+            current = self._policy()
+            if (current.get('account_id') != 'competition'
+                    or current.get('fingerprint') != policy.get('fingerprint')):
+                return {'status': 'unavailable'}
+            self._profile(current)
+            if not isinstance(result, dict) or result.get('account', {}).get('id') != 'competition':
+                return {'status': 'unavailable'}
+            return deepcopy(result)
+        except Exception:
+            # A missing contest sync must neither invent zero fills nor stop research.
+            return {'status': 'unavailable'}
 
     def _policy(self):
         return self.store.setting("policy", {key: None for key in POLICY_KEYS})

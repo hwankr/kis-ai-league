@@ -536,7 +536,11 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             coverage["outside"] += 1
             coverage["reasons"].update(reasons)
     paid_fee, paid_tax = Decimal(0), Decimal(0)
+    gross_buy, gross_sell = Decimal(0), Decimal(0)
+    traded_days, traded_symbols = set(), set()
+    buy_fills, sell_fills = 0, 0
     for index, frame in enumerate(frames):
+        day_buy, day_sell = Decimal(0), Decimal(0)
         rows = {row["symbol"]: row for row in frame["rows"]}
         bars = {}
         protection_observed_at = None
@@ -661,6 +665,11 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                 quantity = fill_quantity(position["quantity"], "sell", position) if price is not None else 0
                 if quantity:
                     proceeds = quantity * price
+                    gross_sell += proceeds
+                    day_sell += proceeds
+                    sell_fills += 1
+                    traded_days.add(frame["as_of"])
+                    traded_symbols.add(symbol)
                     cash += proceeds * (1 - fee - tax)
                     paid_fee += proceeds * fee
                     paid_tax += proceeds * tax
@@ -736,6 +745,11 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             if not quantity:
                 continue
             cost = quantity * unit_cost
+            gross_buy += quantity * price
+            day_buy += quantity * price
+            buy_fills += 1
+            traded_days.add(frame["as_of"])
+            traded_symbols.add(symbol)
             cash -= cost
             spent += cost
             strategy_spent[strategy] += cost
@@ -754,6 +768,7 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                                       for position in positions.values()), Decimal(0)))
         curve.append({"as_of": frame["as_of"], "equity": float(equity), "cash": float(cash), "buy_cost": float(spent),
                       "position_value": float(position_value), "reserved_cash": float(reserved),
+                      "gross_buy_amount": float(day_buy), "gross_sell_amount": float(day_sell),
                       **({"protection_active": protection["active"]} if protection is not None else {})})
         pending = signals(policy, frame)
         if not index and saved and saved.get("policy_id") == identity and "pending_entries" in saved:
@@ -777,7 +792,16 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                        entry_remainder="cancelled_after_observation", exit_remainder="retry_next_observation")
     coverage.update(supported=coverage["outside"] == 0 if support is not None else None,
                     reasons=sorted(coverage["reasons"]))
+    activity = {"basis": "modelled_fills", "gross_buy_amount": float(gross_buy),
+                "gross_sell_amount": float(gross_sell), "gross_amount": float(gross_buy + gross_sell),
+                "trading_days": len(traded_days), "symbols": len(traded_symbols),
+                "buy_fill_events": buy_fills, "sell_fill_events": sell_fills,
+                "intervals": len(frames) - 1,
+                "mean_daily_gross_amount": float((gross_buy + gross_sell) / (len(frames) - 1)),
+                "average_exposure_pct": sum(point["position_value"] / point["equity"] * 100
+                                            for point in curve[1:]) / (len(frames) - 1)}
     return {"return": float((equities[-1] / start - 1) * 100), "drawdown": float(-drawdown),
+            "trading_activity": activity,
             "closed": closed, "half_returns": [float((midpoint / start - 1) * 100),
                                                 float((equities[-1] / midpoint - 1) * 100)],
             "equity_curve": curve, "daily_log_returns": [math.log(float(after / before)) for before, after in zip(equities, equities[1:])],
@@ -820,7 +844,8 @@ def _portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_
               "intervals": max(0, len(frames) - 1) if isinstance(frames, list) else 0,
               "equity_curve": [], "stress_equity_curve": [], "daily_log_returns": [], "stress_daily_log_returns": [],
               "final_state": None, "stress_final_state": None, "execution_stress_return_pct": None,
-              "execution_stress_drawdown_pct": None, "diagnostics": {}, "support": {"supported": False}}
+              "execution_stress_drawdown_pct": None, "diagnostics": {}, "support": {"supported": False},
+              "trading_activity": None, "stress_trading_activity": None}
     try:
         policy = validate_policy(policy)
         if not isinstance(frames, list) or len(frames) < 2:
@@ -857,6 +882,7 @@ def _portfolio_metrics(policy, frames, limits, *, initial_state=None, execution_
         result.update(valid=True, net_return_pct=normal["return"], stress_return_pct=stress["return"],
                       max_drawdown_pct=normal["drawdown"], stress_drawdown_pct=stress["drawdown"],
                       closed_trades=normal["closed"], half_returns=normal["half_returns"],
+                      trading_activity=normal["trading_activity"], stress_trading_activity=stress["trading_activity"],
                       equity_curve=normal["equity_curve"], stress_equity_curve=stress["equity_curve"],
                       daily_log_returns=normal["daily_log_returns"], stress_daily_log_returns=stress["daily_log_returns"],
                       final_state=normal["final_state"], stress_final_state=stress["final_state"],

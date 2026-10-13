@@ -368,6 +368,7 @@ class DashboardServer(ThreadingHTTPServer):
                                   else CandidateService(observer=observer))
         if self.experiment_service is not None:
             self.experiment_service.candidate_service = self.candidate_service
+            self.experiment_service.competition_reader = self.kis_competition_snapshot
         self.frontend_path = frontend_path.resolve()
         if self.automatic_research and self.experiment_service is not None:
             from backend.autonomy import AutonomousMonitor
@@ -427,10 +428,13 @@ class DashboardServer(ThreadingHTTPServer):
         from backend.timefolio_account import account_snapshot
         return account_snapshot(ROOT)
 
-    def competition_snapshot(self):
+    def kis_competition_snapshot(self):
         from backend.competition_progress import KisCompetitionProgress
         store = getattr(self.experiment_service, "store", None)
-        kis = KisCompetitionProgress(self.service, store.orders if store is not None else None).snapshot()
+        return KisCompetitionProgress(self.service, store.orders if store is not None else None).snapshot()
+
+    def competition_snapshot(self):
+        kis = self.kis_competition_snapshot()
         timefolio = self.timefolio_snapshot()
         return {"kis": kis, "timefolio": {key: timefolio.get(key) for key in (
             "status", "stale", "error", "updated_at", "turnover")}}

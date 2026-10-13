@@ -20,12 +20,22 @@
 .competition-updated { margin-top: 14px; }
 .competition-error { margin: 10px 0 0; color: #8b5e14; font-size: 11px; overflow-wrap: anywhere; }
 .competition-timefolio { padding-left: 28px; border-left: 1px solid #edf0f3; }
+.competition-pace { margin-top: 22px; padding-top: 16px; border-top: 1px solid #edf0f3; }
+.competition-pace-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; color: var(--secondary); font-size: 11px; }
+.competition-pace-shortfall { color: #8b5e14; }
+.competition-pace dl { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; margin: 14px 0 0; }
+.competition-pace dt { color: var(--muted); font-size: 10px; }
+.competition-pace dd { margin: 6px 0 0; font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+@media (min-width: 1001px) and (max-width: 1200px) {
+  .competition-pace dl { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 @media (max-width: 1000px) {
   .competition-groups { grid-template-columns: 1fr; gap: 22px; }
   .competition-timefolio { padding: 20px 0 0; border-left: 0; border-top: 1px solid #edf0f3; }
   .competition-timefolio .competition-metric { max-width: 360px; }
 }
 @media (max-width: 560px) {
+  .competition-pace dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .competition-kis-metrics { grid-template-columns: 1fr 1.65fr; gap: 24px 20px; }
   .competition-value strong { font-size: 21px; }
 }

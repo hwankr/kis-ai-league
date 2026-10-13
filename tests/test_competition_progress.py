@@ -153,6 +153,56 @@ class ServiceTests(unittest.TestCase):
         self.service.snapshot()
         self.accounts.trades.assert_called_once_with("competition", "2026-10-12", "2026-10-19")
 
+    def test_fresh_sync_uses_post_query_clock_when_request_crosses_daily_cutoff(self):
+        current = [datetime.fromisoformat("2026-10-13T15:59:59+09:00")]
+        self.service.now = lambda: current[0]
+        def query(account, start, end):
+            current[0] = datetime.fromisoformat("2026-10-13T16:00:02+09:00")
+            return source([trade()], start_date=start, end_date=end, updated_at=current[0].isoformat())
+        self.accounts.trades.side_effect = query
+        result = self.service.snapshot()
+        self.assertEqual(result["pace"]["status"], "behind")
+        self.assertEqual(result["pace"]["completed_sessions"], 2)
+        self.assertEqual(result["pace"]["as_of"], current[0].isoformat())
+        self.assertEqual(self.accounts.trades.call_count, 1)
+
+    def test_midnight_during_query_retries_with_new_contest_period(self):
+        current = [datetime.fromisoformat("2026-10-13T23:59:59+09:00")]
+        self.service.now = lambda: current[0]
+        def query(account, start, end):
+            current[0] = datetime.fromisoformat("2026-10-14T00:00:02+09:00")
+            return source([trade()], start_date=start, end_date=end, updated_at=current[0].isoformat())
+        self.accounts.trades.side_effect = query
+        result = self.service.snapshot()
+        self.assertEqual([call.args[2] for call in self.accounts.trades.call_args_list],
+                         ["2026-10-13", "2026-10-14"])
+        self.assertEqual(result["period"]["as_of"], "2026-10-14")
+        self.assertEqual(result["pace"]["status"], "behind")
+        self.assertEqual(result["pace"]["completed_sessions"], 2)
+
+    def test_contest_start_during_read_retries_instead_of_reporting_prestart_zero(self):
+        self.service.now = Mock(side_effect=[datetime.fromisoformat(value) for value in
+            ("2026-10-11T23:59:59+09:00", "2026-10-12T00:00:01+09:00", "2026-10-12T00:00:02+09:00")])
+        self.accounts.trades.side_effect = lambda account, start, end: source(
+            [trade()], start_date=start, end_date=end, updated_at="2026-10-12T00:00:01+09:00")
+        result = self.service.snapshot()
+        self.accounts.trades.assert_called_once_with("competition", "2026-10-12", "2026-10-12")
+        self.assertEqual(result["phase"], "active")
+        self.assertEqual(result["metrics"]["gross_amount"]["value"], "200")
+
+    def test_contest_end_during_query_retries_phase_with_same_clamped_period(self):
+        current = [datetime.fromisoformat("2026-11-20T23:59:59+09:00")]
+        self.service.now = lambda: current[0]
+        def query(account, start, end):
+            current[0] = datetime.fromisoformat("2026-11-21T00:00:02+09:00")
+            return source([trade()], start_date=start, end_date=end, updated_at=current[0].isoformat())
+        self.accounts.trades.side_effect = query
+        result = self.service.snapshot()
+        self.assertEqual(self.accounts.trades.call_count, 2)
+        self.assertTrue(all(call.args[2] == "2026-11-20" for call in self.accounts.trades.call_args_list))
+        self.assertEqual(result["phase"], "ended")
+        self.assertEqual(result["pace"]["status"], "ended_shortfall")
+
     def test_start_boundary_uses_kst_and_avoids_invalid_prestart_broker_query(self):
         self.service.now = lambda: datetime.fromisoformat("2026-10-11T14:59:59+00:00")
         result = self.service.snapshot()

@@ -59,6 +59,16 @@ exit_mode (fixed/signal_extension) and max_holding_sessions belong to exit.
 Preserve absent-option behavior with legacy/unrestricted/fixed defaults; for
 fixed exits set max_holding_sessions equal to holding_sessions. Signal extension
 may extend a profitable still-qualified holding only up to the explicit maximum.
+competition_context contains whole-account contest progress, separately from
+modelled trading_activity. A weekday calendar is an estimate, not an exchange
+calendar. When reliable progress is behind, compare allocation and diversification
+within the same signal quality, costs, account limits and risk protection. Gross
+amount means executed buy plus sell notionals, excluding fees and unexecuted
+liquidation marks. Do not shorten holding periods solely to create turnover,
+relax signal quality, repeat meaningless trades or treat turnover as profit.
+Trading activity is a feasibility diagnostic, never an optimization reward or
+evidence that future contest requirements will be met. Missing or stale progress
+is unknown, never zero. The normal and stressed net-return adoption gates remain.
 """
 
 
@@ -101,6 +111,72 @@ def _number(value):
         return result if math.isfinite(result) else None
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def public_competition_context(value):
+    """Freeze only aggregate contest facts; account identities never leave here."""
+    from datetime import date
+    if value is None:
+        return None
+    value = value if isinstance(value, dict) else {}
+    result = {"basis": "whole_account_broker_fills", "reliable": False,
+              "status": value.get("status") if value.get("status") in {"ok", "error", "unavailable"} else "unavailable"}
+    period = value.get("period") if isinstance(value.get("period"), dict) else {}
+    result["period"] = {}
+    for key in ("start_date", "end_date", "as_of"):
+        raw = period.get(key)
+        try:
+            if isinstance(raw, str) and date.fromisoformat(raw).isoformat() == raw:
+                result["period"][key] = raw
+        except ValueError:
+            pass
+    result["reliable"] = (result["status"] == "ok" and value.get("stale") is False
+                          and value.get("coverage") == "complete" and len(result["period"]) == 3)
+    pace = value.get("pace") if isinstance(value.get("pace"), dict) else {}
+    result["pace"] = {"calendar_basis": "weekday_estimate", "status": pace.get("status") if pace.get("status") in
+                      {"not_started", "unavailable", "met", "behind", "on_track", "ended_shortfall"} else "unavailable"}
+    for key in ("total_sessions", "completed_sessions", "remaining_sessions", "next_5_sessions", "recent_5_sessions"):
+        if type(pace.get(key)) is int and pace[key] >= 0:
+            result["pace"][key] = pace[key]
+    for key in ("target_gross_amount", "gross_amount", "remaining_gross_amount", "required_daily_gross_amount",
+                "expected_gross_amount", "shortfall_gross_amount", "next_5_required_gross_amount",
+                "recent_5_gross_amount", "projected_final_gross_amount"):
+        number = _number(pace.get(key))
+        result["pace"][key] = number if number is not None and number >= 0 else None
+    if result["pace"]["status"] == "unavailable":
+        result["reliable"] = False
+    if not result["reliable"]:
+        result["pace"]["status"] = "unavailable"
+        for key in list(result["pace"]):
+            if key.endswith("amount"):
+                result["pace"][key] = None
+    return result
+
+
+def _public_activity(value):
+    if not isinstance(value, dict) or value.get("basis") != "modelled_fills":
+        return None
+    result = {"basis": "modelled_fills"}
+    for key in ("gross_buy_amount", "gross_sell_amount", "gross_amount", "mean_daily_gross_amount", "average_exposure_pct"):
+        number = _number(value.get(key))
+        result[key] = number if number is not None and number >= 0 else None
+    for key in ("trading_days", "symbols", "buy_fill_events", "sell_fill_events", "intervals"):
+        result[key] = value[key] if type(value.get(key)) is int and value[key] >= 0 else None
+    return result
+
+
+def _pace_allocation_candidates(parent):
+    """Keep entry/exit conditions and cash exposure; vary only allocation."""
+    for minimum, slots in ((0, None), (8, None), (16, 20)):
+        candidate = deepcopy(parent)
+        candidate["allocation_mode"] = "equal_eligible"
+        candidate["name"] = "배분·후보 분산 비교"
+        if minimum:
+            for strategy in candidate["strategies"]:
+                strategy["top_n"] = min(20, max(minimum, strategy["top_n"] * 2))
+        if slots is not None:
+            candidate["max_positions"] = slots
+        yield candidate
 
 
 def _behavior_id(policy):
@@ -501,6 +577,10 @@ def _public_feedback(history):
                  "decision": item.get("decision") if item.get("decision") in
                  {"promote", "keep", "invalid", "retired", "waiting", "apply", "blocked", "error"} else "unknown"}
         entry["metrics"]["valid"] = metrics.get("valid") is True
+        for key in ("trading_activity", "stress_trading_activity"):
+            activity = _public_activity(metrics.get(key))
+            if activity is not None:
+                entry["metrics"][key] = activity
         halves = metrics.get("half_returns", [])
         if isinstance(halves, list) and len(halves) == 2:
             entry["metrics"]["half_returns"] = [_number(value) for value in halves]
@@ -615,7 +695,7 @@ def _public_daily_evaluation(value):
     return result
 
 
-def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_proposal=None):
+def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_proposal=None, competition_context=None):
     """Return a novel frozen rule hypothesis; inputs are never mutated."""
     champion = validate_policy(deepcopy(champion or BASELINE_POLICY))
     frames, limits, history = deepcopy(frames), deepcopy(limits), deepcopy(history or [])
@@ -628,6 +708,10 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         mode = "exploit" if attribution["stage"] == "supported" else "bootstrap"
     if attribution is not None and attribution["stage"] != "execution":
         execution_hint = False
+    competition = public_competition_context(competition_context)
+    behind = bool(competition and competition["reliable"] and competition["pace"]["status"] == "behind")
+    if behind and "allocation" not in families:
+        families = (*families, "allocation")
     parent_id = policy_id(champion)
     seen, behaviors = {policy_id(champion)}, {_behavior_id(champion)}
     for item in history:
@@ -676,6 +760,10 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
                        "history": _public_feedback(history), "feature_summary": summaries,
                        "sessions": len(frames), "cancel_after_minutes": champion.get("cancel_after_minutes", 10),
                        "evaluation_role": "development_only; separate evaluation required; not prospective evidence"}
+            if competition is not None:
+                payload["competition_context"] = deepcopy(competition)
+                payload["allocation_limits"] = {key: _number(limits.get(key)) for key in
+                                                ("budget", "order_cap", "daily_buy_limit")}
             result = llm.generate(RESEARCH_PROMPT, payload, deepcopy(POLICY_SCHEMA))
             if isinstance(result, str):
                 result = json.loads(result)
@@ -687,6 +775,13 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         # different candidate. Storage failures must remain visible to research.
         if llm_state == "valid" and on_llm_proposal is not None:
             on_llm_proposal(deepcopy(candidates[0][0]))
+    if behind:
+        # A legacy parent has no rule slots. Bootstrap from the same first
+        # grammar hypothesis before varying only its allocation, not signals.
+        base = champion if champion["kind"] == "rules" else next(
+            _grammar(champion, summaries, mode, execution_hint, families))
+        for policy in _pace_allocation_candidates(base):
+            add(policy, "grammar")
     for policy in _grammar(champion, summaries, mode, execution_hint, families):
         add(policy, "grammar")
         if len(candidates) >= MAX_CANDIDATES:
@@ -737,18 +832,22 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
             "hypothesis": _hypothesis(family, attribution, execution_hint),
             "hypothesis_test": _hypothesis_test(family, attribution, history),
             "method": method + ("_development" if evaluations else "_bootstrap"), "development": development}
+    if competition is not None:
+        result["competition_context"] = deepcopy(competition)
     by_id = {policy_id(item[1]): (item[0], item[5]) for item in evaluations}
     pool = []
     for candidate, candidate_method, candidate_family, candidate_changes in candidates:
         identity = policy_id(candidate)
         candidate_score, candidate_metrics = by_id.get(identity, (None, {}))
         compact = {key: deepcopy(candidate_metrics.get(key)) for key in
-                   (*METRICS, "stress_drawdown_pct", "half_returns", "valid", "error")}
+                   (*METRICS, "stress_drawdown_pct", "half_returns", "valid", "error",
+                    "trading_activity", "stress_trading_activity")}
         compact.update(score=candidate_score, candidates_tested=len(candidates), role="development_only",
                        llm_status=llm_state, execution_hint=execution_hint)
         # The pool is bounded and contains no equity curves. The daily decision
         # recomputes each candidate on the same frozen comparison inputs.
         pool.append({"policy": deepcopy(candidate), "rationale": "동일 기준의 일일 비교를 위한 개발 후보입니다.",
+            **({"competition_context": deepcopy(competition)} if competition is not None else {}),
             "parent_id": parent_id, "change_family": candidate_family, "changes": deepcopy(candidate_changes),
             "hypothesis": _hypothesis(candidate_family, attribution, execution_hint),
             "hypothesis_test": _hypothesis_test(candidate_family, attribution, history),

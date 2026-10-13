@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 import re
 
 from backend.competition_deadline import KIS_LAST_DAY
+from backend.competition_pacing import calculate_turnover_pacing
 from backend.history import series_for_profile
 from backend.kis import KST, load_profiles
 
@@ -123,6 +124,8 @@ def _base(now, account=None):
             "updated_at": None, "stale": False, "error": None, "coverage": "none",
             "metrics": {key: {**_metric(None, target), **({"lower_bound": True} if key == "api_orders" else {})}
                         for key, target in TARGETS.items()},
+            "pace": calculate_turnover_pacing(now=now, start_date=KIS_FIRST_DAY, end_date=KIS_LAST_DAY,
+                                               daily_amounts={}, reliable=False),
             "basis": {"trades": "whole_account_broker_fills",
                       "api_orders": "accepted_api_order_matches", "reset_adjusted": False}}
 
@@ -160,6 +163,13 @@ def calculate_kis_progress(snapshot, orders, *, fingerprint, now):
                   "api_orders": api_count}
         for key, value in values.items():
             result["metrics"][key].update(_metric(value, TARGETS[key]))
+    daily_amounts = {}
+    for key, fill in fills.items():
+        daily_amounts[key[0]] = daily_amounts.get(key[0], Decimal(0)) + fill["amount"]
+    result["pace"] = calculate_turnover_pacing(
+        now=now, start_date=KIS_FIRST_DAY, end_date=KIS_LAST_DAY, daily_amounts=daily_amounts,
+        reliable=complete and not result["stale"], gross_target=TARGETS["gross_amount"],
+        source_updated_at=result["updated_at"])
     if orders is None or known and result["metrics"]["api_orders"]["value"] is None:
         result.update(status="error", error="API 주문 기록 조회 미완료" if complete else result["error"])
     return result
@@ -196,6 +206,16 @@ class KisCompetitionProgress:
                     except Exception:
                         orders = None
                 current = self.profile_reader()
+                # Broker sync timestamps are taken after network I/O. Use the
+                # post-read clock so a fresh response is not mistaken for future
+                # data, and retry when the requested contest window rolled over.
+                observed_now = self.now()
+                latest = _base(observed_now, account)
+                period_changed = (latest["period"] != failure["period"]
+                                  or latest["phase"] != failure["phase"])
+                now, failure = observed_now, latest
+                if period_changed:
+                    continue
                 if not current.configured or series_for_profile(current) != series:
                     continue
                 return calculate_kis_progress(source, orders, fingerprint=series.fingerprint, now=now)

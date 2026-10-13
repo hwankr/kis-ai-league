@@ -4,6 +4,29 @@ import useCompetitionProgress from '../useCompetitionProgress';
 import '../competition-progress.css';
 
 const shortDate = (value: string | null | undefined) => value ? value.slice(5).replace('-', '.') : '—';
+const paceStatus = { not_started: '시작 전', unavailable: '집계 대기', met: '목표 달성', behind: '누적 계획 미달',
+  on_track: '누적 계획 충족', ended_shortfall: '종료 · 목표 미달' };
+function TurnoverPace({ kis, retained }: { kis: CompetitionProgressData['kis'] | undefined; retained: boolean }) {
+  const pace = kis?.pace;
+  const calendarCurrent = pace && !retained && !kis?.stale;
+  const current = calendarCurrent && kis?.coverage === 'complete' && pace.status !== 'unavailable';
+  const status = current ? pace.status : 'unavailable';
+  const amount = (value: unknown) => current && numeric(value) !== null ? `${number(value)}원` : '—';
+  const recentGross = numeric(pace?.recent_5_gross_amount);
+  const recentDaily = pace && pace.recent_5_sessions > 0 && recentGross !== null ? recentGross / pace.recent_5_sessions : null;
+  return <div className="competition-pace" role="group" aria-label="체결액 계획">
+    <div className="competition-pace-heading"><span>체결액 계획 · 매수+매도</span>
+      <span className={status === 'behind' || status === 'ended_shortfall' ? 'competition-pace-shortfall' : ''}>
+        {paceStatus[status]}</span></div>
+    <dl>
+      <div><dt>남은 금액</dt><dd>{amount(pace?.remaining_gross_amount)}</dd></div>
+      <div><dt>남은 평일 · 추정</dt><dd>{calendarCurrent ? `${number(pace.remaining_sessions)}일` : '—'}</dd></div>
+      <div><dt>1일 필요</dt><dd>{amount(pace?.required_daily_gross_amount)}</dd></div>
+      <div><dt>다음 {calendarCurrent ? pace.next_5_sessions : 5}평일 필요</dt><dd>{amount(pace?.next_5_required_gross_amount)}</dd></div>
+      <div><dt>최근 {calendarCurrent ? pace.recent_5_sessions : 5}평일 일평균</dt><dd>{amount(recentDaily)}</dd></div>
+    </dl>
+  </div>;
+}
 function Meter({ label, metric, unit, status, hint }: {
   label: string; metric?: ProgressMetric; unit: string; status?: string; hint?: string;
 }) {
@@ -43,6 +66,7 @@ export function CompetitionProgressView({ data, loading, error, onRefresh }: {
           <Meter label="거래 종목" unit="종목" metric={kis?.metrics.symbols ?? { value: null, target: 5, met: null, progress_pct: null }}/>
           <Meter label="API 체결" unit="회" metric={kis?.metrics.api_orders ?? { value: null, target: 5, met: null, progress_pct: null }} hint="확인된 주문 기준"/>
         </div>
+        <TurnoverPace kis={kis} retained={!!error}/>
         {kisError ? <p className="competition-error" role="status">{kisError}</p> : null}
         {kis?.updated_at ? <time className="competition-updated" dateTime={kis.updated_at}>{timestamp(kis.updated_at).text}</time> : null}
       </div>

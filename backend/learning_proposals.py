@@ -7,7 +7,9 @@ from backend.experiment_store import encode
 from backend.learning_policy import policy_id, validate_policy
 
 
-def proposal_context(champion, frames, limits, history, state, provider, requested_at):
+def proposal_context(champion, frames, limits, history, state, provider, requested_at, *, competition_context=None):
+    from backend.learning_research import public_competition_context
+    competition = public_competition_context(competition_context)
     try:
         public = provider.public_config() if provider is not None else {}
     except Exception:
@@ -17,6 +19,9 @@ def proposal_context(champion, frames, limits, history, state, provider, request
     # These are provider metadata, never endpoints, credentials or raw responses.
     metadata = {key: public[key] for key in ('provider', 'model', 'reasoning_effort')
                 if isinstance(public.get(key), str) and len(public[key]) <= 100}
+    inputs = {'champion': champion, 'frames': frames, 'limits': limits, 'history': history}
+    if competition is not None:
+        inputs['competition_context'] = competition
     return {
         'as_of': frames[-1]['as_of'] if frames else None,
         'requested_at': requested_at,
@@ -26,9 +31,8 @@ def proposal_context(champion, frames, limits, history, state, provider, request
         'limits': deepcopy(limits),
         'development_sessions': len(frames),
         'provider': metadata,
-        'research_input_hash': hashlib.sha256(encode({
-            'champion': champion, 'frames': frames, 'limits': limits, 'history': history,
-        }).encode('utf-8')).hexdigest(),
+        **({'competition_context': deepcopy(competition)} if competition is not None else {}),
+        'research_input_hash': hashlib.sha256(encode(inputs).encode('utf-8')).hexdigest(),
         'research_version': hashlib.sha256(Path(__file__).with_name('learning_research.py').read_bytes()).hexdigest(),
     }
 

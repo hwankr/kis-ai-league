@@ -2,12 +2,22 @@ import { numeric } from './format';
 import type { Numeric } from './types';
 
 export interface ProgressMetric { value: Numeric; target: Numeric; met: boolean | null; progress_pct: Numeric; lower_bound?: boolean }
+export interface CompetitionPace {
+  calendar_basis: 'weekday_estimate'; cutoff: '16:00_KST';
+  status: 'not_started' | 'unavailable' | 'met' | 'behind' | 'on_track' | 'ended_shortfall';
+  total_sessions: number; completed_sessions: number; remaining_sessions: number;
+  target_gross_amount: Numeric; gross_amount: Numeric; remaining_gross_amount: Numeric;
+  expected_gross_amount: Numeric; shortfall_gross_amount: Numeric; required_daily_gross_amount: Numeric;
+  next_5_sessions: number; next_5_required_gross_amount: Numeric;
+  recent_5_sessions: number; recent_5_gross_amount: Numeric; projected_final_gross_amount: Numeric;
+}
 export interface CompetitionProgressData {
   kis: {
     status: string; phase: 'not_started' | 'active' | 'ended'; stale: boolean; error: string | null; updated_at: string | null;
     period: { start_date: string; end_date: string; as_of: string };
     coverage: 'complete' | 'partial' | 'none';
     metrics: Record<'trading_days' | 'gross_amount' | 'symbols' | 'api_orders', ProgressMetric>;
+    pace?: CompetitionPace;
   };
   timefolio: {
     status: string; stale: boolean; error: string | null; updated_at: string | null;
@@ -40,6 +50,24 @@ export function readCompetitionProgress(value: unknown): CompetitionProgressData
       || !optionalNumber(metric.progress_pct) || !(metric.met === null || typeof metric.met === 'boolean')
       || metric.value === null && (metric.met !== null || metric.progress_pct !== null)
       || metric.lower_bound !== undefined && typeof metric.lower_bound !== 'boolean') throw error();
+  }
+  if (kis.pace !== undefined) {
+    const p = kis.pace;
+    if (!object(p) || p.calendar_basis !== 'weekday_estimate' || p.cutoff !== '16:00_KST'
+      || !['not_started', 'unavailable', 'met', 'behind', 'on_track', 'ended_shortfall'].includes(String(p.status))
+      || !nonnegative(p.target_gross_amount) || numeric(p.target_gross_amount) === 0) throw error();
+    for (const key of ['total_sessions', 'completed_sessions', 'remaining_sessions', 'next_5_sessions', 'recent_5_sessions']) {
+      if (p[key] === null || !optionalInteger(p[key])) throw error();
+    }
+    const total = p.total_sessions as number, completed = p.completed_sessions as number, remaining = p.remaining_sessions as number;
+    if (total === 0 || completed + remaining !== total || (p.next_5_sessions as number) > Math.min(5, remaining)
+      || (p.recent_5_sessions as number) > Math.min(5, completed)) throw error();
+    for (const key of ['gross_amount', 'remaining_gross_amount', 'expected_gross_amount', 'shortfall_gross_amount',
+      'required_daily_gross_amount', 'next_5_required_gross_amount', 'recent_5_gross_amount', 'projected_final_gross_amount']) {
+      if (!optionalNumber(p[key]) || p.status === 'unavailable' && p[key] !== null) throw error();
+    }
+    if (p.status !== 'unavailable' && [p.gross_amount, p.remaining_gross_amount, p.expected_gross_amount,
+      p.shortfall_gross_amount, p.recent_5_gross_amount].some(value => value === null)) throw error();
   }
   if (timefolio.turnover !== null) {
     const t = timefolio.turnover;
