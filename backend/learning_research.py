@@ -1,7 +1,7 @@
 """Bounded policy discovery from frozen observations; never promotes or executes.
 
-Development scores select a hypothesis for a separate prospective trial. They
-are neither untouched test results nor evidence of profitable online learning.
+Development scores select hypotheses. Daily provisional reviews and prospective
+trials remain separate stages, not evidence of profitable online learning.
 """
 from copy import deepcopy
 import hashlib
@@ -43,7 +43,13 @@ Actual execution aggregates are a separate diagnostic, not simulated returns.
 Only cohorts of at least five terminal orders may support an execution hint.
 Unknown or unresolved orders are not successes or failures. Such a hint may
 suggest liquidity, top_n or entry-gap changes, never cancellation-time changes.
-The proposal is unvalidated; development performance will not authorize adoption.
+History separates development scores, daily_evaluation and actual activation.
+feedback_mode uses development or completed-trial scoring, never a short daily
+comparison alone. A daily apply is provisional: activation can still be pending,
+prepared or unknown when activation evidence is missing. Only activated records
+confirm a policy change; none proves forward improvement. Keep, blocked and
+error are distinct and not_activated.
+The proposal itself grants no adoption or order permission.
 """
 
 
@@ -444,11 +450,22 @@ def _public_feedback(history):
         metrics = _metrics(item)
         entry = {"metrics": {key: _number(metrics.get(key)) for key in METRICS},
                  "decision": item.get("decision") if item.get("decision") in
-                 {"promote", "keep", "invalid", "retired", "waiting"} else "unknown"}
+                 {"promote", "keep", "invalid", "retired", "waiting", "apply", "blocked", "error"} else "unknown"}
         entry["metrics"]["valid"] = metrics.get("valid") is True
         halves = metrics.get("half_returns", [])
         if isinstance(halves, list) and len(halves) == 2:
             entry["metrics"]["half_returns"] = [_number(value) for value in halves]
+        if isinstance(item.get("daily_evaluation"), dict):
+            # Preserve the development score used by feedback_mode, but never
+            # label it as the final daily comparison or a prospective result.
+            entry["development"] = {**entry.pop("metrics"), "basis": "development_only"}
+            entry["daily_evaluation"] = _public_daily_evaluation(item["daily_evaluation"])
+            activation = item.get("activation") if isinstance(item.get("activation"), dict) else {}
+            entry["activation"] = {"status": activation.get("status") if activation.get("status") in
+                {"pending", "prepared", "activated", "not_activated", "unknown"} else "unknown"}
+            for key in ("prepared_at", "adopted_at", "effective_day"):
+                if isinstance(activation.get(key), str):
+                    entry["activation"][key] = activation[key][:40]
         try:
             entry["policy"] = _public_policy(validate_policy(item["policy"]))
         except (KeyError, ValueError, TypeError):
@@ -461,6 +478,41 @@ def _public_feedback(history):
         if item.get("change_family") in {*FAMILIES, "bootstrap"}:
             entry["change_family"] = item["change_family"]
         result.append(entry)
+    return result
+
+
+def _public_daily_evaluation(value):
+    """Only comparison facts leave the store; no account or raw input metadata."""
+    result = {"basis": "development_only", "decision": value.get("decision") if value.get("decision") in
+              {"apply", "keep", "blocked", "error"} else "unknown"}
+    for key, length in (("as_of", 10), ("reason", 300)):
+        if isinstance(value.get(key), str):
+            result[key] = value[key][:length]
+    metrics = value.get("metrics")
+    if not isinstance(metrics, dict):
+        result["metrics"] = None
+        return result
+    summary = {}
+    for key in ("intervals", "recent_intervals", "excluded_frames", "observed_baseline_frames"):
+        if type(metrics.get(key)) is int and metrics[key] >= 0:
+            summary[key] = metrics[key]
+    for key in ("start_day", "end_day"):
+        if isinstance(metrics.get(key), str):
+            summary[key] = metrics[key][:10]
+    if metrics.get("source_basis") == "observed_legacy_suffix":
+        summary["source_basis"] = metrics["source_basis"]
+    if type(metrics.get("loss_reduction_only")) is bool:
+        summary["loss_reduction_only"] = metrics["loss_reduction_only"]
+    for key in ("champion", "candidate", "delta"):
+        if isinstance(metrics.get(key), dict):
+            summary[key] = {name: _number(metrics[key].get(name)) for name in
+                ("net_return_pct", "stress_return_pct", "max_drawdown_pct", "stress_drawdown_pct",
+                 "recent_stress_return_pct")}
+    if isinstance(metrics.get("checks"), dict):
+        summary["checks"] = {key: metrics["checks"][key] for key in
+            ("normal_improvement", "stress_improvement", "drawdown_not_worse", "recent_improvement")
+            if type(metrics["checks"].get(key)) is bool}
+    result["metrics"] = summary
     return result
 
 
@@ -524,7 +576,7 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
                        "allowed_change_families": list(families) if champion["kind"] == "rules" else ["bootstrap"],
                        "history": _public_feedback(history), "feature_summary": summaries,
                        "sessions": len(frames), "cancel_after_minutes": champion.get("cancel_after_minutes", 10),
-                       "evaluation_role": "development_only; separate future trial required"}
+                       "evaluation_role": "development_only; separate evaluation required; not prospective evidence"}
             result = llm.generate(RESEARCH_PROMPT, payload, deepcopy(POLICY_SCHEMA))
             if isinstance(result, str):
                 result = json.loads(result)

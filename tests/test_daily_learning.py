@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from backend.experiment_store import ExperimentStore
 from backend.learning import LearningService
@@ -57,6 +58,94 @@ class DailyLearningTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertNotEqual(self.learner.daily.pending()['decision_id'], first)
         self.assertEqual(len(self.learner.daily.history()), 2)
+
+    def test_daily_outcomes_reach_next_research_without_replacing_development_feedback(self):
+        from backend.learning_research import _feedback, _public_feedback
+        from tests.test_learning_research import metrics
+        original = self.learner.proposer
+        def propose(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result['development'] = {**metrics(12, 11, 1), 'sessions': 120}
+            return result
+        self.learner.proposer = propose
+        for index, decision in enumerate(('keep', 'blocked', 'error', 'apply')):
+            with self.subTest(decision=decision):
+                self.data = raw_input(index)
+                self.now = datetime.fromisoformat(self.data['observed_at'])
+                self.context['initial_state']['as_of'] = self.data['as_of']
+                final = {'basis': 'development_only', 'intervals': 1,
+                         'champion': {'net_return_pct': -2., 'stress_return_pct': -2.1},
+                         'candidate': {'net_return_pct': -1., 'stress_return_pct': -1.1},
+                         'loss_reduction_only': True}
+                if decision == 'blocked':
+                    final = {'basis': 'development_only', 'error': 'insufficient_observed_baseline'}
+                self.learner.daily.evaluator = Mock(return_value={
+                    'decision': decision, 'reason': decision + ' reason', 'metrics': final})
+                if decision == 'error':
+                    self.learner.daily.evaluator.side_effect = RuntimeError('temporary evaluator failure')
+                    with self.assertRaises(RuntimeError):
+                        self.process()
+                else:
+                    self.process()
+                saved = self.learner.daily.history()
+                history = self.learner._research_history()
+                entry = history[1]
+                self.assertEqual(entry['decision'], decision)
+                self.assertEqual(entry['daily_evaluation']['metrics'], saved[0]['metrics'])
+                self.assertEqual(entry['daily_evaluation']['reason'], saved[0]['reason'])
+                self.assertEqual(entry['daily_evaluation']['as_of'], self.data['as_of'])
+                self.assertNotIn('metrics', entry)
+                self.assertEqual(_feedback(history), 'exploit')
+                public = _public_feedback([entry])[0]
+                self.assertEqual(public['decision'], decision)
+                self.assertEqual(public['daily_evaluation']['decision'], decision)
+                self.assertEqual(public['development']['net_return_pct'], 12)
+                self.assertNotIn('metrics', public)
+                self.assertEqual(public['activation']['status'], 'pending' if decision == 'apply' else 'not_activated')
+                if decision in ('keep', 'apply'):
+                    self.assertEqual(public['daily_evaluation']['metrics']['intervals'], 1)
+                    self.assertEqual(public['daily_evaluation']['metrics']['candidate']['net_return_pct'], -1)
+                elif decision == 'error':
+                    self.assertIsNone(public['daily_evaluation']['metrics'])
+                entry['daily_evaluation']['metrics'] = {'changed': True}
+                self.assertEqual(self.learner.daily.history(), saved)
+                if index:
+                    delivered = self.calls[-1][2][1]
+                    self.assertEqual(delivered['daily_evaluation']['decision'], ('keep', 'blocked', 'error')[index - 1])
+
+    def test_daily_activation_feedback_distinguishes_preparation_from_real_activation(self):
+        self.process()
+        daily = self.learner.daily
+        pending = daily.pending()
+        decision = deepcopy(daily.history()[0])
+        self.assertEqual(self.learner._research_history()[1]['activation']['status'], 'pending')
+        run = {'id': 'prepared-test', 'as_of': pending['signal_day'], 'status': 'ready',
+               'created_at': self.now.isoformat(), 'learning_policy': pending['policy'], 'signals': []}
+        self.assertTrue(daily.prepare(pending, run))
+        self.assertEqual(self.learner._research_history()[1]['activation']['status'], 'prepared')
+        self.assertEqual(daily.history()[0], decision)
+        self.now = datetime.fromisoformat(raw_input(1)['observed_at'])
+        self.store.save_settings({'enabled': True, 'user_paused': False})
+        self.assertTrue(daily.activate(daily.pending(), effective_day=self.now.date().isoformat()))
+        history = self.learner._research_history()
+        self.assertEqual(history[1]['decision'], 'apply')
+        self.assertEqual(history[1]['activation']['status'], 'activated')
+        self.assertEqual(history[1]['activation']['effective_day'], self.now.date().isoformat())
+        saved = daily.history()[0]
+        saved.pop('activation')
+        self.assertEqual(saved, decision)
+        self.assertEqual(self.store.orders(), [])
+
+    def test_daily_apply_without_activation_evidence_is_unknown_not_pending_or_rejected(self):
+        self.process()
+        self.data = raw_input(1)
+        self.now = datetime.fromisoformat(self.data['observed_at'])
+        self.context['initial_state']['as_of'] = self.data['as_of']
+        self.process()
+        history = self.learner._research_history()
+        self.assertEqual(history[1]['activation']['status'], 'pending')
+        self.assertEqual(history[2]['decision'], 'apply')
+        self.assertEqual(history[2]['activation']['status'], 'unknown')
 
     def test_settled_book_unlocks_same_input_but_repeat_and_restart_do_not_reroll(self):
         self.context['initial_state']['pending_orders'] = ['unsettled']

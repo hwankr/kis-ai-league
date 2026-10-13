@@ -162,14 +162,14 @@ class LearningRuntimeTests(unittest.TestCase):
         self.current = self.current.replace(hour=10, minute=0)
         self.service._symbol_quote(self.broker, "005930")
         original = self.broker.submit
-        def inspect(*args):
+        def inspect(*args, **kwargs):
             order = self.service.store.orders()[-1]
             self.assertEqual(order['status'], 'submitting')
             self.assertEqual(order['decision_price'], '10000')
             self.assertEqual(order['decision_volume'], 100)
             self.assertEqual(datetime.fromisoformat(order['decision_observed_at']), self.current)
             self.assertIsNone(order['execution_prediction']['fill_ratio'])
-            return original(*args)
+            return original(*args, **kwargs)
         with patch.object(self.broker, 'submit', side_effect=inspect):
             first = self.submit(quantity=2)
         prediction = deepcopy(first['execution_prediction'])

@@ -42,6 +42,12 @@ def _timestamp(value):
         return None
 
 
+class _StopTimeout(TimeoutError):
+    def __init__(self, target, requested_at):
+        super().__init__("mirror_stop_timeout")
+        self.target, self.requested_at = target, requested_at
+
+
 class OperationsService:
     def __init__(self, root=ROOT, *, now=None, monotonic=None):
         self.root = Path(root).resolve()
@@ -52,6 +58,7 @@ class OperationsService:
         self._verified = False
         self._busy = False
         self._error = None
+        self._stop_timeout = None
         self._worker = None
         self._timeout = 120
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -126,6 +133,7 @@ class OperationsService:
                 pass
             except Exception:
                 self._error = "연동 자동 복구 설정을 확인하지 못했습니다."
+                self._stop_timeout = None
 
     def close(self):
         """Stop supervising on dashboard shutdown; leave the mirror and preference intact."""
@@ -172,6 +180,14 @@ class OperationsService:
     def snapshot(self):
         with self._guard:
             state, locked, verified = self._observe()
+            timeout = self._stop_timeout
+            stopped_at = _timestamp(state.get("updated_at"))
+            if (timeout is not None and not locked and state.get("status") == "stopped"
+                    and _identity(state) == timeout.target and stopped_at is not None
+                    and datetime.fromisoformat(timeout.requested_at) < datetime.fromisoformat(stopped_at)
+                    <= self._now() + timedelta(seconds=5)):
+                # A terminal heartbeat need not keep advancing while the page is closed.
+                self._error, self._stop_timeout = None, None
             control = self._control()
             busy = self._busy or self._locked("launcher.lock")
             pending = locked and self._stop_pending(state)
@@ -217,6 +233,7 @@ class OperationsService:
 
     def _queue(self, action, target, *, automatic=False):
         self._busy, self._error = True, None
+        self._stop_timeout = None
         self._worker = threading.Thread(target=self._execute, args=(action, target),
                                         kwargs={"automatic": automatic}, daemon=True)
         try:
@@ -227,6 +244,7 @@ class OperationsService:
 
     def _execute(self, action, target, *, automatic=False):
         error = None
+        stop_timeout = None
         retry = None
         try:
             with file_lock(self.local / "launcher.lock", blocking=False):
@@ -259,6 +277,9 @@ class OperationsService:
                         raise ValueError("새로 시작한 실행기의 상태를 확인하세요.")
         except BlockingIOError:
             error = "다른 실행기 요청이 진행 중입니다."
+        except _StopTimeout as failure:
+            error = "종료를 아직 확인하지 못했습니다. 실행 상태를 확인하세요."
+            stop_timeout = _StopTimeout(failure.target, failure.requested_at)
         except TimeoutError:
             error = error or "종료를 아직 확인하지 못했습니다. 실행 상태를 확인하세요."
         except Exception:
@@ -266,6 +287,7 @@ class OperationsService:
         finally:
             with self._guard:
                 self._error, self._busy = error, False
+                self._stop_timeout = stop_timeout
 
     def _stop(self, target):
         with self._guard:
@@ -275,9 +297,10 @@ class OperationsService:
                     or state.get("status") in {"stopped", "error", "stopping"}
                     or self._stop_pending(state)):
                 raise ValueError("실행 인스턴스를 확인하지 못했습니다.")
+            requested_at = self._now().isoformat()
             _write(self.local / "timefolio-mirror-stop.json",
                    {"action": "stop", "instance": target[0], "pid": target[1], "started_at": target[2],
-                    "requested_at": datetime.now(timezone.utc).isoformat()})
+                    "requested_at": requested_at})
         deadline = time.monotonic() + self._timeout
         while True:
             state = _read(self.local / "timefolio-mirror-state.json")
@@ -289,5 +312,5 @@ class OperationsService:
                     return
                 raise ValueError("정상 종료를 확인하지 못했습니다.")
             if time.monotonic() >= deadline:
-                raise TimeoutError
+                raise _StopTimeout(target, requested_at)
             time.sleep(1)

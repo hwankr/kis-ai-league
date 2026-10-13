@@ -164,6 +164,59 @@ class ResearchTests(unittest.TestCase):
             for key in ("cash_reserve", "max_positions", "cancel_after_minutes"):
                 self.assertEqual(normal["policy"][key], hint["policy"][key])
 
+    def test_llm_daily_feedback_separates_development_final_review_and_activation(self):
+        history = [{"policy": rule(), "decision": "apply", "development": metrics(12, 11, 1),
+            "daily_evaluation": {"as_of": "2026-10-12", "decision": "apply", "reason": "잠정 손실 축소",
+                "basis": "development_only", "fingerprint": "private-account",
+                "metrics": {"intervals": 1, "recent_intervals": 1, "start_day": "2026-10-08",
+                    "end_day": "2026-10-12", "source_basis": "observed_legacy_suffix",
+                    "excluded_frames": 118, "observed_baseline_frames": 2, "loss_reduction_only": True,
+                    "champion": {"net_return_pct": -2, "stress_return_pct": -2.1},
+                    "candidate": {"net_return_pct": -1, "stress_return_pct": -1.1, "raw_input": "private-market"},
+                    "delta": {"net_return_pct": 1}, "checks": {"normal_improvement": True},
+                    "raw_input": "private-market"}},
+            "activation": {"status": "activated", "effective_day": "2026-10-13",
+                           "adopted_at": "2026-10-13T00:05:00+00:00", "run_id": "private-run"}}]
+        before = deepcopy(history)
+        llm = Mock()
+        llm.generate.return_value = rule()
+        propose_candidate(BASELINE_POLICY, [], LIMITS, history, llm)
+        prompt, payload, _ = llm.generate.call_args.args
+        public = json.loads(json.dumps(payload))['history'][0]
+        self.assertEqual(payload['feedback_mode'], 'exploit')
+        self.assertEqual(public['decision'], 'apply')
+        self.assertEqual(public['development']['net_return_pct'], 12)
+        self.assertEqual(public['daily_evaluation']['reason'], '잠정 손실 축소')
+        self.assertEqual(public['daily_evaluation']['metrics']['champion']['net_return_pct'], -2)
+        self.assertEqual(public['daily_evaluation']['metrics']['champion']['stress_return_pct'], -2.1)
+        self.assertEqual(public['daily_evaluation']['metrics']['candidate']['net_return_pct'], -1)
+        self.assertEqual(public['daily_evaluation']['metrics']['candidate']['stress_return_pct'], -1.1)
+        self.assertEqual(public['daily_evaluation']['metrics']['intervals'], 1)
+        self.assertTrue(public['daily_evaluation']['metrics']['loss_reduction_only'])
+        self.assertEqual(public['activation']['status'], 'activated')
+        self.assertEqual(public['activation']['effective_day'], '2026-10-13')
+        self.assertIn('never a short daily', prompt)
+        self.assertNotIn('metrics', public)
+        self.assertEqual(history, before)
+        for private in ('private-account', 'private-market', 'private-run'):
+            self.assertNotIn(private, json.dumps(payload))
+        history[0]['activation'] = {'status': 'unknown'}
+        propose_candidate(BASELINE_POLICY, [], LIMITS, history, llm)
+        unknown = json.loads(json.dumps(llm.generate.call_args.args[1]))['history'][0]
+        self.assertEqual(unknown['activation'], {'status': 'unknown'})
+        self.assertEqual(unknown['decision'], 'apply')
+        self.assertEqual(unknown['daily_evaluation']['metrics']['candidate']['net_return_pct'], -1)
+
+    def test_daily_public_review_never_invents_returns_for_blocked_or_failed_evaluation(self):
+        from backend.learning_research import _public_feedback
+        for decision in ('blocked', 'error'):
+            public = _public_feedback([{'decision': decision, 'development': metrics(),
+                'daily_evaluation': {'decision': decision, 'reason': '확인 필요', 'metrics': None},
+                'activation': {'status': 'not_activated'}}])[0]
+            self.assertEqual(public['daily_evaluation']['decision'], decision)
+            self.assertIsNone(public['daily_evaluation']['metrics'])
+            self.assertEqual(public['activation']['status'], 'not_activated')
+
     def test_valid_llm_proposal_is_recorded_before_grammar_wins_development(self):
         returned = rule()
         returned["cancel_after_minutes"] = 60

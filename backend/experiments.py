@@ -1,4 +1,5 @@
 """Local experiment runner: analysis, paper execution and durable reconciliation."""
+from contextlib import ExitStack, contextmanager
 from datetime import date, datetime, time as daytime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -89,6 +90,8 @@ class ExperimentService:
         self.analyzer, self.llm_factory = analyzer, llm_factory
         self.master_reader = master_reader or EligibilityService().master_snapshot
         self.lock = threading.RLock()
+        self._pause_requests_lock = threading.Lock()
+        self._pause_requests = 0
         self.worker = None
         self.worker_started_at = None
         self.next_tick = 0
@@ -144,19 +147,51 @@ class ExperimentService:
         return self.now().astimezone(timezone.utc).isoformat(timespec="microseconds")
 
     def close(self):
-        self.stopping = True
+        deadline = time.monotonic() + 20
+        try:
+            with file_lock(self.directory / "submission.lock", timeout=20):
+                self.stopping = True
+        except (OSError, TimeoutError):
+            return False
         learning_closed = self.learning.close()
         if self.worker is not None and self.worker.is_alive():
-            self.worker.join(20)
+            self.worker.join(max(0, deadline - time.monotonic()))
         return learning_closed and (self.worker is None or not self.worker.is_alive())
 
     def _event(self, kind, message):
         self.store.event(kind, message, self._timestamp())
 
     def _pause(self, reason):
-        self.store.save_setting("enabled", False)
-        self.store.save_setting("pause_reason", reason)
-        self.store.save_setting("user_paused", True)
+        with self._pause_requests_lock:
+            self._pause_requests += 1
+        try:
+            with file_lock(self.directory / "submission.lock"):
+                epoch = self.store.setting("pause_epoch", 0) + 1
+                self.store.save_settings({"enabled": False, "pause_reason": reason,
+                                          "user_paused": True, "pause_epoch": epoch})
+        finally:
+            with self._pause_requests_lock:
+                self._pause_requests -= 1
+
+    @contextmanager
+    def _submission_guard(self, pause_epoch):
+        # A pause either commits before this check, or follows a request that
+        # has already crossed the HTTP boundary. Never unlock between the two.
+        from backend.paper_broker import BrokerRejected, BrokerStopped
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(file_lock(self.directory / "submission.lock"))
+            except (OSError, TimeoutError):
+                raise BrokerRejected("모의 주문 전 전송 잠금에 접근하지 못했습니다.", request_sent=False) from None
+            # Persist deadline state in _submit's rejection handler, after this
+            # lock is released; never acquire self.lock while holding it.
+            expired = ended(self.now(), KIS_LAST_DAY)
+            with self._pause_requests_lock:
+                pausing = self._pause_requests > 0
+            if (expired or self.stopping or pausing or self.store.setting("pause_epoch", 0) != pause_epoch
+                    or not self.store.setting("enabled", False) or not self._market_open()):
+                raise BrokerStopped(KIS_ENDED_MESSAGE if expired else "전송 직전 주문이 중지되어 보내지 않았습니다.")
+            yield
 
     def _enforce_deadline(self):
         if not ended(self.now(), KIS_LAST_DAY):
@@ -512,9 +547,8 @@ class ExperimentService:
                     raise KisError("미확정 주문을 먼저 확인하세요.")
                 if self._enforce_deadline():
                     raise KisError(KIS_ENDED_MESSAGE)
-                self.store.save_setting("enabled", True)
-                self.store.save_setting("user_paused", False)
-                self.store.save_setting("pause_reason", None)
+                with file_lock(self.directory / "submission.lock"):
+                    self.store.save_settings({"enabled": True, "user_paused": False, "pause_reason": None})
                 self._health(next_retry_at=None)
                 retry = self.store.setting("llm_retry", {})
                 if retry:
@@ -1362,6 +1396,7 @@ class ExperimentService:
         return ordered, caps
 
     def _submit(self, policy, broker, decision, side, quantity, price, intent_key, *, run_id):
+        pause_epoch = self.store.setting("pause_epoch", 0)
         if self._enforce_deadline() or self.stopping or not self.store.setting("enabled", False) or not self._market_open():
             return
         if side == 'buy' and self.learning_account.state(policy.get('fingerprint', '')).get('risk', {}).get('active'):
@@ -1373,7 +1408,7 @@ class ExperimentService:
                  "filled_quantity": 0, "filled_amount": "0", "average_price": None,
                  "remaining_quantity": quantity, "status": "submitting", "order_id": None, "branch_id": None,
                  "order_date": self.now().astimezone(KST).date().isoformat(), "created_at": self._timestamp(),
-                 "error": None, "fingerprint": policy["fingerprint"], "run_id": run_id}
+                 "error": None, "fingerprint": policy["fingerprint"], "run_id": run_id, "pause_epoch": pause_epoch}
         order['decision_price'] = str(price)
         context = self._decision_quote(decision['symbol'], price)
         if context:
@@ -1401,9 +1436,16 @@ class ExperimentService:
             order.pop('submission_attempted_at', None)
             self.store.save_order(order)
             return
-        from backend.paper_broker import BrokerRejected
+        from backend.paper_broker import BrokerRejected, BrokerStopped
         try:
-            ack = broker.submit(order["symbol"], side, quantity, str(price))
+            ack = broker.submit(order["symbol"], side, quantity, str(price),
+                                send_guard=lambda: self._submission_guard(pause_epoch))
+        except BrokerStopped as error:
+            self._enforce_deadline()
+            order.update(status="cancelled", remaining_quantity=0, submission_skipped=True,
+                         request_sent=False, error=str(error))
+            order.pop('submission_attempted_at', None)
+            self.store.save_order(order)
         except BrokerRejected as error:
             self._enforce_deadline()
             order.update(status="rejected", remaining_quantity=0, error=str(error), broker_error_code=error.code,

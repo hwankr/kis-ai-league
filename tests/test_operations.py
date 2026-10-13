@@ -206,6 +206,75 @@ class OperationsTests(unittest.TestCase):
         self.assertTrue(self.mirror_locked)
         self.service._launcher.ensure_mirror.assert_not_called()
 
+    def test_delayed_stop_completion_clears_warning_without_changing_saved_controls(self):
+        value = self.verified()
+        self.service._timeout = 0
+        self.service.command({"action": "mirror_stop"})
+        self.assertIsNotNone(self.finish()["error"])
+        control_path = self.local / "timefolio-mirror-control.json"
+        stop_path = self.local / "timefolio-mirror-stop.json"
+        before = (control_path.read_bytes(), stop_path.read_bytes())
+        self.assertEqual(json.loads(before[1])["requested_at"], self.now.isoformat())
+        self.save({**value, "status": "stopped", "updated_at": self.stamp()})
+        self.mirror_locked = False
+        self.seconds = 600  # Returning to the page later still confirms the terminal record.
+        with patch("backend.launcher.datetime", wraps=datetime) as clock:
+            clock.now.return_value = self.service._now()
+            for _ in range(2):
+                result = self.service.snapshot()
+                self.assertEqual(result["mirror"]["status"], "stopped")
+                self.assertIsNone(result["error"])
+        self.assertEqual((control_path.read_bytes(), stop_path.read_bytes()), before)
+        self.assertFalse(self.service._control()["desired_running"])
+        self.service._launcher.ensure_mirror.assert_not_called()
+        self.read_controls.assert_not_called()
+
+    def test_stop_timeout_requires_same_runner_fresh_completion_and_released_lock(self):
+        value = self.verified()
+        self.service._timeout = 0
+        self.service.command({"action": "mirror_stop"})
+        warning = self.finish()["error"]
+        requested_at = json.loads((self.local / "timefolio-mirror-stop.json").read_text())["requested_at"]
+        stopped = {**value, "status": "stopped", "updated_at": self.stamp()}
+        self.mirror_locked = False
+        for changes in ({"instance": "b" * 32}, {"pid": value["pid"] + 1},
+                        {"started_at": self.stamp(-120)}, {"updated_at": self.stamp(-1000)},
+                        {"updated_at": self.stamp(60)}, {"updated_at": requested_at},
+                        {"updated_at": None}, {"status": "error"}, {"status": "paused"}):
+            with self.subTest(changes=changes):
+                self.save({**stopped, **changes})
+                self.assertEqual(self.service.snapshot()["error"], warning)
+        self.save({})
+        self.assertEqual(self.service.snapshot()["error"], warning)
+        self.save(stopped)
+        self.mirror_locked = True
+        self.assertEqual(self.service.snapshot()["error"], warning)
+        self.mirror_locked = False
+        self.assertIsNone(self.service.snapshot()["error"])
+
+    def test_stopped_record_does_not_clear_other_errors_or_replaced_timeout(self):
+        for failure in (OSError("private"), TimeoutError("unrelated timeout")):
+            with self.subTest(failure=type(failure).__name__):
+                value = self.verified()
+                with patch.object(self.service, "_stop", side_effect=failure):
+                    self.service.command({"action": "mirror_stop"})
+                    warning = self.finish()["error"]
+                self.save({**value, "status": "stopped", "updated_at": self.stamp()})
+                self.mirror_locked = False
+                self.assertIsNotNone(warning)
+                self.assertEqual(self.service.snapshot()["error"], warning)
+        value = self.verified()
+        self.service._timeout = 0
+        self.service.command({"action": "mirror_stop"})
+        self.finish()
+        with patch.object(self.service, "_control", side_effect=OSError("private")):
+            self.service.tick()
+        warning = self.service.snapshot()["error"]
+        self.assertIn("자동 복구 설정", warning)
+        self.save({**value, "status": "stopped", "updated_at": self.stamp()})
+        self.mirror_locked = False
+        self.assertEqual(self.service.snapshot()["error"], warning)
+
     def test_stop_rechecks_identity_before_writing_request(self):
         value = self.verified()
         self.service.snapshot()

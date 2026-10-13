@@ -7,11 +7,11 @@ from copy import deepcopy
 from datetime import date, datetime, time, timezone
 import hashlib
 import json
-from pathlib import Path
 
 from backend.experiment_store import encode
 from backend.kis import KST
 from backend.learning_policy import build_frame, policy_id, validate_policy
+from backend.source_version import DAILY_SOURCES, source_version
 
 
 VERSION = 'daily-policy-v1'
@@ -38,9 +38,7 @@ class DailyPolicyService:
         self.store, self.enabled, self.now = store, enabled, now
         self.fallback_policy, self.proposer, self.evaluator = fallback_policy, proposer, evaluator
         self.stopping = stopping or (lambda: False)
-        self.engine_version = hashlib.sha256(b''.join(Path(__file__).with_name(name).read_bytes() for name in (
-            'daily_policy.py', 'daily_evaluation.py', 'learning_policy.py', 'learning_evaluation.py',
-            'learning_research.py'))).hexdigest()
+        self.engine_version = source_version(DAILY_SOURCES)
         with store.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS daily_policy_decisions '
                        '(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, day TEXT NOT NULL, '

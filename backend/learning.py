@@ -6,13 +6,13 @@ from copy import deepcopy
 from datetime import datetime, time, timezone
 import hashlib
 import json
-from pathlib import Path
 import threading
 
 from backend.experiment_store import encode
 from backend.kis import KST
 from backend.learning_compatibility import scorecard_version_matches, version_matches
 from backend.request_gate import file_lock
+from backend.source_version import LEARNING_SOURCES, source_version
 
 def _hash(value):
     return hashlib.sha256(encode(value).encode()).hexdigest()
@@ -32,9 +32,7 @@ class LearningService:
         self.pending = None
         self.attempted = None
         self.retry_after = None
-        self.version = hashlib.sha256(b''.join(Path(__file__).with_name(name).read_bytes() for name in (
-            'learning.py', 'learning_policy.py', 'learning_evaluation.py', 'learning_account.py',
-            'learning_attribution.py'))).hexdigest()
+        self.version = source_version(LEARNING_SOURCES)
         with store.connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS learning_frames
@@ -79,8 +77,26 @@ class LearningService:
         from backend.learning_policy import policy_id
         history = self.history()
         if self.daily.enabled:
-            history = [{**item['proposal'], 'candidate_id': policy_id(item['proposal']['policy']),
-                        'decision': item['decision']} for item in self.daily.history() if item.get('proposal')] + history
+            pending = self.daily.pending() or {}
+            daily_history = []
+            for item in self.daily.history():
+                if not item.get('proposal'):
+                    continue
+                activation = deepcopy(item.get('activation') or {})
+                if activation:
+                    activation['status'] = 'activated'
+                elif pending.get('decision_id') == item['id']:
+                    activation['status'] = 'prepared' if pending.get('prepared_run') else 'pending'
+                else:
+                    activation['status'] = 'unknown' if item['decision'] == 'apply' else 'not_activated'
+                if activation['status'] == 'prepared':
+                    activation['prepared_at'] = pending.get('prepared_at')
+                daily_history.append({**deepcopy(item['proposal']),
+                    'candidate_id': policy_id(item['proposal']['policy']), 'decision': item['decision'],
+                    'daily_evaluation': {key: deepcopy(item.get(key)) for key in
+                        ('as_of', 'decision', 'reason', 'basis', 'metrics')},
+                    'activation': activation})
+            history = daily_history + history
         fingerprint = (self.store.setting("policy") or {}).get("fingerprint")
         groups = {}
         for order in self.store.orders():

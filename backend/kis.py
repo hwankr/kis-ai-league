@@ -300,20 +300,22 @@ class PaperClient:
     def _gate_path(self, purpose):
         return self.cache_path.parent / f"{purpose}-{_credential_identity(self.settings)}.lock"
 
-    def _request(self, path, *, headers=None, params=None, body=None, before_send=None):
+    def _request(self, path, *, headers=None, params=None, body=None, before_send=None, send_guard=None):
         # 계좌 간 제한을 공유하되, 연속조회의 페이지 사이에는 잔고 조회가 진행된다.
         with self.request_guard() if self.request_guard is not None else nullcontext():
-            return self._perform_request(path, headers=headers, params=params, body=body, before_send=before_send)
+            return self._perform_request(path, headers=headers, params=params, body=body,
+                                         before_send=before_send, send_guard=send_guard)
 
-    def _perform_request(self, path, *, headers=None, params=None, body=None, before_send=None):
+    def _perform_request(self, path, *, headers=None, params=None, body=None, before_send=None, send_guard=None):
         # 대시보드와 독립 수집기가 같은 키를 사용해도 요청 간격을 공유한다.
         try:
             with request_spacing(self._gate_path("request")):
-                return self._http_request(path, headers=headers, params=params, body=body, before_send=before_send)
+                return self._http_request(path, headers=headers, params=params, body=body,
+                                          before_send=before_send, send_guard=send_guard)
         except (OSError, TimeoutError):
             raise KisError("로컬 API 요청 잠금에 접근하지 못했습니다. 잠시 후 다시 조회하세요.") from None
 
-    def _http_request(self, path, *, headers=None, params=None, body=None, before_send=None):
+    def _http_request(self, path, *, headers=None, params=None, body=None, before_send=None, send_guard=None):
         # 모의 서버로만 연결하며, 서버 응답 본문이나 인증 헤더를 오류에 출력하지 않는다.
         url = PAPER_URL + path
         if params:
@@ -323,10 +325,14 @@ class PaperClient:
             headers={"Content-Type": "application/json; charset=utf-8",
                      "User-Agent": "kis-ai-league/0.1", **(headers or {})},
         )
-        if before_send is not None:
-            before_send()
         try:
-            with urlopen(request, timeout=15) as response:
+            # Serialize the final permission check and actual transmission with
+            # a user pause. Authentication and request-spacing waits are outside.
+            with send_guard() if send_guard is not None else nullcontext():
+                if before_send is not None:
+                    before_send()
+                response = urlopen(request, timeout=15)
+            with response:
                 data = json.load(response)
                 response_headers = dict(response.headers.items())
         except HTTPError as error:

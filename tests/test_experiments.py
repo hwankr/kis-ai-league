@@ -1,9 +1,10 @@
 """Offline service scenarios: durable intent, cumulative fills and bounded exposure."""
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
+import io
 import json
 import multiprocessing
 from pathlib import Path
@@ -69,7 +70,11 @@ class FakeBroker:
     def orders(self, start, end):
         return [deepcopy(row) for row in self.remote if start <= row["order_date"] <= end]
 
-    def submit(self, symbol, side, quantity, price):
+    def submit(self, symbol, side, quantity, price, *, send_guard=None):
+        with send_guard() if send_guard is not None else nullcontext():
+            return self._submit(symbol, side, quantity, price)
+
+    def _submit(self, symbol, side, quantity, price):
         self.submissions.append((symbol, side, quantity, price))
         if self.submit_error:
             raise self.submit_error
@@ -256,7 +261,7 @@ class ExperimentsTests(unittest.TestCase):
 
     def test_broker_deadline_rejection_is_unsent_and_disables_engine(self):
         self.current = datetime(2026, 11, 20, 23, 59, 59, tzinfo=KST)
-        def delayed_broker(*args):
+        def delayed_broker(*args, **kwargs):
             self.current += timedelta(seconds=1)
             raise BrokerRejected("KIS 대회가 종료되어 새 주문을 중지했습니다.", request_sent=False)
         with patch.object(self.service, "_market_open", return_value=True), \
@@ -281,11 +286,11 @@ class ExperimentsTests(unittest.TestCase):
 
     def test_durable_intent_exists_before_broker_call_and_same_intent_never_reissued(self):
         original = self.broker.submit
-        def inspect(*args):
+        def inspect(*args, **kwargs):
             records = ExperimentStore(self.root / "state" / "experiments.sqlite3").orders()
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["status"], "submitting")
-            return original(*args)
+            return original(*args, **kwargs)
         self.broker.submit = inspect
         self.submit()
         self.submit()
@@ -682,8 +687,8 @@ class ExperimentsTests(unittest.TestCase):
         self.add_run()
         self.enable()
         original = self.broker.submit
-        def pause_during(*args):
-            result = original(*args)
+        def pause_during(*args, **kwargs):
+            result = original(*args, **kwargs)
             self.service._pause("사용자 중지")
             return result
         self.broker.submit = pause_during
@@ -691,6 +696,379 @@ class ExperimentsTests(unittest.TestCase):
         self.assertEqual(len(self.broker.submissions), 1)
         self.assertEqual(self.service.store.orders()[0]["status"], "submitted")
         self.assertFalse(self.service.store.setting("enabled", True))
+
+    @staticmethod
+    def transport_ack():
+        response = io.StringIO(json.dumps({"rt_cd": "0", "output": {
+            "ODNO": "123", "KRX_FWDG_ORD_ORGNO": "12345", "ORD_TMD": "100000"}}))
+        response.headers = {}
+        return response
+
+    def test_transport_waits_recheck_pause_shutdown_market_and_deadline_for_both_sides(self):
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        for stage in ("token", "request_guard", "request_spacing"):
+            for reason in ("pause", "shutdown", "market", "deadline"):
+                for side in ("buy", "sell"):
+                    with self.subTest(stage=stage, reason=reason, side=side):
+                        self.current = NOW
+                        self.service.stopping = False
+                        self.enable()
+                        policy = self.service._policy()
+                        profile = self.service._profile(policy)
+                        previous_ids = {item["id"] for item in self.service.store.orders()}
+
+                        def invalidate():
+                            if reason == "pause":
+                                self.service._pause("사용자 중지")
+                            elif reason == "shutdown":
+                                self.service.close()
+                            elif reason == "market":
+                                self.current = self.current.replace(hour=15, minute=15)
+                            else:
+                                self.current = datetime(2026, 11, 21, tzinfo=KST)
+
+                        @contextmanager
+                        def wait_at(name):
+                            if name == stage:
+                                invalidate()
+                            yield
+
+                        def token():
+                            if stage == "token":
+                                invalidate()
+                            return "test-token"
+
+                        client = PaperClient(profile.settings, self.root / "test-token.json",
+                                             request_guard=lambda: wait_at("request_guard"))
+                        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+                        with patch.object(client, "token", side_effect=token), \
+                                patch("backend.kis.request_spacing", side_effect=lambda _: wait_at("request_spacing")), \
+                                patch("backend.kis.urlopen") as opened:
+                            self.service._submit(policy, broker, decision(), side, 1, Decimal("10000"),
+                                                 f"{stage}:{reason}:{side}", run_id=None)
+                        opened.assert_not_called()
+                        created = [item for item in self.service.store.orders() if item["id"] not in previous_ids]
+                        self.assertEqual(len(created), 1)
+                        order = created[0]
+                        self.assertEqual(order["status"], "cancelled")
+                        self.assertTrue(order["submission_skipped"])
+                        self.assertFalse(order["request_sent"])
+                        self.assertNotIn("submission_attempted_at", order)
+                        self.assertFalse(self.service.store.setting("issues", []))
+        self.service.stopping = False
+
+    def test_pause_from_another_instance_cannot_commit_between_final_check_and_http_entry(self):
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        other = self.make_service()
+        self.enable()
+        policy = self.service._policy()
+        profile = self.service._profile(policy)
+        client = PaperClient(profile.settings, self.root / "test-token.json")
+        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+        checked, allow_http, entered_http, finish_http = (threading.Event() for _ in range(4))
+        pause_attempted, paused = threading.Event(), threading.Event()
+        errors, checks = [], []
+        original_check = broker._require_competition_open
+
+        def final_check():
+            original_check()
+            checks.append(True)
+            if len(checks) == 2:
+                checked.set()
+                if not allow_http.wait(5):
+                    raise AssertionError("HTTP entry not released")
+
+        @contextmanager
+        def observed_lock(path, **kwargs):
+            if threading.current_thread().name == "test-pause" and path.name == "submission.lock":
+                pause_attempted.set()
+            with file_lock(path, **kwargs) as handle:
+                yield handle
+
+        def http(*args, **kwargs):
+            self.assertTrue(self.service.store.setting("enabled"))
+            entered_http.set()
+            if not finish_http.wait(5):
+                raise AssertionError("HTTP response not released")
+            return self.transport_ack()
+
+        def submit():
+            try:
+                self.service._submit(policy, broker, decision(), "buy", 1, Decimal("10000"),
+                                     "in-flight", run_id=None)
+            except BaseException as error:
+                errors.append(error)
+
+        def pause():
+            try:
+                other._pause("사용자 중지")
+                paused.set()
+            except BaseException as error:
+                errors.append(error)
+
+        submitting = threading.Thread(target=submit)
+        pausing = threading.Thread(target=pause, name="test-pause")
+        with patch.object(client, "token", return_value="test-token"), \
+                patch("backend.kis.request_spacing", side_effect=lambda _: nullcontext()), \
+                patch("backend.experiments.file_lock", side_effect=observed_lock), \
+                patch.object(broker, "_require_competition_open", side_effect=final_check), \
+                patch("backend.kis.urlopen", side_effect=http) as opened:
+            try:
+                submitting.start()
+                self.assertTrue(checked.wait(5))
+                pausing.start()
+                self.assertTrue(pause_attempted.wait(5))
+                self.assertFalse(paused.wait(0.05))
+                allow_http.set()
+                self.assertTrue(entered_http.wait(5))
+                self.assertFalse(paused.wait(0.05))
+            finally:
+                allow_http.set()
+                finish_http.set()
+                submitting.join(5)
+                if pausing.ident is not None:
+                    pausing.join(5)
+            self.assertFalse(submitting.is_alive())
+            self.assertFalse(pausing.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(paused.is_set())
+            self.assertFalse(self.service.store.setting("enabled"))
+            self.assertEqual(self.service.store.orders()[0]["status"], "submitted")
+            self.service._submit(policy, broker, decision(), "buy", 1, Decimal("10000"),
+                                 "after-pause", run_id=None)
+            self.assertEqual(len(self.service.store.orders()), 1)
+            opened.assert_called_once()
+
+    def test_transport_unknown_is_not_retried_after_user_pause(self):
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        self.enable()
+        policy = self.service._policy()
+        profile = self.service._profile(policy)
+        client = PaperClient(profile.settings, self.root / "test-token.json")
+        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+        with patch.object(client, "token", return_value="test-token"), \
+                patch("backend.kis.request_spacing", side_effect=lambda _: nullcontext()), \
+                patch("backend.kis.urlopen", side_effect=TimeoutError()) as opened:
+            self.service._submit(policy, broker, decision(), "buy", 1, Decimal("10000"), "unknown", run_id=None)
+            self.service._pause("사용자 중지")
+            self.service._submit(policy, broker, decision(), "buy", 1, Decimal("10000"), "unknown", run_id=None)
+            self.assertEqual(self.service.store.orders()[0]["status"], "unknown")
+            opened.assert_called_once()
+
+    def test_deadline_guard_releases_submission_lock_before_waiting_for_service_lock(self):
+        from backend.competition_deadline import ended
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        self.enable()
+        policy = self.service._policy()
+        profile = self.service._profile(policy)
+        client = PaperClient(profile.settings, self.root / "test-token.json")
+        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+        deadline_observed = threading.Event()
+        errors = []
+
+        def token():
+            self.current = datetime(2026, 11, 21, tzinfo=KST)
+            return "test-token"
+
+        def observe_deadline(*args):
+            expired = ended(*args)
+            if expired:
+                deadline_observed.set()
+            return expired
+
+        @contextmanager
+        def bounded_lock(path, **kwargs):
+            kwargs.setdefault("timeout", 1)
+            with file_lock(path, **kwargs) as handle:
+                yield handle
+
+        def submit():
+            try:
+                self.service._submit(policy, broker, decision(), "buy", 1, Decimal("10000"),
+                                     "deadline-pause", run_id=None)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=submit)
+        with patch.object(client, "token", side_effect=token), \
+                patch("backend.kis.request_spacing", side_effect=lambda _: nullcontext()), \
+                patch("backend.experiments.file_lock", side_effect=bounded_lock), \
+                patch("backend.experiments.ended", side_effect=observe_deadline), \
+                patch("backend.kis.urlopen") as opened:
+            try:
+                with self.service.lock:
+                    worker.start()
+                    self.assertTrue(deadline_observed.wait(5))
+                    self.service._pause("사용자 중지")
+            finally:
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            opened.assert_not_called()
+        self.assertEqual(self.service.store.setting("pause_reason"), "사용자 중지")
+        order = self.service.store.orders()[0]
+        self.assertEqual(order["status"], "cancelled")
+        self.assertFalse(order["request_sent"])
+
+    def test_submission_lock_entry_failure_is_unsent_without_retry(self):
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        self.enable()
+        policy = self.service._policy()
+        profile = self.service._profile(policy)
+        client = PaperClient(profile.settings, self.root / "test-token.json")
+        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+        for error in (TimeoutError("busy"), OSError("unavailable")):
+            with self.subTest(error=type(error).__name__):
+                previous_ids = {item["id"] for item in self.service.store.orders()}
+                with patch.object(client, "token", return_value="test-token"), \
+                        patch("backend.kis.request_spacing", side_effect=lambda _: nullcontext()), \
+                        patch("backend.experiments.file_lock", side_effect=error), \
+                        patch("backend.kis.urlopen") as opened:
+                    for _ in range(2):
+                        self.service._submit(policy, broker, decision(), "buy", 1, Decimal("10000"),
+                                             "lock-" + type(error).__name__, run_id=None)
+                    opened.assert_not_called()
+                created = [item for item in self.service.store.orders() if item["id"] not in previous_ids]
+                self.assertEqual(len(created), 1)
+                self.assertEqual(created[0]["status"], "rejected")
+                self.assertFalse(created[0]["request_sent"])
+                self.assertTrue(created[0]["submission_skipped"])
+
+    def test_pause_then_resume_does_not_revive_an_order_waiting_for_authentication(self):
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        policy = self.service._policy()
+        profile = self.service._profile(policy)
+        client = PaperClient(profile.settings, self.root / "test-token.json")
+        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+        for side in ("buy", "sell"):
+            with self.subTest(side=side):
+                self.enable()
+                before = self.service.store.setting("pause_epoch", 0)
+                previous_ids = {item["id"] for item in self.service.store.orders()}
+                tokens = []
+
+                def token():
+                    if not tokens:
+                        self.service._pause("사용자 중지")
+                        # Simulate a later authorized resume while old work still
+                        # holds its captured epoch. New work uses the new epoch.
+                        self.service.store.save_settings({"enabled": True, "user_paused": False, "pause_reason": None})
+                    tokens.append(True)
+                    return "test-token"
+
+                with patch.object(client, "token", side_effect=token), \
+                        patch("backend.kis.request_spacing", side_effect=lambda _: nullcontext()), \
+                        patch("backend.kis.urlopen", side_effect=lambda *a, **kw: self.transport_ack()) as opened:
+                    self.service._submit(policy, broker, decision(), side, 1, Decimal("10000"),
+                                         side + "-before-pause", run_id=None)
+                    opened.assert_not_called()
+                    cancelled = [item for item in self.service.store.orders() if item["id"] not in previous_ids]
+                    self.assertEqual(len(cancelled), 1)
+                    self.assertEqual(cancelled[0]["status"], "cancelled")
+                    self.assertEqual(cancelled[0]["pause_epoch"], before)
+                    self.assertFalse(cancelled[0]["request_sent"])
+                    self.assertEqual(self.service.store.setting("pause_epoch"), before + 1)
+                    self.assertTrue(self.service.store.setting("enabled"))
+                    self.assertFalse(self.service.store.setting("issues", []))
+                    self.service._submit(policy, broker, decision(), side, 1, Decimal("10000"),
+                                         side + "-after-resume", run_id=None)
+                    opened.assert_called_once()
+                submitted = [item for item in self.service.store.orders()
+                             if item["id"] not in previous_ids and item["status"] == "submitted"]
+                self.assertEqual(len(submitted), 1)
+                self.assertEqual(submitted[0]["pause_epoch"], before + 1)
+
+    def test_waiting_pause_cannot_be_overtaken_by_more_submissions(self):
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        self.enable()
+        policy = self.service._policy()
+        profile = self.service._profile(policy)
+        client = PaperClient(profile.settings, self.root / "test-token.json")
+        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+        waiting, release = threading.Event(), threading.Event()
+        errors = []
+
+        @contextmanager
+        def defer_pause(path, **kwargs):
+            if threading.current_thread().name == "waiting-pause" and path.name == "submission.lock":
+                waiting.set()
+                if not release.wait(5):
+                    raise AssertionError("Pause was not released")
+            with file_lock(path, **kwargs) as handle:
+                yield handle
+
+        def pause():
+            try:
+                self.service._pause("사용자 중지")
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=pause, name="waiting-pause")
+        with patch.object(client, "token", return_value="test-token"), \
+                patch("backend.experiments.file_lock", side_effect=defer_pause), \
+                patch("backend.kis.request_spacing", side_effect=lambda _: nullcontext()), \
+                patch("backend.kis.urlopen") as opened:
+            try:
+                worker.start()
+                self.assertTrue(waiting.wait(5))
+                self.assertTrue(self.service.store.setting("enabled"))
+                for index in range(2):
+                    self.service._submit(policy, broker, decision(), "buy", 1, Decimal("10000"),
+                                         f"overtaking-{index}", run_id=None)
+                opened.assert_not_called()
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([item["status"] for item in self.service.store.orders()], ["cancelled", "cancelled"])
+        self.assertFalse(self.service.store.setting("issues", []))
+        self.assertEqual(self.service.store.setting("pause_epoch"), 1)
+        self.assertEqual(self.service._pause_requests, 0)
+
+    def test_broker_deadline_after_service_guard_is_a_normal_unsent_stop(self):
+        from backend.kis import PaperClient
+        from backend.paper_broker import PaperBroker
+        self.enable()
+        policy = self.service._policy()
+        profile = self.service._profile(policy)
+        client = PaperClient(profile.settings, self.root / "test-token.json")
+        broker = PaperBroker(profile, client=client, now=lambda: self.current)
+        checks = []
+        original = broker._require_competition_open
+
+        def cross_deadline():
+            if checks:
+                self.current = datetime(2026, 11, 21, tzinfo=KST)
+            checks.append(True)
+            original()
+
+        with patch.object(client, "token", return_value="test-token"), \
+                patch.object(broker, "_require_competition_open", side_effect=cross_deadline), \
+                patch("backend.kis.request_spacing", side_effect=lambda _: nullcontext()), \
+                patch("backend.kis.urlopen") as opened:
+            self.service._submit(policy, broker, decision(), "sell", 1, Decimal("10000"), "late-deadline", run_id=None)
+            opened.assert_not_called()
+        order = self.service.store.orders()[0]
+        self.assertEqual(order["status"], "cancelled")
+        self.assertFalse(order["request_sent"])
+        self.assertFalse(self.service.store.setting("issues", []))
+
+    def test_close_reports_submission_lock_failure_with_bounded_wait(self):
+        for error in (TimeoutError("busy"), OSError("unavailable")):
+            with self.subTest(error=type(error).__name__), \
+                    patch("backend.experiments.file_lock", side_effect=error) as locked, \
+                    patch.object(self.service.learning, "close") as close_learning:
+                self.assertFalse(self.service.close())
+                locked.assert_called_once_with(self.service.directory / "submission.lock", timeout=20)
+                close_learning.assert_not_called()
 
     def test_accepted_ack_database_failure_preserves_intent_for_unknown_recovery(self):
         self.enable()
