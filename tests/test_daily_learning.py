@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from backend.experiment_store import ExperimentStore
+from backend.experiment_store import ExperimentStore, encode
 from backend.learning import LearningService
 from tests.test_learning import LIMITS, candidate, raw_input
 
@@ -165,13 +165,122 @@ class DailyLearningTests(unittest.TestCase):
         self.assertEqual(restored.frames(), original)
         self.assertIsNotNone(restored.daily.pending())
 
-    def test_changed_same_day_input_preserves_original_and_cancels_pending(self):
+    def test_changed_same_day_input_preserves_original_and_pending_evidence(self):
         self.process()
         original = self.learner.frames()
+        pending = self.learner.daily.pending()
         self.data['histories']['005930'][self.data['as_of']]['volume'] += 1
         self.process()
         self.assertEqual(self.learner.frames(), original)
-        self.assertIsNone(self.learner.daily.pending())
+        self.assertEqual(self.learner.daily.pending(), pending)
+        self.assertEqual(self.learner.daily.snapshot()['status'], 'blocked')
+
+    def test_current_eligibility_refresh_preserves_first_frame_and_pending(self):
+        self.process()
+        original = self.learner.frames()
+        pending = self.learner.daily.pending()
+        self.data['rows'][0]['learning_eligible'] = False
+        self.now += timedelta(minutes=3)
+        self.data['observed_at'] = self.now.isoformat()
+        self.process()
+        self.assertEqual(self.learner.frames(), original)
+        self.assertEqual(self.learner.daily.pending(), pending)
+        self.assertEqual(self.learner.daily.snapshot()['status'], 'prepared')
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(self.data['rows'][0]['learning_eligible'])
+
+    def test_settled_book_uses_eligibility_frozen_before_first_proposal(self):
+        self.data['rows'][0]['learning_eligible'] = False
+        self.context['initial_state']['pending_orders'] = ['unsettled']
+        self.process()
+        original = self.learner.frames()
+        self.assertEqual(self.calls, [])
+        self.data['rows'][0]['learning_eligible'] = True
+        self.context['initial_state']['pending_orders'] = []
+        self.now += timedelta(minutes=3)
+        self.data['observed_at'] = self.now.isoformat()
+        self.process()
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(self.calls[0][1][-1]['rows'][0]['learning_eligible'])
+        self.assertEqual(self.calls[0][1][-1], original[-1])
+        self.assertEqual(self.learner.frames(), original)
+        self.assertIsNotNone(self.learner.daily.pending())
+        pending_inputs = self.learner.daily.pending()['signal_inputs']
+        self.assertEqual({key: pending_inputs[key] for key in original[-1]['signal_inputs']},
+                         original[-1]['signal_inputs'])
+        from backend.daily_policy import market_input_hash
+        original_data = deepcopy(self.data)
+        original_data['rows'][0]['learning_eligible'] = False
+        self.assertEqual(self.learner.daily.pending()['market_input_hash'], market_input_hash(original_data))
+
+    def test_same_day_new_symbol_waits_for_next_completed_day(self):
+        self.process()
+        original = self.learner.frames()
+        pending = self.learner.daily.pending()
+        new_row = {**deepcopy(self.data['rows'][0]), 'symbol': '000660', 'name': '새 종목'}
+        self.data['rows'].append(new_row)
+        self.data['histories']['000660'] = deepcopy(self.data['histories']['005930'])
+        self.process()
+        self.assertEqual(self.learner.frames(), original)
+        self.assertEqual(self.learner.daily.pending(), pending)
+        self.assertEqual(self.learner.daily.snapshot()['status'], 'prepared')
+        self.assertEqual(len(self.calls), 1)
+        self.data = raw_input(1)
+        self.data['rows'].append({**deepcopy(self.data['rows'][0]), 'symbol': '000660', 'name': '새 종목'})
+        self.data['histories']['000660'] = deepcopy(self.data['histories']['005930'])
+        self.now = datetime.fromisoformat(self.data['observed_at'])
+        self.context['initial_state']['as_of'] = self.data['as_of']
+        self.process()
+        self.assertEqual({row['symbol'] for row in self.calls[-1][1][-1]['rows']}, {'005930', '000660'})
+        self.assertEqual(self.learner.frames()[0], original[0])
+
+    def test_evaluator_retry_reuses_frozen_eligibility_without_reroll(self):
+        evaluator = self.learner.daily.evaluator
+        self.learner.daily.evaluator = Mock(side_effect=RuntimeError('temporary'))
+        with self.assertRaises(RuntimeError):
+            self.process()
+        original = self.learner.frames()
+        self.data['rows'][0]['learning_eligible'] = False
+        self.now += timedelta(minutes=3)
+        self.data['observed_at'] = self.now.isoformat()
+        self.learner.daily.evaluator = evaluator
+        self.process()
+        self.assertEqual(self.learner.frames(), original)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.learner.daily.snapshot()['status'], 'prepared')
+
+    def test_legacy_frame_retains_strict_eligibility_comparison(self):
+        self.process()
+        frozen = self.learner.frames()[0]
+        frozen.pop('signal_inputs')
+        with self.store.connect() as db:
+            db.execute('UPDATE learning_frames SET payload=? WHERE day=?',
+                       (encode(frozen), frozen['as_of']))
+        pending = self.learner.daily.pending()
+        self.data['rows'][0]['learning_eligible'] = False
+        self.process()
+        self.assertEqual(self.learner.frames(), [frozen])
+        self.assertEqual(self.learner.daily.pending(), pending)
+        self.assertEqual(self.learner.daily.snapshot()['status'], 'blocked')
+
+    def test_frozen_contract_does_not_relax_baseline_changes(self):
+        self.process()
+        original = self.learner.frames()
+        pending = self.learner.daily.pending()
+        self.learner.process(self.data, [{'symbol': '005930', 'action': 'hold'}],
+                             LIMITS, context=self.context)
+        self.assertEqual(self.learner.frames(), original)
+        self.assertEqual(self.learner.daily.pending(), pending)
+        self.assertEqual(self.learner.daily.snapshot()['status'], 'blocked')
+
+    def test_frozen_contract_does_not_relax_execution_quote_changes(self):
+        self.process()
+        original = self.learner.frames()
+        pending = self.learner.daily.pending()
+        self.context['execution_quotes'] = {'005930': {'price': '20000'}}
+        self.process()
+        self.assertEqual(self.learner.frames(), original)
+        self.assertEqual(self.learner.daily.pending(), pending)
         self.assertEqual(self.learner.daily.snapshot()['status'], 'blocked')
 
     def test_next_morning_reusing_previous_close_does_not_erase_prepared_plan(self):

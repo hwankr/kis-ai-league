@@ -415,6 +415,12 @@ class TimefolioBrowser:
         self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
         tables = [self._grid(self._table("cancel"), "unaccepted")]
         targets = self._table("w2o")
+        # New rows can stay collapsed while the grid still says all are open.
+        # Reapply expansion so their order-state evidence is collected too.
+        collapse = targets.get_by_role("button", name="모두 닫기", exact=True)
+        if collapse.count():
+            collapse.click()
+            self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
         expand = targets.get_by_role("button", name="모두 열기", exact=True)
         if expand.count():
             expand.click()

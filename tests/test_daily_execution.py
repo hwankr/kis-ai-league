@@ -37,10 +37,8 @@ class PreparedDaily:
     def policy(self):
         return deepcopy(self.current["policy"]) if self.current else self.fallback()
 
-    def note(self, status, error=None, *, fingerprint=None):
+    def note(self, status, error=None, *, fingerprint=None, decision_id=None, details=None):
         self.notes.append((status, error))
-        if status == "blocked":
-            self.proposal = None
 
     def prepare(self, pending, run):
         self.proposal = {**deepcopy(pending), "prepared_run": deepcopy(run)}
@@ -68,6 +66,7 @@ class DailyExecutionTests(unittest.TestCase):
         learning_fixtures.LearningIntegrationTests.setUp(self)
         self.real_daily = self.service.learning.daily
         self.daily = PreparedDaily(self.service.store, self.service.learning.champion)
+        self.daily.engine_version = self.real_daily.engine_version
         self.service.learning.daily = self.daily
         self.original = rules_policy()
         self.candidate = rules_policy(name="다음 장 후보", cash_reserve=.5)
@@ -225,7 +224,7 @@ class DailyExecutionTests(unittest.TestCase):
         self.enable()
         self.service._cycle()
         self.assertIsNone(self.daily.active())
-        self.assertIsNone(self.daily.pending())
+        self.assertIsNotNone(self.daily.pending())
         self.assertEqual(self.daily.state()["status"], "blocked")
         self.assertEqual(self.service.store.run_revision(), before)
         self.assertTrue(all(order.get("policy_id") == policy_id(self.original)
@@ -242,7 +241,7 @@ class DailyExecutionTests(unittest.TestCase):
         with patch.object(self.service, "input_reader", return_value=changed_day):
             self.assertFalse(self.service._activate_daily(self.current.date(), self.broker.days))
         self.assertEqual(self.daily.notes[-1][0], "blocked")
-        self.assertIsNone(self.daily.pending())
+        self.assertIsNotNone(self.daily.pending())
         self.assertEqual(self.daily.activations, [])
 
     def test_changed_engine_or_missed_next_session_keeps_active_policy(self):

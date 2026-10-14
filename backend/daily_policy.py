@@ -11,7 +11,7 @@ import json
 from backend.experiment_store import encode
 from backend.kis import KST
 from backend.learning_policy import build_frame, policy_id, validate_policy
-from backend.source_version import DAILY_SOURCES, source_version
+from backend.source_version import DAILY_SOURCES, LEARNING_SOURCES, source_version
 
 
 VERSION = 'daily-policy-v1'
@@ -39,12 +39,18 @@ class DailyPolicyService:
         self.fallback_policy, self.proposer, self.evaluator = fallback_policy, proposer, evaluator
         self.stopping = stopping or (lambda: False)
         self.engine_version = source_version(DAILY_SOURCES)
+        self.learning_engine_version = source_version(LEARNING_SOURCES)
         from backend.daily_comparison import ensure_tables
         ensure_tables(store)
         with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             db.execute('CREATE TABLE IF NOT EXISTS daily_policy_decisions '
                        '(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, day TEXT NOT NULL, '
                        'payload TEXT NOT NULL, UNIQUE(fingerprint,day))')
+            db.execute('CREATE TABLE IF NOT EXISTS daily_policy_preparations '
+                       '(decision_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, day TEXT NOT NULL, payload TEXT NOT NULL)')
+            for (payload,) in db.execute("SELECT value FROM settings WHERE key GLOB 'daily_policy:*'").fetchall():
+                self._archive_preparation(db, json.loads(payload).get('pending'))
 
     def _timestamp(self):
         return self.now().astimezone(timezone.utc).isoformat()
@@ -66,8 +72,19 @@ class DailyPolicyService:
 
     @staticmethod
     def _write(db, key, value):
-        db.execute('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+        db.execute('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value '
+                   'WHERE settings.value IS NOT excluded.value',
                    (key, encode(value)))
+
+    @staticmethod
+    def _archive_preparation(db, pending):
+        if not pending or not isinstance(pending.get('prepared_run'), dict):
+            return
+        if db.execute('SELECT 1 FROM daily_policy_preparations WHERE decision_id=?',
+                      (pending['decision_id'],)).fetchone():
+            return
+        db.execute('INSERT INTO daily_policy_preparations VALUES (?,?,?,?)',
+                   (pending['decision_id'], pending['fingerprint'], pending['signal_day'], encode(pending)))
 
     def active(self):
         return deepcopy(self.state().get('active')) if self.enabled else None
@@ -89,6 +106,15 @@ class DailyPolicyService:
     def snapshot(self):
         state = self.state()
         active, pending, decision = state.get('active'), state.get('pending'), state.get('last_decision')
+        status, error = state.get('status', 'waiting'), state.get('error')
+        if pending and status != 'blocked':
+            if pending.get('engine_version', self.engine_version) != self.engine_version:
+                status, error = 'blocked', '준비 정책의 심사 엔진 버전이 달라 적용을 보류합니다.'
+            else:
+                from backend.learning_compatibility import version_matches
+                run = pending.get('prepared_run')
+                if run is not None and not version_matches(run.get('learning_engine_version'), self.learning_engine_version):
+                    status, error = 'blocked', '준비 정책의 학습 엔진 버전이 달라 적용을 보류합니다.'
         def brief(value, *, waiting=False):
             if not value:
                 return None
@@ -100,11 +126,12 @@ class DailyPolicyService:
             metrics = decision.get('metrics')
             last = {key: decision.get(key) for key in ('as_of', 'decision', 'reason', 'candidate_name', 'change_family')}
             last['metrics'] = metrics if isinstance(metrics, dict) and 'champion' in metrics and 'candidate' in metrics else None
-        return {'enabled': self.enabled, 'status': state.get('status', 'waiting'),
+        return {'enabled': self.enabled, 'status': status,
                 'active': brief(active), 'pending': brief(pending, waiting=True),
-                'last_decision': last, 'error': state.get('error')}
+                'last_decision': last, 'error': error,
+                'activation_check': deepcopy(state.get('activation_check'))}
 
-    def note(self, status, error=None, *, fingerprint=None):
+    def note(self, status, error=None, *, fingerprint=None, decision_id=None, details=None):
         expected = fingerprint
         fingerprint = self._fingerprint()
         if not fingerprint or expected is not None and expected != fingerprint:
@@ -115,9 +142,21 @@ class DailyPolicyService:
                 return
             key = self._key(fingerprint)
             state = self._read(db, key, {})
+            pending = state.get('pending')
+            if decision_id is not None and (pending or {}).get('decision_id') != decision_id:
+                return
+            self._archive_preparation(db, pending)
+            # A read retry or an older research task cannot reopen a blocked plan.
+            if pending and state.get('status') == 'blocked' and status != 'blocked':
+                return
+            check = {key: deepcopy(value) for key, value in details.items() if key != 'checked_at'} if details is not None else None
+            previous_check = {key: value for key, value in (state.get('activation_check') or {}).items() if key != 'checked_at'}
+            if (state.get('status') == status and state.get('error') == error
+                    and (check is None or check == previous_check)):
+                return
             state.update(status=status, error=error)
-            if status == 'blocked':
-                state.pop('pending', None)
+            if check is not None:
+                state['activation_check'] = {**check, 'checked_at': self._timestamp()}
             self._write(db, key, state)
 
     def process(self, data, frames, limits, history, *, context, proposer, llm=None):
@@ -129,16 +168,26 @@ class DailyPolicyService:
         frozen_limits = {key: str(limits[key]) for key in LIMIT_KEYS}
         if not fingerprint or fingerprint != self._fingerprint():
             return
-        digest = market_input_hash(data)
+        from backend.daily_inputs import freeze_inputs, input_matches
         with self.store.connect() as db:
             row = db.execute('SELECT payload FROM daily_policy_decisions WHERE fingerprint=? AND day=?',
                              (fingerprint, day)).fetchone()
         prior = json.loads(row[0]) if row else None
-        if prior and prior['market_input_hash'] != digest:
+        if prior and not input_matches(prior, data):
             self.note('blocked', '같은 거래일의 평가 자료가 변경되어 새 정책 적용을 보류합니다.', fingerprint=fingerprint)
             return
         if prior and prior.get('decision') != 'error':
             return
+        # Never retrofit a legacy decision or refreeze an accepted response on retry.
+        signal_inputs = deepcopy(prior.get('signal_inputs')) if prior else freeze_inputs(data)
+        if prior is None:
+            baseline = next((frame.get('baseline_signals', []) for frame in reversed(frames)
+                             if str(frame.get('as_of')) == day), [])
+            if not isinstance(baseline, list):
+                raise ValueError('invalid_daily_baseline_signals')
+            signal_inputs['baseline_signals'] = deepcopy(baseline)
+            signal_inputs['baseline_hash'] = _hash(baseline)
+        digest = prior['market_input_hash'] if prior else signal_inputs['hash']
         book = (context or {}).get('initial_state')
         evaluation_context = deepcopy((context or {}).get('daily_evaluation'))
         current = self.now().astimezone(KST)
@@ -176,6 +225,8 @@ class DailyPolicyService:
                       'reason': '일일 개선 평가 재시도 대기', 'metrics': None,
                       'book_hash': _hash(book), 'basis': 'development_only',
                       'evaluation_context': evaluation_context}
+            if signal_inputs is not None:
+                record['signal_inputs'] = deepcopy(signal_inputs)
             seed = deepcopy(prior.get('comparison_seed')) if prior else None
             if prior is None:
                 seed = {'parent_policy': deepcopy(parent), 'candidate_policy': deepcopy(candidate),
@@ -206,6 +257,8 @@ class DailyPolicyService:
                        'fingerprint': fingerprint, 'limits': frozen_limits, 'market_input_hash': digest,
                        'engine_version': self.engine_version,
                        'prepared_at': None}
+            if signal_inputs is not None:
+                pending['signal_inputs'] = deepcopy(signal_inputs)
             if seed is not None:
                 pending['comparison_seed'] = deepcopy(seed)
             fallback_id = policy_id(self.fallback_policy())
@@ -220,7 +273,9 @@ class DailyPolicyService:
                     record.update(decision='blocked', reason='심사 중 계좌·한도·적용 정책이 변경됐습니다.')
                 latest.update(status='prepared' if record['decision'] == 'apply' else record['decision'],
                               last_decision=record, error=None)
+                latest.pop('activation_check', None)
                 # A new completed session supersedes yesterday's unactivated plan.
+                self._archive_preparation(db, latest.get('pending'))
                 latest.pop('pending', None)
                 if record['decision'] == 'apply':
                     latest['pending'] = pending
@@ -236,9 +291,10 @@ class DailyPolicyService:
         key = self._key(fingerprint)
         state = self._read(db, key, {})
         pending = state.get('pending')
-        if (not self.enabled or not pending or settings.get('fingerprint') != fingerprint
+        if (not self.enabled or not pending or state.get('status') == 'blocked'
+                or settings.get('fingerprint') != fingerprint
                 or any(pending.get(field) != supplied.get(field) for field in
-                       ('decision_id', 'candidate_id', 'parent_id', 'revision', 'signal_day', 'market_input_hash'))
+                       ('decision_id', 'candidate_id', 'parent_id', 'revision', 'signal_day', 'market_input_hash', 'signal_inputs'))
                 or state.get('revision', 0) != pending['revision']
                 or pending.get('engine_version', self.engine_version) != self.engine_version
                 or any(str(settings.get(field)) != pending['limits'][field] for field in LIMIT_KEYS)):
@@ -266,8 +322,10 @@ class DailyPolicyService:
                 existing = state['pending'].get('prepared_run')
                 if existing:
                     # First complete signal set is frozen, including after restart.
+                    self._archive_preparation(db, state['pending'])
                     return existing.get('id') == run.get('id')
                 state['pending'].update(prepared_run=deepcopy(run), prepared_at=self._timestamp())
+                self._archive_preparation(db, state['pending'])
                 self._write(db, key, state)
             return True
         except (KeyError, TypeError, ValueError):
@@ -298,6 +356,7 @@ class DailyPolicyService:
                         or policy_id(validate_policy(run['learning_policy'])) != stored['candidate_id']
                         or run['as_of'] != stored['signal_day']):
                     return False
+                self._archive_preparation(db, stored)
                 saved_run = deepcopy(run)
                 analysis = saved_run.get('analysis')
                 if isinstance(analysis, dict) and analysis.get('decisions') == saved_run.get('signals'):
@@ -310,6 +369,7 @@ class DailyPolicyService:
                           ('policy', 'candidate_id', 'signal_day', 'parent_id', 'fingerprint', 'limits', 'decision_id')}
                 active.update(adopted_at=self._timestamp(), effective_day=effective_day, run_id=run['id'], revision=revision)
                 state.update(active=active, revision=revision, status='active', error=None)
+                state.pop('activation_check', None)
                 state.pop('pending', None)
                 self._write(db, key, state)
                 db.execute('INSERT OR IGNORE INTO learning_policies VALUES (?,?)',

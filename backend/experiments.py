@@ -810,9 +810,9 @@ class ExperimentService:
 
     def _prepare_daily(self, data, baseline):
         """Freeze next-session signals without exposing an unactivated run."""
-        from backend.daily_policy import market_input_hash
+        from backend.daily_inputs import frame_for_pending, frozen_data, input_matches
         from backend.experiment_analysis import analysis_version, build_snapshot
-        from backend.learning_policy import build_frame, policy_id, signals
+        from backend.learning_policy import policy_id, signals
         if not self.learning.enabled or self._policy().get("execution_strategy") != ALL_STRATEGIES:
             return False
         pending = self.learning.daily.pending()
@@ -823,10 +823,12 @@ class ExperimentService:
         if (pending["signal_day"] != signal_day or signal_day > current.date().isoformat()
                 or signal_day == current.date().isoformat() and current.time() < daytime(16)
                 or signal_day < current.date().isoformat() and current.time() >= daytime(9)
-                or market_input_hash(data) != pending["market_input_hash"]):
+                or not input_matches(pending, data)):
             return False
-        frame = build_frame(data)
-        normalized = build_snapshot(**data)
+        frame = frame_for_pending(pending, data)
+        signal_inputs = pending.get("signal_inputs")
+        normalized = build_snapshot(**(frozen_data(signal_inputs, data) if signal_inputs is not None else data))
+        input_hash = hashlib.sha256(encode(normalized).encode()).hexdigest() if signal_inputs is not None else baseline["input_hash"]
         version = analysis_version(self.config_path)
         digestable = {key: value for key, value in normalized.items() if key != "observed_at"}
         digestable["analysis_version"] = version
@@ -836,13 +838,14 @@ class ExperimentService:
         key = (hashlib.sha256(encode([base_key, policy_id(candidate), self.learning.version,
             {key: value for key, value in frame.items() if key != "observed_at"}]).encode()).hexdigest()
                if learned else base_key)
-        decisions = [item for item in baseline["signals"] if not item.get("policy_id")]
+        decisions = deepcopy(signal_inputs["baseline_signals"]) if signal_inputs is not None else [
+            item for item in baseline["signals"] if not item.get("policy_id")]
         if learned:
             decisions += signals(candidate, frame)
-        analysis = {"decisions": decisions, "input_hash": baseline["input_hash"], "version_id": version,
+        analysis = {"decisions": decisions, "input_hash": input_hash, "version_id": version,
                     "llm_status": baseline.get("llm_status"), "input": normalized}
         run = {"id": uuid4().hex, "as_of": signal_day, "created_at": self._timestamp(),
-               "status": "ready", "input_hash": baseline["input_hash"], "version_id": version,
+               "status": "ready", "input_hash": input_hash, "version_id": version,
                "collection_hash": key, "signals": decisions, "error": baseline.get("error"),
                "llm_status": baseline.get("llm_status"), "analysis": analysis,
                "learning_policy": candidate, "learning_engine_version": self.learning.version,
@@ -851,7 +854,7 @@ class ExperimentService:
 
     def _activate_daily(self, today, days):
         """The broker's first traded bar confirms the day; signals predate its open."""
-        from backend.daily_policy import market_input_hash
+        from backend.daily_inputs import freeze_inputs, input_matches
         from backend.experiment_analysis import analysis_version
         from backend.learning_compatibility import version_matches
         if not self.learning.enabled or self._policy().get("execution_strategy") != ALL_STRATEGIES:
@@ -860,26 +863,52 @@ class ExperimentService:
         if not pending or not isinstance(pending.get("prepared_run"), dict):
             return False
         run = pending["prepared_run"]
+        def blocked(code, message, expected=None, actual=None):
+            self.learning.daily.note("blocked", message, fingerprint=pending["fingerprint"],
+                decision_id=pending["decision_id"], details={"code": code, "expected": expected, "actual": actual})
+            return False
         sessions = sorted(set(days))
         following = [day for day in sessions if day > pending["signal_day"]]
-        if (pending["signal_day"] not in sessions or not following or following[0] != today.isoformat()
-                or run["as_of"] != pending["signal_day"]
-                or stamp(run["created_at"]) >= datetime.combine(today, daytime(9), KST)
-                or run.get("version_id") != analysis_version(self.config_path)
-                or not version_matches(run.get("learning_engine_version"), self.learning.version)):
+        if pending["signal_day"] not in sessions or not following or today.isoformat() < following[0]:
             return False
+        if following[0] != today.isoformat():
+            return blocked("activation_session_expired", "준비 정책의 다음 거래일이 지나 적용을 보류합니다.",
+                           following[0], today.isoformat())
+        if run["as_of"] != pending["signal_day"]:
+            return blocked("signal_day_mismatch", "준비 신호의 거래일이 달라 적용을 보류합니다.",
+                           pending["signal_day"], run["as_of"])
+        if stamp(run["created_at"]) >= datetime.combine(today, daytime(9), KST):
+            return blocked("prepared_after_cutoff", "준비 신호가 09시 이후 생성되어 적용을 보류합니다.")
+        daily_version = self.learning.daily.engine_version
+        if pending.get("engine_version") != daily_version:
+            return blocked("daily_engine_mismatch", "준비 정책의 심사 엔진 버전이 달라 적용을 보류합니다.",
+                           pending.get("engine_version"), daily_version)
+        current_analysis = analysis_version(self.config_path)
+        if run.get("version_id") != current_analysis:
+            return blocked("analysis_version_mismatch", "준비 신호의 분석 버전이 달라 적용을 보류합니다.",
+                           run.get("version_id"), current_analysis)
+        if not version_matches(run.get("learning_engine_version"), self.learning.version):
+            return blocked("learning_engine_mismatch", "준비 정책의 학습 엔진 버전이 달라 적용을 보류합니다.",
+                           run.get("learning_engine_version"), self.learning.version)
         try:
             current = self.input_reader()
             unchanged = (str(current["as_of"]) == pending["signal_day"]
-                         and market_input_hash(current) == pending["market_input_hash"])
+                         and input_matches(pending, current))
         except Exception:
             self.learning.daily.note("error", "정책 적용 전 시장 자료를 확인하지 못했습니다. 기존 정책을 유지합니다.",
-                                     fingerprint=pending["fingerprint"])
+                                     fingerprint=pending["fingerprint"], decision_id=pending["decision_id"],
+                                     details={"code": "market_input_unavailable"})
             return False
         if not unchanged:
-            self.learning.daily.note("blocked", "준비한 정책의 시장 자료가 변경되어 적용을 보류합니다.",
-                                     fingerprint=pending["fingerprint"])
-            return False
+            actual = {"signal_day": str(current.get("as_of"))}
+            try:
+                observed = freeze_inputs(current)
+                actual.update(market_input_hash=observed["hash"], source_hash=observed["source_hash"])
+            except (KeyError, TypeError, ValueError):
+                actual["invalid_input"] = True
+            return blocked("market_input_changed", "준비한 정책의 시장 자료가 변경되어 적용을 보류합니다.",
+                           {"signal_day": pending["signal_day"], "market_input_hash": pending["market_input_hash"],
+                            "source_hash": (pending.get("signal_inputs") or {}).get("source_hash")}, actual)
         return self.learning.daily.activate(pending, effective_day=today.isoformat())
 
     def _learn(self, data, run):

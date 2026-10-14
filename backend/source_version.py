@@ -4,10 +4,10 @@ from pathlib import Path
 
 
 HASH_SCHEME = 'py-lf-v1'
-LEARNING_SOURCES = ('learning.py', 'learning_policy.py', 'learning_evaluation.py',
+LEARNING_SOURCES = ('learning.py', 'daily_inputs.py', 'research_rules.py', 'learning_policy.py', 'learning_evaluation.py',
                     'learning_account.py', 'learning_attribution.py', 'learning_history.py', 'portfolio_plan.py',
                     'daily_comparison.py', 'source_version.py')
-DAILY_SOURCES = ('daily_policy.py', 'daily_evaluation.py', 'learning_policy.py',
+DAILY_SOURCES = ('daily_policy.py', 'daily_inputs.py', 'research_rules.py', 'daily_evaluation.py', 'learning_policy.py',
                  'learning_evaluation.py', 'learning_research.py', 'learning_history.py',
                  'learning_account.py', 'portfolio_plan.py',
                  'daily_comparison.py', 'source_version.py')

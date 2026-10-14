@@ -862,6 +862,46 @@ class TimefolioGridDOMBrowserTests(unittest.TestCase):
             self.assertEqual([row["parent_symbol"] for row in tables if row["kind"] == "order_details"], symbols)
             self.assertEqual(len(tables), 9)
 
+    def test_receipt_tables_expand_new_order_rows_after_all_was_already_open(self):
+        self.page.set_content("""<button>가이드라인 위반</button>
+          <table><thead><tr><th id="prodId">종목</th><th id="cancel">취소</th></tr></thead></table>
+          <table id="targets"><thead><tr><th id="w2o">미체결</th><th>
+            <button id="expand" onclick="toggleAll()">모두 열기</button>
+          </th></tr></thead><tbody>
+            <tr data-has-detail data-symbol="006400"><td data-colid="prodId">A006400</td></tr>
+          </tbody></table>
+          <table><thead><tr><th id="genT">주문시각</th></tr></thead></table>
+          <script>
+          let expandAll=false;
+          function toggleAll() {
+            expandAll=!expandAll;
+            document.querySelector('#expand').textContent=expandAll?'모두 닫기':'모두 열기';
+            document.querySelectorAll('[data-detail]').forEach(row=>row.remove());
+            if(expandAll) requestAnimationFrame(()=>requestAnimationFrame(()=>{
+              document.querySelectorAll('[data-has-detail]').forEach(row=>
+                row.insertAdjacentHTML('afterend', '<tr data-detail><td colspan=2><table>'+
+                  '<thead><tr><th id="avgPx">평균가</th></tr></thead>'+
+                  '<tbody><tr><td>Done 29</td></tr></tbody></table></td></tr>'));
+            }));
+          }
+          </script>""")
+        adapter = TimefolioBrowser("unused-local-new-row-profile")
+        adapter.page = self.page
+        adapter._ui_query = Mock()
+        adapter._grid = Mock(side_effect=lambda table, kind, **kwargs: {"kind": kind, **kwargs})
+        tables = adapter._receipt_tables()
+        self.assertEqual([row['parent_symbol'] for row in tables if row['kind'] == 'order_details'],
+                         ['006400'])
+        self.assertEqual(self.page.locator('#expand').inner_text(), "모두 닫기")
+        # The site's expansion effect follows the toggle, not incoming rows.
+        self.page.evaluate("""() => document.querySelector('#targets tbody').insertAdjacentHTML('beforeend',
+          '<tr data-has-detail data-symbol="373220"><td data-colid="prodId">A373220</td></tr>')""")
+        self.assertEqual(self.page.locator('table:has(> thead th[id="avgPx"])').count(), 1)
+        for _ in range(2):
+            tables = adapter._receipt_tables()
+            self.assertEqual([row['parent_symbol'] for row in tables if row['kind'] == 'order_details'],
+                             ['006400', '373220'])
+
     def test_repeated_account_and_receipt_observations_remount_orders_and_refresh_full_period(self):
         html = """<button onclick="selectTab('guide')">가이드라인 위반</button>
           <button onclick="selectTab('orders')">주문 내역</button>

@@ -507,6 +507,7 @@ class LearningService:
         from backend.learning_benchmarks import refresh_market_comparison
         from backend.learning_history import enrich_selection
         from backend.daily_comparison import freeze_context, evaluation_context, update_followups
+        from backend.daily_inputs import freeze_inputs, frozen_data
         if not self.enabled or self.stopping:
             return
         current = self.now().astimezone(KST)
@@ -515,13 +516,25 @@ class LearningService:
         frame = build_frame(data, baseline_signals)
         frame['captured_at'] = self._timestamp()
         frame['execution_quotes'] = deepcopy((context or {}).get('execution_quotes', {}))
-        digest = _hash({key: value for key, value in frame.items() if key not in {'observed_at', 'captured_at'}})
         with self.store.connect() as db:
             prior = db.execute('SELECT payload FROM learning_frames WHERE day=?', (frame['as_of'],)).fetchone()
             if prior is None:
+                frame['signal_inputs'] = freeze_inputs(data)
+                digest = _hash({key: value for key, value in frame.items() if key not in {'observed_at', 'captured_at'}})
                 db.execute('INSERT INTO learning_frames VALUES (?,?,?)', (frame['as_of'], digest, encode(frame)))
         if prior:
             frozen = json.loads(prior[0])
+            if 'signal_inputs' in frozen:
+                try:
+                    data = frozen_data(frozen['signal_inputs'], data)
+                except (KeyError, TypeError, ValueError):
+                    self.daily.note('blocked', '같은 거래일의 관측 자료 변경 · 원본 유지',
+                                    fingerprint=limits.get('fingerprint'))
+                    return
+                frame = build_frame(data, baseline_signals)
+                frame.update(captured_at=self._timestamp(),
+                             execution_quotes=deepcopy((context or {}).get('execution_quotes', {})),
+                             signal_inputs=deepcopy(frozen['signal_inputs']))
             ignored = {'observed_at', 'captured_at', 'benchmark_prices'}
             comparable = enrich_selection(frozen, frame)
             if ({key: value for key, value in comparable.items() if key not in ignored}
@@ -531,6 +544,12 @@ class LearningService:
                 self.daily.note('blocked', '같은 거래일의 관측 자료 변경 · 원본 유지',
                                 fingerprint=limits.get('fingerprint'))
                 return
+            if 'signal_inputs' in frozen:
+                # Research and policy preparation keep the first complete cohort,
+                # even when current eligibility or the observed universe expands.
+                frame = deepcopy(frozen)
+        else:
+            data = frozen_data(frame['signal_inputs'], data)
         frames = self.frames()
         if not frames or frames[-1]['as_of'] != frame['as_of']:
             return
