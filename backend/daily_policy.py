@@ -6,6 +6,7 @@ their policy pointer; frozen long-horizon trials are not rewritten here.
 from copy import deepcopy
 from datetime import date, datetime, time, timezone
 import hashlib
+import inspect
 import json
 
 from backend.experiment_store import encode
@@ -31,6 +32,16 @@ def _stamp(value):
     if result.utcoffset() is None:
         raise ValueError('daily_timestamp_requires_timezone')
     return result
+
+
+def _accepts_keyword(function, name):
+    """Keep explicit legacy test callbacks usable; production accepts the contract."""
+    try:
+        parameters = inspect.signature(function).parameters
+        return (name in parameters and parameters[name].kind != inspect.Parameter.POSITIONAL_ONLY
+                or any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()))
+    except (TypeError, ValueError):
+        return False
 
 
 class DailyPolicyService:
@@ -96,10 +107,17 @@ class DailyPolicyService:
         active = self.active()
         return deepcopy(active['policy']) if active else self.fallback_policy()
 
-    def history(self):
-        fingerprint = self._fingerprint()
+    def get_decision(self, decision_id):
+        """Read the authoritative full request; settings contain only its summary."""
         with self.store.connect() as db:
-            rows = db.execute('SELECT payload FROM daily_policy_decisions WHERE fingerprint=? '
+            row = db.execute('SELECT payload FROM daily_policy_decisions WHERE id=?', (decision_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def history(self, *, include_inputs=True):
+        fingerprint = self._fingerprint()
+        projection = 'payload' if include_inputs else "json_remove(payload, '$.research_inputs', '$.signal_inputs', '$.award_context')"
+        with self.store.connect() as db:
+            rows = db.execute(f'SELECT {projection} FROM daily_policy_decisions WHERE fingerprint=? '
                               'ORDER BY day DESC LIMIT 30', (fingerprint,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
@@ -115,6 +133,13 @@ class DailyPolicyService:
                 run = pending.get('prepared_run')
                 if run is not None and not version_matches(run.get('learning_engine_version'), self.learning_engine_version):
                     status, error = 'blocked', '준비 정책의 학습 엔진 버전이 달라 적용을 보류합니다.'
+                elif 'award_context' in pending:
+                    from backend.daily_inputs import validate_award_context
+                    context = pending.get('award_context')
+                    if (not validate_award_context(context) or context['hash'] != pending.get('award_context_hash')
+                            or run is not None and any(run.get(key) != pending.get(key)
+                                for key in ('award_context_hash', 'research_request_hash'))):
+                        status, error = 'blocked', '동결한 정책 선정 입력이 달라 적용을 보류합니다.'
         def brief(value, *, waiting=False):
             if not value:
                 return None
@@ -168,7 +193,8 @@ class DailyPolicyService:
         frozen_limits = {key: str(limits[key]) for key in LIMIT_KEYS}
         if not fingerprint or fingerprint != self._fingerprint():
             return
-        from backend.daily_inputs import freeze_inputs, input_matches
+        from backend.daily_inputs import (freeze_inputs, input_matches, freeze_award_context,
+                                         freeze_research_inputs, validate_research_inputs)
         with self.store.connect() as db:
             row = db.execute('SELECT payload FROM daily_policy_decisions WHERE fingerprint=? AND day=?',
                              (fingerprint, day)).fetchone()
@@ -207,32 +233,79 @@ class DailyPolicyService:
         if prior and prior.get('parent_id') != parent_id:
             self.note('blocked', '당일 심사 후 적용 정책이 변경됐습니다.', fingerprint=fingerprint)
             return
+        research_inputs = deepcopy(prior.get('research_inputs')) if prior else None
+        award_context = deepcopy(prior.get('award_context')) if prior else None
+        if prior is None:
+            latest_frame = deepcopy(frames[-1]) if frames else {}
+            if (latest_frame.get('as_of') != day
+                    or any(latest_frame.get(key) != value for key, value in signal_inputs['frame'].items()
+                           if key != 'baseline_signals')):
+                self.note('blocked', '최신 연구 프레임과 신호일 자료가 달라 심사를 보류합니다.', fingerprint=fingerprint)
+                return
+            observed_at = (context or {}).get('observed_at') or self._timestamp()
+            if _stamp(observed_at) > self.now():
+                self.note('blocked', '계좌 관측 시각이 현재보다 늦어 심사를 보류합니다.', fingerprint=fingerprint)
+                return
+            award_context = freeze_award_context(signal_day=day, observed_at=observed_at,
+                latest_frame=latest_frame, initial_state=book,
+                execution_model=(context or {}).get('execution_model') or {'mode': 'daily_open'},
+                competition_context=(context or {}).get('competition_context'), limits=frozen_limits)
+            research_inputs = freeze_research_inputs(parent, frames, frozen_limits, history, award_context)
+        elif 'research_inputs' in prior or 'award_context' in prior:
+            if (not validate_research_inputs(research_inputs)
+                    or research_inputs['award_context'] != award_context
+                    or prior.get('research_request_hash') != research_inputs['hash']
+                    or prior.get('award_context_hash') != award_context['hash']):
+                self.note('blocked', '동결한 정책 선정 입력을 확인할 수 없습니다.', fingerprint=fingerprint)
+                return
+        if research_inputs is not None:
+            # A changed history or fresh book must not silently alter a retry.
+            parent, frames, history = (deepcopy(research_inputs[key]) for key in ('champion', 'frames', 'history'))
+            book = deepcopy(award_context['initial_state'])
         decision_id = _hash([VERSION, fingerprint, day])
         self.note('researching', fingerprint=fingerprint)
         proposal = prior.get('proposal') if prior else None
         try:
-            if proposal is None:
-                proposal = proposer(parent, frames, frozen_limits, history, llm=llm)
-            candidate = validate_policy(proposal['policy'])
-            # Persist an accepted model response before any further computation.
             record = {'id': decision_id, 'version': VERSION, 'engine_version': self.engine_version,
                       'fingerprint': fingerprint, 'as_of': day,
                       'created_at': prior['created_at'] if prior else self._timestamp(),
                       'parent_id': parent_id, 'revision': revision, 'market_input_hash': digest,
                       'research_input_hash': _hash(frames), 'limits': frozen_limits,
-                      'proposal': deepcopy(proposal), 'candidate_name': candidate['name'],
-                      'change_family': proposal.get('change_family'), 'decision': 'error',
+                      'proposal': deepcopy(proposal), 'candidate_name': None,
+                      'change_family': None, 'decision': 'error',
                       'reason': '일일 개선 평가 재시도 대기', 'metrics': None,
                       'book_hash': _hash(book), 'basis': 'development_only',
                       'evaluation_context': evaluation_context}
             if signal_inputs is not None:
                 record['signal_inputs'] = deepcopy(signal_inputs)
+            if research_inputs is not None:
+                record.update(research_inputs=deepcopy(research_inputs),
+                              research_request_hash=research_inputs['hash'],
+                              award_context=deepcopy(award_context), award_context_hash=award_context['hash'])
+            # Keep the entire request before a provider call, including failed calls.
+            with self.store.connect() as db:
+                db.execute('INSERT INTO daily_policy_decisions VALUES (?,?,?,?) '
+                           'ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
+                           (decision_id, fingerprint, day, encode(record)))
+            if proposal is None:
+                options = {'award_context': deepcopy(award_context)} if (
+                    award_context is not None and _accepts_keyword(proposer, 'award_context')) else {}
+                if research_inputs is not None and _accepts_keyword(proposer, 'research_identity'):
+                    options['research_identity'] = {'decision_id': decision_id, 'fingerprint': fingerprint,
+                                                    'engine_version': self.engine_version}
+                proposal = proposer(deepcopy(parent), deepcopy(frames), deepcopy(frozen_limits),
+                                    deepcopy(history), llm=llm, **options)
+            candidate = validate_policy(proposal['policy'])
+            record.update(proposal=deepcopy(proposal), candidate_name=candidate['name'],
+                          change_family=proposal.get('change_family'))
             seed = deepcopy(prior.get('comparison_seed')) if prior else None
-            if prior is None:
+            if prior is None or research_inputs is not None and seed is None:
                 seed = {'parent_policy': deepcopy(parent), 'candidate_policy': deepcopy(candidate),
                         'initial_state': deepcopy(book),
-                        'execution_model': deepcopy((context or {}).get('execution_model') or {'mode': 'daily_open'}),
-                        'observed_at': self._timestamp(), 'limits': deepcopy(frozen_limits), 'signal_day': day}
+                        'execution_model': deepcopy(award_context['execution_model'] if award_context is not None
+                            else (context or {}).get('execution_model') or {'mode': 'daily_open'}),
+                        'observed_at': award_context['observed_at'] if award_context is not None else self._timestamp(),
+                        'limits': deepcopy(frozen_limits), 'signal_day': day}
             if seed is not None:
                 record['comparison_seed'] = seed
             with self.store.connect() as db:
@@ -240,8 +313,9 @@ class DailyPolicyService:
                            'ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
                            (decision_id, fingerprint, day, encode(record)))
             from backend.daily_evaluation import select_daily_candidate
+            options = {'award_context': deepcopy(award_context)} if award_context is not None else {}
             proposal, result = select_daily_candidate(parent, proposal, frames, frozen_limits,
-                evaluator=self.evaluator, evaluation_context=evaluation_context)
+                evaluator=self.evaluator, evaluation_context=evaluation_context, **options)
             candidate = validate_policy(proposal['policy'])
             if self.stopping():
                 return
@@ -259,6 +333,9 @@ class DailyPolicyService:
                        'prepared_at': None}
             if signal_inputs is not None:
                 pending['signal_inputs'] = deepcopy(signal_inputs)
+            if award_context is not None:
+                pending.update(award_context=deepcopy(award_context), award_context_hash=award_context['hash'],
+                               research_request_hash=research_inputs['hash'])
             if seed is not None:
                 pending['comparison_seed'] = deepcopy(seed)
             fallback_id = policy_id(self.fallback_policy())
@@ -271,8 +348,11 @@ class DailyPolicyService:
                 if (settings.get('fingerprint') != fingerprint or latest.get('revision', 0) != revision
                         or latest_id != parent_id or any(str(settings.get(key)) != frozen_limits[key] for key in LIMIT_KEYS)):
                     record.update(decision='blocked', reason='심사 중 계좌·한도·적용 정책이 변경됐습니다.')
+                summary = {name: deepcopy(record.get(name)) for name in
+                    ('id', 'as_of', 'decision', 'reason', 'candidate_name', 'change_family', 'metrics',
+                     'created_at', 'evaluated_at', 'research_request_hash', 'award_context_hash')}
                 latest.update(status='prepared' if record['decision'] == 'apply' else record['decision'],
-                              last_decision=record, error=None)
+                              last_decision=summary, error=None)
                 latest.pop('activation_check', None)
                 # A new completed session supersedes yesterday's unactivated plan.
                 self._archive_preparation(db, latest.get('pending'))
@@ -294,21 +374,77 @@ class DailyPolicyService:
         if (not self.enabled or not pending or state.get('status') == 'blocked'
                 or settings.get('fingerprint') != fingerprint
                 or any(pending.get(field) != supplied.get(field) for field in
-                       ('decision_id', 'candidate_id', 'parent_id', 'revision', 'signal_day', 'market_input_hash', 'signal_inputs'))
+                       ('decision_id', 'candidate_id', 'parent_id', 'revision', 'signal_day', 'market_input_hash',
+                        'signal_inputs', 'award_context', 'award_context_hash', 'research_request_hash'))
                 or state.get('revision', 0) != pending['revision']
                 or pending.get('engine_version', self.engine_version) != self.engine_version
                 or any(str(settings.get(field)) != pending['limits'][field] for field in LIMIT_KEYS)):
+            return None, key
+        if not self._award_inputs_match(db, pending):
+            check = {'code': 'award_inputs_mismatch', 'expected': 'frozen_decision_and_preparation',
+                     'actual': pending.get('award_context_hash')}
+            previous = {name: value for name, value in (state.get('activation_check') or {}).items()
+                        if name != 'checked_at'}
+            if state.get('status') != 'blocked' or previous != check:
+                state.update(status='blocked', error='동결한 정책 선정 입력이 달라 적용을 보류합니다.',
+                             activation_check={**check, 'checked_at': self._timestamp()})
+                self._write(db, key, state)
             return None, key
         active_id = (state.get('active') or {}).get('candidate_id')
         if active_id is not None and active_id != pending['parent_id']:
             return None, key
         return state, key
 
+    @staticmethod
+    def _award_inputs_match(db, pending):
+        """New contracts agree with the immutable request and first preparation."""
+        from backend.daily_inputs import validate_research_inputs, pending_entry_selection, validate_entry_selection
+        row = db.execute('SELECT payload FROM daily_policy_decisions WHERE id=?',
+                         (pending['decision_id'],)).fetchone()
+        record = json.loads(row[0]) if row else {}
+        keys = ('award_context', 'award_context_hash', 'research_request_hash')
+        if not any(key in value for value in (pending, record) for key in (*keys, 'research_inputs')):
+            return not pending['policy'].get('held_before_top_n', False)
+        request = record.get('research_inputs')
+        try:
+            context = request['award_context']
+            if (not validate_research_inputs(request)
+                    or any(pending.get(key) != record.get(key) for key in keys)
+                    or pending['award_context'] != context or pending['award_context_hash'] != context['hash']
+                    or pending['research_request_hash'] != request['hash']
+                    or context['signal_day'] != pending['signal_day'] or context['limits'] != pending['limits']
+                    or policy_id(request['champion']) != pending['parent_id']
+                    or record['research_input_hash'] != _hash(request['frames'])
+                    or record['book_hash'] != _hash(context['initial_state'])
+                    or _stamp(context['observed_at']) > _stamp(record['created_at'])):
+                return False
+            seed = pending.get('comparison_seed') or {}
+            if (seed != record.get('comparison_seed')
+                    or any(seed.get(key) != context[key] for key in ('initial_state', 'execution_model', 'observed_at'))
+                    or seed.get('parent_policy') != request['champion']
+                    or seed.get('candidate_policy') != pending['policy']):
+                return False
+            run = pending.get('prepared_run')
+            if run is not None and not validate_entry_selection(run, pending['policy'],
+                    expected=pending_entry_selection(pending), frame=pending['signal_inputs']['frame']):
+                return False
+            if run is not None and any(run.get(key) != pending[key] for key in keys[1:]):
+                return False
+            archived = db.execute('SELECT payload FROM daily_policy_preparations WHERE decision_id=?',
+                                  (pending['decision_id'],)).fetchone()
+            return archived is None or json.loads(archived[0]) == pending
+        except (KeyError, TypeError, ValueError):
+            return False
+
     def prepare(self, pending, run):
         """Stage signals without exposing them as the latest executable run."""
         if not self.enabled or self.stopping():
             return False
         try:
+            from backend.daily_inputs import pending_entry_selection, validate_entry_selection
+            if not validate_entry_selection(run, pending['policy'], expected=pending_entry_selection(pending),
+                    frame=(pending.get('signal_inputs') or {}).get('frame')):
+                return False
             if (policy_id(validate_policy(run['learning_policy'])) != pending['candidate_id']
                     or run['as_of'] != pending['signal_day'] or run.get('status') != 'ready'
                     or _stamp(run['created_at']) > self.now()):
@@ -324,7 +460,13 @@ class DailyPolicyService:
                     # First complete signal set is frozen, including after restart.
                     self._archive_preparation(db, state['pending'])
                     return existing.get('id') == run.get('id')
-                state['pending'].update(prepared_run=deepcopy(run), prepared_at=self._timestamp())
+                saved_run = deepcopy(run)
+                for field in ('award_context_hash', 'research_request_hash'):
+                    if field in state['pending']:
+                        if field in saved_run and saved_run[field] != state['pending'][field]:
+                            return False
+                        saved_run[field] = state['pending'][field]
+                state['pending'].update(prepared_run=saved_run, prepared_at=self._timestamp())
                 self._archive_preparation(db, state['pending'])
                 self._write(db, key, state)
             return True

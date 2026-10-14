@@ -7,6 +7,7 @@ from copy import deepcopy
 import hashlib
 import json
 import math
+import re
 
 from backend.learning_policy import BASELINE_POLICY, policy_id, portfolio_metrics, validate_policy
 from backend.learning_attribution import VERSION as ATTRIBUTION_VERSION, CONTRASTS, EFFECTS
@@ -66,9 +67,35 @@ within the same signal quality, costs, account limits and risk protection. Gross
 amount means executed buy plus sell notionals, excluding fees and unexecuted
 liquidation marks. Do not shorten holding periods solely to create turnover,
 relax signal quality, repeat meaningless trades or treat turnover as profit.
-Trading activity is a feasibility diagnostic, never an optimization reward or
-evidence that future contest requirements will be met. Missing or stale progress
-is unknown, never zero. The normal and stressed net-return adoption gates remain.
+Trading activity is a qualification constraint, not profit or a reward beyond
+the target. Joint qualification and final NAV at least the original capital come
+before relative development return. Core normal/cost scenarios require all
+qualification conditions; execution-reserve paths also retain the capital floor
+and risk cap but report turnover shortfalls separately. Relative return is an
+opportunity-cost diagnostic, not a zero-sacrifice veto of qualifying policies.
+No qualifying or supported progress plan means keep, not a return-only fallback.
+A scenario pass rate is not a win probability. Missing
+or stale progress is unknown, never zero. transition_context describes the
+CURRENT frozen holdings: never insert it into older historical evaluations.
+Compare slots and distinct eligible signals after the original lots' exits;
+max_positions includes existing holdings, and a partial exit frees no slot.
+Do not call a zero-entry policy risk-reducing unless actual future exposure is
+reduced and comparable risk evidence supports it. Existing lot exits and global
+limits are unchanged. KIS and Timefolio have separate ledgers, fees and targets;
+Timefolio mirror restrictions are not a KIS position-count limit.
+The generator separately supplies predeclared allocation/holding 2x2 controls.
+The LLM must still propose one change family; it cannot authorize an arbitrary
+compound change. Capacity experiments preserve signal tests, weights, reserves,
+stops, takes and global limits. Shorter future holding periods must pass costs
+and joint capital/qualification checks; historical packet controls may repeat.
+For a rules incumbent with a reliable current-book contest context, a separate
+deterministic packet fixes four signal templates and future holding ages 1/2/4,
+plus the incumbent and common capacity/age controls, before any candidate score.
+It is not a full factorial. Your proposal remains a separate LLM observation;
+it cannot replace a template, omit a control or claim to have generated that bank.
+held_before_top_n and no_same_day_reentry are optional rule-policy booleans.
+Preserve supplied values; absent means false. They change entry allocation and
+same-session reentry respectively, never the continuation test of an owned lot.
 """
 
 
@@ -99,6 +126,7 @@ POLICY_SCHEMA = _object({
         "max_holding_sessions": _numeric(1, 20, "integer")})},
     "allocation_mode": {"type": "string", "enum": ["legacy", "equal_eligible", "score_rank"]},
     "candidate_scope": {"type": "string", "enum": ["unrestricted", "liquid_top20", "liquid_all"]},
+    "held_before_top_n": {"type": "boolean"}, "no_same_day_reentry": {"type": "boolean"},
     "cash_reserve": _numeric(0, .9), "max_positions": _numeric(1, 20, "integer"),
     "entry_slippage_bps": _numeric(0, 200), "cancel_after_minutes": _numeric(5, 60, "integer")})
 
@@ -130,8 +158,12 @@ def public_competition_context(value):
                 result["period"][key] = raw
         except ValueError:
             pass
-    result["reliable"] = (result["status"] == "ok" and value.get("stale") is False
-                          and value.get("coverage") == "complete" and len(result["period"]) == 3)
+    already_public = value.get("basis") == "whole_account_broker_fills"
+    result["reliable"] = (result["status"] == "ok" and len(result["period"]) == 3 and
+                          (value.get("reliable") is True if already_public else
+                           value.get("stale") is False and value.get("coverage") == "complete"))
+    if value.get("contest") not in (None, "kis_ai_2026"):
+        result.update(status="unavailable", reliable=False)
     pace = value.get("pace") if isinstance(value.get("pace"), dict) else {}
     result["pace"] = {"calendar_basis": "weekday_estimate", "status": pace.get("status") if pace.get("status") in
                       {"not_started", "unavailable", "met", "behind", "on_track", "ended_shortfall"} else "unavailable"}
@@ -150,6 +182,17 @@ def public_competition_context(value):
         for key in list(result["pace"]):
             if key.endswith("amount"):
                 result["pace"][key] = None
+    # Distinct contest requirements must not be reduced to the turnover total.
+    # This is an allowlist: no account identity, broker payload or order IDs.
+    metrics = value.get("metrics") if isinstance(value.get("metrics"), dict) else {}
+    result["metrics"] = {}
+    for key, target in (("trading_days", 5), ("symbols", 5), ("api_orders", 5)):
+        raw = metrics.get(key)
+        raw = raw.get("value") if isinstance(raw, dict) else None
+        number = _number(raw)
+        count = int(number) if number is not None and number >= 0 and number.is_integer() else None
+        result["metrics"][key] = {"value": count if result["reliable"] else None, "target": target}
+    result["contest"] = "kis_ai_2026"
     return result
 
 
@@ -179,11 +222,47 @@ def _pace_allocation_candidates(parent):
         yield candidate
 
 
+def _public_transition_context(value):
+    """Account aggregates for hypotheses, never permission to place an order."""
+    if not isinstance(value, dict):
+        return None
+    book = value.get("initial_state")
+    if not isinstance(book, dict) or not isinstance(book.get("positions"), list):
+        return {"status": "unavailable"}
+    positions = book["positions"]
+    protection = book.get("account_protection") or {}
+    return {"status": "observed", "signal_day": value.get("signal_day"),
+            "held_symbols": len({item.get("symbol") for item in positions}),
+            "cash": _number(book.get("cash")), "equity": _number(book.get("equity")),
+            "pending_orders": book.get("pending_orders"), "unresolved_orders": book.get("unresolved_orders"),
+            "protection_active": protection.get("active"),
+            "existing_exit_rules_preserved": True,
+            "existing_holding_ages": sorted(item["held_sessions"] for item in positions
+                                            if type(item.get("held_sessions")) is int),
+            "basis": "current_frozen_book_not_historical_start"}
+
+
+def _transition_allocation_candidates(base, held_symbols):
+    """Compare capacity without changing signals, exits or global money limits."""
+    for expanded in (False, True):
+        candidate = deepcopy(base)
+        candidate["name"] = "현재 보유·수상요건 배분 비교"
+        candidate["allocation_mode"] = "equal_eligible"
+        wanted = min(20, sum(item["top_n"] for item in candidate["strategies"]))
+        candidate["max_positions"] = min(20, max(candidate["max_positions"], held_symbols + wanted))
+        if expanded:
+            candidate["max_positions"] = 20
+            for strategy in candidate["strategies"]:
+                strategy["top_n"] = min(20, max(8, strategy["top_n"] * 2))
+        yield candidate
+
+
 def _behavior_id(policy):
     """Names and identifiers cannot disguise a previously tested behavior."""
     value = deepcopy(policy)
     value.pop("name", None)
-    for key, default in (("allocation_mode", "legacy"), ("candidate_scope", "unrestricted")):
+    for key, default in (("allocation_mode", "legacy"), ("candidate_scope", "unrestricted"),
+                         ("held_before_top_n", False), ("no_same_day_reentry", False)):
         if value.get(key, default) == default:
             value.pop(key, None)
     for strategy in value.get("strategies", []):
@@ -357,7 +436,9 @@ def _policy_changes(parent, policy):
             changes.append({"path": prefix + key, "before": deepcopy(before[key]), "after": deepcopy(after[key])})
 
     for key, family, default in (("allocation_mode", "allocation", "legacy"),
-                                  ("candidate_scope", "conditions", "unrestricted")):
+                                  ("candidate_scope", "conditions", "unrestricted"),
+                                  ("held_before_top_n", "allocation", False),
+                                  ("no_same_day_reentry", "execution", False)):
         compare({key: parent.get(key, default)}, {key: policy.get(key, default)}, key, family)
 
     for key, family in (("cash_reserve", "allocation"), ("max_positions", "allocation"),
@@ -379,6 +460,7 @@ def _policy_changes(parent, policy):
 
 def _hypothesis(family, attribution, execution_hint):
     changes = {"bootstrap": "기존 고정 전략에서 규칙 전략을 신설해 비교합니다.",
+               "capacity": "배분·신규 보유기간의 단독 대조군과 결합 효과를 같은 자료에서 비교합니다.",
                "conditions": "진입 조건만 바꿔 신호 선택의 차이를 검증합니다.",
                "ranking": "종목 순위만 바꿔 선택 결과의 차이를 검증합니다.",
                "allocation": "비중·보유 한도만 바꿔 자본 배분의 차이를 검증합니다.",
@@ -396,7 +478,7 @@ def _hypothesis(family, attribution, execution_hint):
 
 
 def _hypothesis_test(family, attribution, history):
-    metric = {"bootstrap": "D11", "conditions": "D00", "ranking": "D00", "exit": "D00",
+    metric = {"bootstrap": "D11", "capacity": "controlled_capacity_interaction", "conditions": "D00", "ranking": "D00", "exit": "D00",
               "allocation": "capital_observed", "execution": "execution_inherited"}[family]
     if family == "conditions" and attribution is not None and attribution["stage"] == "execution":
         metric = "execution_inherited"
@@ -569,6 +651,7 @@ def _public_policy(policy):
 
 def _public_feedback(history):
     result = []
+    detailed_award_sent = False
     for item in history[:12]:
         if not isinstance(item, dict):
             continue
@@ -589,6 +672,15 @@ def _public_feedback(history):
             # label it as the final daily comparison or a prospective result.
             entry["development"] = {**entry.pop("metrics"), "basis": "development_only"}
             entry["daily_evaluation"] = _public_daily_evaluation(item["daily_evaluation"])
+            award = (entry["daily_evaluation"].get("metrics") or {}).get("award_selection")
+            if isinstance(award, dict):
+                # The latest trial carries every bounded path. Older trials
+                # keep per-condition deficits without multiplying raw paths
+                # by twelve in each provider request.
+                if detailed_award_sent:
+                    for outcome in award.get("outcomes", []):
+                        outcome.pop("scenarios", None)
+                detailed_award_sent = True
             activation = item.get("activation") if isinstance(item.get("activation"), dict) else {}
             entry["activation"] = {"status": activation.get("status") if activation.get("status") in
                 {"pending", "prepared", "activated", "not_activated", "unknown"} else "unknown"}
@@ -606,8 +698,13 @@ def _public_feedback(history):
         attribution = _attribution(item.get("attribution"))
         if attribution is not None:
             entry["attribution"] = attribution
-        if item.get("change_family") in {*FAMILIES, "bootstrap"}:
+        if item.get("change_family") in {*FAMILIES, "bootstrap", "capacity"}:
             entry["change_family"] = item["change_family"]
+        source = item.get('proposal_source')
+        if isinstance(source, dict) and source.get('source') == 'deterministic_signal_hold_packet':
+            entry['proposal_source'] = {key: deepcopy(source[key]) for key in
+                ('source', 'template_version', 'frame_input_hash', 'summary_hash', 'packet_hash', 'threshold_basis',
+                 'roles', 'template_families', 'control_roles', 'llm_generated') if key in source}
         result.append(entry)
     return result
 
@@ -649,6 +746,52 @@ def _public_forward_comparison(value):
     return summary
 
 
+def _public_award_outcome(item):
+    """Keep the failed requirement, not just an ambiguous combined deficit."""
+    qualification = item.get("qualification") or {}
+    result = {"promotion_reason": item.get("promotion_reason"), "eligible": item.get("eligible"),
+              "transition_class": item.get("transition_class"),
+              "entry_count": (item.get("transition") or {}).get("entry_count"),
+              "zero_entry_reason": (item.get("transition") or {}).get("zero_entry_reason"),
+              "qualification_status": qualification.get("status"),
+              "worst_shortfall": _number(qualification.get("worst_shortfall"))}
+    identity = item.get("candidate_id")
+    if isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity):
+        result["candidate_id"] = identity
+    result["coverage"] = {key: qualification[key] for key in
+        ("scenario_count", "evaluated_scenarios", "qualifying_scenarios")
+        if type(qualification.get(key)) is int and qualification[key] >= 0}
+    result["scenarios"] = []
+    for path in qualification.get("scenarios", [])[:24]:
+        if not isinstance(path, dict):
+            continue
+        keys = ("gross_amount", "trading_days", "symbols", "api_orders", "final_equity")
+        clean = {"values": {key: _number((path.get("values") or {}).get(key)) for key in keys},
+                 "checks": {key: (path.get("checks") or {}).get(key)
+                            if type((path.get("checks") or {}).get(key)) is bool else None for key in keys},
+                 "joint_met": path.get("joint_met") if type(path.get("joint_met")) is bool else None,
+                 "shortfall": _number(path.get("shortfall"))}
+        if isinstance(path.get("id"), str) and re.fullmatch(r"[a-z0-9_:.-]{1,120}", path["id"]):
+            clean["id"] = path["id"]
+        for field in ("deficits", "normalized_deficits"):
+            if isinstance(path.get(field), dict):
+                clean[field] = {key: _number(path[field].get(key)) for key in keys}
+        if isinstance(path.get("execution_diagnostics"), dict):
+            clean["execution_diagnostics"] = {key: _number(path["execution_diagnostics"].get(key)) for key in
+                ("buy_attempts", "sell_attempts", "partial_orders", "unfilled_orders", "limit_blocked",
+                 "untradeable_bars", "ineligible_quotes", "fees_paid", "taxes_paid", "slippage_bps", "final_holding_count")}
+        result["scenarios"].append(clean)
+    result["requirements"] = {}
+    for key in ("gross_amount", "trading_days", "symbols", "api_orders", "final_equity"):
+        observed = [path["values"][key] for path in result["scenarios"] if path["values"][key] is not None]
+        checks = [path["checks"][key] for path in result["scenarios"]]
+        result["requirements"][key] = {"minimum": min(observed) if observed else None,
+            "maximum": max(observed) if observed else None,
+            "failed_paths": sum(check is False for check in checks),
+            "unknown_paths": sum(check is None for check in checks)}
+    return result
+
+
 def _public_daily_evaluation(value):
     """Only comparison facts leave the store; no account or raw input metadata."""
     result = {"basis": "development_only", "decision": value.get("decision") if value.get("decision") in
@@ -680,6 +823,12 @@ def _public_daily_evaluation(value):
         summary["selection"] = {"basis": "reused_development_data", "prospective": False,
             **{key: selection[key] for key in ("candidates_evaluated", "eligible_candidates")
                if type(selection.get(key)) is int and selection[key] >= 0}}
+    award = metrics.get("award_selection")
+    if isinstance(award, dict):
+        summary["award_selection"] = {key: deepcopy(award.get(key)) for key in
+            ("version", "contest_id", "status", "reason", "return_tolerance_pp", "selected_qualification")}
+        summary["award_selection"]["outcomes"] = [_public_award_outcome(item)
+            for item in award.get("outcomes", [])[:MAX_CANDIDATES] if isinstance(item, dict)]
     if type(metrics.get("loss_reduction_only")) is bool:
         summary["loss_reduction_only"] = metrics["loss_reduction_only"]
     for key in ("champion", "candidate", "delta"):
@@ -695,7 +844,8 @@ def _public_daily_evaluation(value):
     return result
 
 
-def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_proposal=None, competition_context=None):
+def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_proposal=None, competition_context=None,
+                      award_context=None):
     """Return a novel frozen rule hypothesis; inputs are never mutated."""
     champion = validate_policy(deepcopy(champion or BASELINE_POLICY))
     frames, limits, history = deepcopy(frames), deepcopy(limits), deepcopy(history or [])
@@ -708,7 +858,10 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         mode = "exploit" if attribution["stage"] == "supported" else "bootstrap"
     if attribution is not None and attribution["stage"] != "execution":
         execution_hint = False
+    if award_context is not None:
+        competition_context = award_context.get("competition_context")
     competition = public_competition_context(competition_context)
+    transition = _public_transition_context(award_context)
     behind = bool(competition and competition["reliable"] and competition["pace"]["status"] == "behind")
     if behind and "allocation" not in families:
         families = (*families, "allocation")
@@ -728,7 +881,7 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
             pass
     candidates, llm_state = [], "unused"
 
-    def add(policy, method):
+    def add(policy, method, *, allow_family=False):
         try:
             policy = deepcopy(policy)
             policy["cancel_after_minutes"] = champion.get("cancel_after_minutes", 10)
@@ -741,7 +894,7 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
                 for parent, child in zip(champion["strategies"], policy["strategies"]):
                     child["id"], child["name"] = parent["id"], parent["name"]
             family, changes = _policy_changes(champion, policy)
-            if family is None or family != "bootstrap" and family not in families:
+            if family is None or family != "bootstrap" and family not in families and not allow_family:
                 return
             identity, behavior = policy_id(policy), _behavior_id(policy)
             if identity not in seen and behavior not in behaviors:
@@ -764,6 +917,8 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
                 payload["competition_context"] = deepcopy(competition)
                 payload["allocation_limits"] = {key: _number(limits.get(key)) for key in
                                                 ("budget", "order_cap", "daily_buy_limit")}
+            if transition is not None:
+                payload["transition_context"] = deepcopy(transition)
             result = llm.generate(RESEARCH_PROMPT, payload, deepcopy(POLICY_SCHEMA))
             if isinstance(result, str):
                 result = json.loads(result)
@@ -775,17 +930,104 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         # different candidate. Storage failures must remain visible to research.
         if llm_state == "valid" and on_llm_proposal is not None:
             on_llm_proposal(deepcopy(candidates[0][0]))
-    if behind:
+    capacity_research = bool(behind and transition and transition.get("status") == "observed")
+    packet_metadata, proposal_sources, search_plan = {}, {}, None
+    if capacity_research:
+        from datetime import date
+        from backend.policy_capacity import capacity_packet, capacity_metadata, _signal_base_changes
+        llm_candidates = deepcopy(candidates)
+        candidates.clear()
+        pool_ids = set()
+        search_plan = {"version": "balanced-capacity-search-v2", "max_candidates": MAX_CANDIDATES,
+                       "selection_before_performance": True, "packets": [],
+                       "controls_may_repeat_prior_research": True,
+                       "existing_lot_rules_changed": False, "global_limits_changed": False}
+
+        def add_packet(base, method, top_n=8):
+            packet = capacity_packet(base, top_n=top_n, champion=champion)
+            search_plan["packets"].append({key: deepcopy(packet[key]) for key in
+                ("version", "top_n", "base_id", "actual_parent_id", "member_ids", "degenerate_roles", "hash")})
+            for role in ("B", "A", "E", "AE"):
+                candidate = packet["members"][role]
+                identity = policy_id(candidate)
+                if identity == parent_id:
+                    continue
+                metadata = capacity_metadata(packet, identity)
+                if metadata not in packet_metadata.setdefault(identity, []):
+                    packet_metadata[identity].append(metadata)
+                if identity in pool_ids:
+                    continue
+                family, changes = _policy_changes(champion, candidate)
+                if family is None and champion["kind"] == "rules" and role != "B":
+                    family = "capacity"
+                    changes = [{"path": "capacity_packet", "before": packet["base_id"],
+                                "after": identity, "controls": deepcopy(packet["member_ids"])}]
+                if family is None:
+                    continue
+                candidates.append((deepcopy(candidate), method, family, changes))
+                pool_ids.add(identity)
+                seen.add(identity)
+                behaviors.add(_behavior_id(candidate))
+
+        if champion["kind"] == "legacy":
+            # Four whole 2x2 packets, never a score-sorted prefix. A valid LLM
+            # occupies one packet; the omitted grammar family rotates by date.
+            bases = list(_grammar(champion, summaries, mode, execution_hint, families))[:4]
+            try:
+                omitted = date.fromisoformat(transition["signal_day"]).toordinal() % 4
+            except (TypeError, ValueError, KeyError):
+                omitted = 0
+            valid_llm = llm_candidates and all(_behavior_id(llm_candidates[0][0]) != _behavior_id(base)
+                                               for base in bases)
+            if valid_llm:
+                add_packet(llm_candidates[0][0], "llm")
+                bases = [base for index, base in enumerate(bases) if index != omitted]
+            search_plan.update(grammar_rotation_index=omitted if valid_llm else None,
+                               llm_packet_used=bool(valid_llm),
+                               fallback="four_fixed_grammar_packets")
+            for base in bases:
+                add_packet(base, "grammar")
+        else:
+            from datetime import datetime
+            from backend.policy_capacity import signal_hold_packet, signal_hold_metadata
+            from backend.learning_proposals import template_proposal_source
+            packet = signal_hold_packet(champion, frames)
+            if (date.fromisoformat(packet['signal_day']) > date.fromisoformat(transition['signal_day'])
+                    or award_context.get('observed_at') is not None and
+                    datetime.fromisoformat(packet['input_observed_at']) > datetime.fromisoformat(award_context['observed_at'])):
+                raise ValueError('signal_hold_input_after_decision')
+            search_plan.update(version='fixed-signal-hold-search-v1',
+                packets=[{key: deepcopy(packet[key]) for key in packet if key != 'members'}],
+                allocation_levels=[8], hold_levels=[1, 2, 4],
+                signal_family_order=['trend', 'relative', 'recovery', 'liquid'],
+                comparison_design=packet['comparison_design'],
+                source='deterministic_signal_hold_packet', llm_packet_used=False,
+                llm_observation_candidate_ids=[policy_id(item[0]) for item in llm_candidates],
+                llm_observation_callback_completed=bool(llm_candidates and on_llm_proposal is not None),
+                fallback='none; incomplete fixed packet is unavailable')
+            for identity in packet['candidate_ids']:
+                role = next(role for role, value in packet['member_ids'].items() if value == identity)
+                candidate = packet['members'][role]
+                packet_metadata[identity] = [signal_hold_metadata(packet, identity)]
+                proposal_sources[identity] = template_proposal_source(packet, identity)
+                changes = [{'path': 'signal_hold_packet', 'before': parent_id, 'after': identity,
+                            'roles': packet_metadata[identity][0]['roles'], 'packet_hash': packet['hash']}]
+                candidates.append((deepcopy(candidate), 'registered_template', 'capacity', changes))
+                pool_ids.add(identity)
+        if len(candidates) > MAX_CANDIDATES:
+            raise ValueError("capacity_pool_exceeds_predeclared_bound")
+    elif behind:
         # A legacy parent has no rule slots. Bootstrap from the same first
         # grammar hypothesis before varying only its allocation, not signals.
         base = champion if champion["kind"] == "rules" else next(
             _grammar(champion, summaries, mode, execution_hint, families))
         for policy in _pace_allocation_candidates(base):
             add(policy, "grammar")
-    for policy in _grammar(champion, summaries, mode, execution_hint, families):
-        add(policy, "grammar")
-        if len(candidates) >= MAX_CANDIDATES:
-            break
+    if not capacity_research:
+        for policy in _grammar(champion, summaries, mode, execution_hint, families):
+            add(policy, "grammar")
+            if len(candidates) >= MAX_CANDIDATES:
+                break
     if not candidates:
         raise ValueError("no_novel_research_candidate")
     evaluations = []
@@ -834,6 +1076,17 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
             "method": method + ("_development" if evaluations else "_bootstrap"), "development": development}
     if competition is not None:
         result["competition_context"] = deepcopy(competition)
+    if transition is not None:
+        result["transition_context"] = deepcopy(transition)
+    if search_plan is not None:
+        result["search_plan"] = deepcopy(search_plan)
+    if policy_id(policy) in packet_metadata:
+        result["capacity_packets"] = deepcopy(packet_metadata[policy_id(policy)])
+    if policy_id(policy) in proposal_sources:
+        result['proposal_source'] = deepcopy(proposal_sources[policy_id(policy)])
+        result['hypothesis'] = '현재 정책과 공통 배분·진입 기준, 신규 보유 1/2/4세션 및 고정 네 신호군을 같은 자료로 비교합니다.'
+        result['hypothesis_test'] = {'metric': 'registered_signal_hold_comparison', 'direction': 'joint_qualification',
+                                     'packet_hash': proposal_sources[policy_id(policy)]['packet_hash']}
     by_id = {policy_id(item[1]): (item[0], item[5]) for item in evaluations}
     pool = []
     for candidate, candidate_method, candidate_family, candidate_changes in candidates:
@@ -853,6 +1106,15 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
             "hypothesis_test": _hypothesis_test(candidate_family, attribution, history),
             "method": candidate_method + ("_development" if candidate_score is not None else "_bootstrap"),
             "development": compact})
+        if identity in packet_metadata:
+            pool[-1]["capacity_packets"] = deepcopy(packet_metadata[identity])
+        if identity in proposal_sources:
+            pool[-1]['proposal_source'] = deepcopy(proposal_sources[identity])
+            pool[-1]['hypothesis'] = '현재 정책과 공통 배분·진입 기준, 신규 보유 1/2/4세션 및 고정 네 신호군을 같은 자료로 비교합니다.'
+            pool[-1]['hypothesis_test'] = {'metric': 'registered_signal_hold_comparison', 'direction': 'joint_qualification',
+                                           'packet_hash': proposal_sources[identity]['packet_hash']}
+        if search_plan is not None:
+            pool[-1]["search_plan"] = deepcopy(search_plan)
     # Preserve the selected development record exactly; selecting a different
     # candidate later replaces all its associated method/metrics/hypothesis too.
     for index, item in enumerate(pool):

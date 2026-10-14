@@ -84,7 +84,7 @@ class LearningService:
                 self.store, (self.store.setting('policy') or {}).get('fingerprint'))}
             pending = self.daily.pending() or {}
             daily_history = []
-            for item in self.daily.history():
+            for item in self.daily.history(include_inputs=False):
                 if not item.get('proposal'):
                     continue
                 activation = deepcopy(item.get('activation') or {})

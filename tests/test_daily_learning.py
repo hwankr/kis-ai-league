@@ -21,7 +21,7 @@ class DailyLearningTests(unittest.TestCase):
         self.calls = []
         self.store.save_settings({'policy': {**LIMITS, 'fingerprint': 'account'},
                                  'enabled': False, 'user_paused': True})
-        def propose(parent, frames, limits, history, llm=None):
+        def propose(parent, frames, limits, history, llm=None, *, award_context=None, research_identity=None):
             self.calls.append(deepcopy((parent, frames, history)))
             return {'policy': candidate(), 'change_family': 'bootstrap'}
         self.learner = LearningService(self.store, enabled=True, daily_enabled=True, now=lambda: self.now,

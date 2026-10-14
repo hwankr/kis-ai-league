@@ -11,10 +11,10 @@ import math
 
 from backend.learning_evaluation import _return_and_drawdown, _series
 from backend.learning_policy import KST, LEGACY_IDS, _day, _instant, portfolio_metrics, validate_policy
-from backend.learning_research import _behavior_id, _policy_changes
+from backend.learning_research import _behavior_id, _policy_changes, _public_activity
 
 
-VERSION = "daily-development-v2"
+VERSION = "daily-award-development-v5"
 EPSILON = 1e-9
 MAXIMUM_DRAWDOWN_PCT = 15.
 METRICS = ("net_return_pct", "stress_return_pct", "max_drawdown_pct", "stress_drawdown_pct")
@@ -130,7 +130,8 @@ def _comparison(a, b, drawdown_limit):
     return {"champion": a, "candidate": b, "delta": delta, "checks": checks, "eligible": eligible}
 
 
-def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=None, evaluation_context=None):
+def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=None, evaluation_context=None,
+                             candidate_pool=None):
     """Compare both policies on identical development data and trading costs.
 
     Two frames suffice to compute one return interval. A legacy parent
@@ -160,6 +161,11 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
             raise ValueError("invalid_limits")
         if "limits" in proposal and proposal["limits"] != limits:
             raise ValueError("proposal_changes_limits")
+        capacity = None
+        if parent['kind'] == 'rules' and 'capacity_packets' in proposal:
+            from backend.policy_capacity import validate_capacity_member
+            capacity = validate_capacity_member(parent, proposal, candidate_pool, limits=limits, frames=frames)
+            result['metrics']['capacity_contract'] = capacity
         if _behavior_id(parent) == _behavior_id(candidate):
             return {**result, "decision": "keep", "reason": "현재 정책과 실제 동작이 같습니다."}
         if candidate["kind"] != "rules":
@@ -168,6 +174,8 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
                 item["id"] for item in candidate["strategies"]]:
             raise ValueError("strategy_slots_changed")
         family, changes = _policy_changes(parent, candidate)
+        if capacity is not None and (family is None or capacity['version'] == 'signal-hold-packet-v1'):
+            family, changes = 'capacity', capacity['changes']
         if family is None or not changes:
             raise ValueError("multiple_or_unsupported_changes")
         if parent["cancel_after_minutes"] != candidate["cancel_after_minutes"]:
@@ -223,6 +231,10 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
             selection_stress_return_pct=min(item["candidate"]["stress_return_pct"] for item in comparisons),
             loss_reduction_only=any(item["candidate"][key] <= 0 for item in comparisons
                                     for key in ("net_return_pct", "stress_return_pct")))
+        result["metrics"]["paired_trading_activity"] = {
+            side: {"normal": _public_activity(raw.get("trading_activity")),
+                   "cost_stress": _public_activity(raw.get("stress_trading_activity"))}
+            for side, raw in (("champion", raw_parent), ("candidate", raw_candidate))}
         _finite(result)
         if all(item["eligible"] for item in comparisons):
             reason = ("개발 비교에서 비용 후 수익 개선·낙폭 한도 충족: 손실 축소의 잠정 적용"
@@ -239,12 +251,13 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
                  "inconsistent_evaluation_summary", "insufficient_observed_baseline", "invalid_evaluation_context",
                  "unresolved_evaluation_book", "evaluation_anchor_missing", "insufficient_context_intervals",
                  "evaluation_context_not_known_at_anchor", "unpaired_execution_scenarios"}
-        known.add("invalid_evaluation_drawdown_limit")
+        known.update({"invalid_evaluation_drawdown_limit", "invalid_capacity_contract"})
         result["metrics"]["error"] = reason if reason in known else "invalid_evaluation_input"
         return result
 
 
-def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None, evaluation_context=None):
+def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None, evaluation_context=None,
+                           award_context=None):
     """One final decision from a bounded, already generated development pool.
 
     Every candidate sees the same inputs and gates. Reusing these data for
@@ -268,20 +281,121 @@ def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None
     records = []
     for item, identity in zip(supplied, ids):
         options = {"evaluation_context": deepcopy(evaluation_context)} if evaluation_context is not None else {}
+        if evaluate is evaluate_daily_candidate:
+            options['candidate_pool'] = deepcopy(supplied)
         result = evaluate(deepcopy(champion), deepcopy(item), deepcopy(frames), deepcopy(limits), **options)
         records.append((item, identity, result))
+    # The compound exception needs measured controls, not just well-formed
+    # policies. A valid but unimproved control is still evidence; a failed
+    # computation cannot authorize the allocation/exit interaction.
+    def measured(metrics):
+        return isinstance(metrics, dict) and all(type(metrics.get(key)) in (int, float)
+            and math.isfinite(metrics[key]) for key in METRICS)
+    def parent_evidence(metrics):
+        scenarios = metrics.get('scenario_comparisons') or {}
+        if (not measured(metrics.get('champion')) or not isinstance(scenarios, dict)
+                or any(not isinstance(value, dict) or not measured(value.get('champion'))
+                       for value in scenarios.values())):
+            return None
+        return (metrics['champion'], {key: value['champion'] for key, value in scenarios.items()})
+    original_evidence = {}
+    for _, identity, outcome in records:
+        evidence = outcome.get('metrics') or {}
+        parent = parent_evidence(evidence)
+        valid = (outcome.get('decision') in {'apply', 'keep'} and not evidence.get('error')
+                 and measured(evidence.get('candidate')) and parent is not None
+                 and all(measured(value.get('candidate')) for value in
+                         (evidence.get('scenario_comparisons') or {}).values()))
+        original_evidence[identity] = (valid, parent)
+    for _, _, outcome in records:
+        metrics = outcome.get('metrics') or {}
+        if metrics.get('change_family') != 'capacity' or outcome.get('decision') not in {'apply', 'keep'}:
+            continue
+        parent = parent_evidence(metrics)
+        failures = []
+        for packet in metrics['capacity_contract']['control_packets']:
+            for role in packet.get('required_roles', packet['member_ids']):
+                identity = packet['member_ids'][role]
+                if identity == policy_id(champion):
+                    valid = parent is not None
+                else:
+                    valid, control_parent = original_evidence.get(identity, (False, None))
+                    valid = valid and parent is not None and control_parent == parent
+                if not valid:
+                    failures.append({'packet_hash': packet['packet_hash'], 'role': role,
+                                     'candidate_id': identity})
+        if failures:
+            outcome.update(decision='blocked', reason='배분·청산 공동 변경의 대조군 비교 자료를 확인할 수 없습니다.')
+            metrics.update(error='capacity_control_evidence_unavailable', capacity_control_failures=failures)
     eligible = [record for record in records if record[2].get("decision") == "apply"]
     def rank(record):
         metrics = record[2].get("metrics") or {}
         return (*tuple(metrics.get(key, -math.inf) for key in ("selection_return_pct", "selection_stress_return_pct")), record[1])
-    selected = max(eligible, key=rank) if eligible else next(
-        (record for record in records if record[1] == policy_id(proposal["policy"])), records[0])
+    award = None
+    award_index = None
+    if award_context is not None and award_context.get("competition_context") is not None:
+        from backend.policy_award import select_award_record
+        award_index, award = select_award_record(champion, records, frames, limits, award_context)
+    selected = (records[award_index] if award_index is not None else
+                max(eligible, key=rank) if eligible and award is None else next(
+                    (record for record in records if record[1] == policy_id(proposal["policy"])), records[0]))
     selected_proposal = deepcopy(selected[0])
     if pool is not None:
         selected_proposal["candidate_pool"] = deepcopy(pool)
     result = deepcopy(selected[2])
+    if award is not None:
+        result["decision"] = award["status"]
+        reason = {"return_improvement_with_capacity": "현재 보유 전이와 비용 후 수익 개선을 확인한 잠정 적용",
+                  "qualification_tradeoff": "허용 수익 범위에서 동일 경로의 수상요건 개선을 확인한 잠정 적용",
+                  "joint_qualification_robust": "공통 기본·예비 경로의 공동 수상요건과 위험 한도를 충족한 잠정 적용",
+                  "joint_qualification_conditional": "공통 기본 경로의 수상요건·예비 경로의 자산·위험 한도를 충족한 조건부 적용",
+                  "qualified_progress": "공통 경로의 자산·위험 한도 안에서 거래금액 부족 개선을 확인한 잠정 적용",
+                  "risk_reduction": "현재 신규 노출·비교 낙폭 감소를 확인한 위험 축소 적용",
+                  "no_supported_plan": "공동 수상요건·위험 한도를 뒷받침하는 개선 근거 부족: 현행 유지",
+                  "no_supported_award_improvement": "수상요건·현재 보유를 반영한 개선 근거 부족: 현행 유지",
+                  "incumbent_tie_or_qualification_preference": "공동 평가에서 현행 유지 우선",
+                  "account_protection_active": "누적 손실 보호 중: 현행 보호·청산 유지",
+                  "contest_has_no_remaining_sessions": "대회 잔여 거래세션 없음: 현행 유지"}
+        result["reason"] = reason.get(award["reason"], "수상요건·현재 보유의 필수 자료 미확인: 신규 정책 보류")
+        if not isinstance(result.get("metrics"), dict):
+            result["metrics"] = {}
+        result["metrics"]["award_selection"] = award
     metrics = result.get("metrics")
     if isinstance(metrics, dict):
+        contracts = {}
+        by_id = {identity: outcome for _, identity, outcome in records}
+        parent_sources = {}
+        # Audit provenance must not depend on which linked candidate happens
+        # to be projected last, especially one whose own comparison failed.
+        for _, source_id, source in sorted(records, key=lambda record: record[1]):
+            valid, parent = original_evidence[source_id]
+            if valid:
+                contract = (source.get('metrics') or {}).get('capacity_contract') or {}
+                for packet in contract.get('control_packets', []):
+                    parent_sources.setdefault(packet['packet_hash'], (source_id, parent))
+        for _, _, outcome in records:
+            contract = (outcome.get('metrics') or {}).get('capacity_contract')
+            for packet in (contract or {}).get('control_packets', []):
+                controls = {}
+                for role, identity in packet['member_ids'].items():
+                    control = by_id.get(identity)
+                    raw = (control or {}).get('metrics') or {}
+                    controls[role] = {'candidate_id': identity,
+                        'basis': 'incumbent_reference' if identity == policy_id(champion) else 'same_pool_evaluation',
+                        'decision': (control or {}).get('decision', 'keep' if identity == policy_id(champion) else 'blocked'),
+                        'metrics': {key: deepcopy(raw[key]) for key in ('candidate', 'scenario_comparisons',
+                            'selection_return_pct', 'selection_stress_return_pct', 'maximum_drawdown_pct', 'error') if key in raw}}
+                    if identity == policy_id(champion):
+                        source_id, parent = parent_sources.get(packet['packet_hash'], (None, None))
+                        controls[role]['source_candidate_id'] = source_id
+                        controls[role]['metrics'] = {'champion': deepcopy(parent[0]) if parent else None,
+                            'scenario_comparisons': {key: {'champion': deepcopy(value)}
+                                for key, value in (parent[1] if parent else {}).items()}}
+                contracts[packet['packet_hash']] = {'version': packet['version'], 'top_n': packet['top_n'],
+                    'base_id': packet['base_id'], 'actual_parent_id': packet['actual_parent_id'],
+                    'packet_hash': packet['packet_hash'], 'controls': controls}
+        if contracts:
+            metrics['capacity_controls'] = list(contracts.values())
         metrics["selection"] = {"objective": "net_return_with_cost_stress_and_drawdown_cap",
             "basis": "reused_development_data", "prospective": False,
             "candidates_evaluated": len(records), "eligible_candidates": len(eligible),
@@ -292,4 +406,10 @@ def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None
                           "net_return_pct": (outcome.get("metrics") or {}).get("selection_return_pct"),
                           "stress_return_pct": (outcome.get("metrics") or {}).get("selection_stress_return_pct")}
                          for _, identity, outcome in records]}
+        if award is not None:
+            metrics["selection"].update(objective="joint_award_qualification_with_absolute_equity_and_risk_gates",
+                eligible_candidates=award.get("eligible_candidates", 0),
+                selected_candidate_id=selected[1] if award_index is not None else policy_id(champion),
+                incumbent_selected=award_index is None,
+                outcomes=deepcopy(award["outcomes"]))
     return selected_proposal, result

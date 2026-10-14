@@ -177,7 +177,7 @@ class ExperimentService:
                 self._pause_requests -= 1
 
     @contextmanager
-    def _submission_guard(self, pause_epoch):
+    def _submission_guard(self, pause_epoch, *, entry_check=None):
         # A pause either commits before this check, or follows a request that
         # has already crossed the HTTP boundary. Never unlock between the two.
         from backend.paper_broker import BrokerRejected, BrokerStopped
@@ -194,6 +194,13 @@ class ExperimentService:
             if (expired or self.stopping or pausing or self.store.setting("pause_epoch", 0) != pause_epoch
                     or not self.store.setting("enabled", False) or not self._market_open()):
                 raise BrokerStopped(KIS_ENDED_MESSAGE if expired else "전송 직전 주문이 중지되어 보내지 않았습니다.")
+            if entry_check is not None:
+                try:
+                    available = entry_check()
+                except Exception:
+                    raise BrokerStopped("매수 직전 보유·주문 상태를 확인하지 못해 전송하지 않았습니다.") from None
+                if not available:
+                    raise BrokerStopped("매수 직전 보유·주문 상태가 달라 재진입을 차단했습니다.")
             yield
 
     def _enforce_deadline(self):
@@ -386,7 +393,8 @@ class ExperimentService:
         from backend.experiment_analysis import make_llm
         return (self.llm_factory or make_llm)(self.config_path)
 
-    def _propose_learning(self, champion, frames, limits, history, llm=None):
+    def _propose_learning(self, champion, frames, limits, history, llm=None, *, award_context=None,
+                          research_identity=None):
         from backend.learning_proposals import proposal_context, save_llm_proposal
         from backend.learning_research import propose_candidate
         # Freeze the research account before the provider call; current order
@@ -396,10 +404,27 @@ class ExperimentService:
         if daily is not None and daily.enabled:
             research_state = {**research_state, "fingerprint": self._policy().get("fingerprint"),
                               "engine_version": daily.engine_version}
-        competition = self._competition_research_context()
+        if research_identity is not None:
+            if (award_context is None or not isinstance(research_identity, dict)
+                    or set(research_identity) != {'decision_id', 'fingerprint', 'engine_version'}
+                    or not all(isinstance(value, str) and value for value in research_identity.values())):
+                raise ValueError('invalid_daily_research_identity')
+            research_state = {**research_state, 'fingerprint': research_identity['fingerprint'],
+                              'engine_version': research_identity['engine_version']}
+        if award_context is not None:
+            from backend.daily_inputs import validate_award_context
+            if not validate_award_context(award_context):
+                raise ValueError('invalid_award_context')
+            competition = deepcopy(award_context['competition_context'])
+        else:
+            competition = self._competition_research_context()
+        options = {'award_context': deepcopy(award_context)} if award_context is not None else {}
         context = proposal_context(champion, frames, limits, history,
-                                   research_state, llm, self._timestamp(), competition_context=competition)
+                                   research_state, llm, self._timestamp(), competition_context=competition, **options)
+        if research_identity is not None and context['daily_decision_id'] != research_identity['decision_id']:
+            raise ValueError('daily_research_identity_changed')
         return propose_candidate(champion, frames, limits, history, llm=llm, competition_context=competition,
+            **options,
             on_llm_proposal=lambda policy: save_llm_proposal(
                 self.store, policy, context=context, captured_at=self._timestamp()))
 
@@ -754,6 +779,7 @@ class ExperimentService:
                 "benchmarks": indices}
 
     def _analyze(self, *, retry_llm=False, automatic_retry=False):
+        from backend.daily_inputs import freeze_entry_selection, validate_entry_selection
         from backend.experiment_analysis import analyze_experiments, analysis_version, build_snapshot
         from backend.learning_policy import build_frame, policy_id, signals
         data = self.input_reader()
@@ -764,11 +790,25 @@ class ExperimentService:
         base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
         adopted = self._adopted_policy()
         learned_frame = build_frame(data) if adopted and adopted["kind"] == "rules" else None
+        entry_selection = None
         key = (hashlib.sha256(encode([base_key, policy_id(adopted),
                 self.learning.version,
                 {key: value for key, value in learned_frame.items() if key != "observed_at"}]).encode()).hexdigest()
                if learned_frame else base_key)
         previous = self.store.find_run(key, exact=True)
+        if learned_frame and adopted.get('held_before_top_n'):
+            if previous is not None:
+                if not validate_entry_selection(previous, adopted, frame=learned_frame):
+                    raise OperationalBlock('동결한 진입 신호 원본이 일치하지 않아 분석을 보류합니다.', 'entry_selection')
+                entry_selection = deepcopy(previous['entry_selection'])
+            else:
+                current = self.now().astimezone(KST)
+                signal_day = str(data['as_of'])
+                if (signal_day > current.date().isoformat()
+                        or signal_day == current.date().isoformat() and current.time() < daytime(16)
+                        or signal_day < current.date().isoformat() and current.time() >= daytime(9)):
+                    raise OperationalBlock('장중에는 진입 후보를 새로 정하지 않습니다. 장후 동결 신호가 필요합니다.', 'entry_selection')
+                entry_selection = freeze_entry_selection(adopted, self._entry_selection_book())
         if previous is not None:
             state = previous.get("llm_status")
             failed = isinstance(state, dict) and state.get("status") in {"error", "unconfigured"}
@@ -790,7 +830,8 @@ class ExperimentService:
                       "llm_status": baseline.get("llm_status"), "input": normalized}
         else:
             result = (self.analyzer or analyze_experiments)(**data, llm=self._get_llm())
-        decisions = result["decisions"] + (signals(adopted, learned_frame) if learned_frame else [])
+        decisions = result["decisions"] + (signals(adopted, learned_frame,
+            entry_context=entry_selection['context'] if entry_selection else None) if learned_frame else [])
         result["decisions"] = decisions
         run = {"id": uuid4().hex, "as_of": str(data["as_of"]), "created_at": self._timestamp(),
                "status": "ready", "input_hash": result["input_hash"], "version_id": result["version_id"],
@@ -798,6 +839,8 @@ class ExperimentService:
                "error": (result.get("llm_status") or {}).get("error") if isinstance(result.get("llm_status"), dict) else None,
                "llm_status": result.get("llm_status"), "analysis": result,
                "learning_policy": adopted, "learning_engine_version": self.learning.version if adopted else None}
+        if entry_selection is not None:
+            run['entry_selection'] = entry_selection
         self.store.add_run(run)
         self.store.save_setting("analysis_attempt", {"collection_hash": key, "state": "complete",
                                                      "completed_at": self._timestamp(), "run_id": run["id"]})
@@ -810,7 +853,7 @@ class ExperimentService:
 
     def _prepare_daily(self, data, baseline):
         """Freeze next-session signals without exposing an unactivated run."""
-        from backend.daily_inputs import frame_for_pending, frozen_data, input_matches
+        from backend.daily_inputs import frame_for_pending, frozen_data, input_matches, pending_entry_selection
         from backend.experiment_analysis import analysis_version, build_snapshot
         from backend.learning_policy import policy_id, signals
         if not self.learning.enabled or self._policy().get("execution_strategy") != ALL_STRATEGIES:
@@ -834,6 +877,7 @@ class ExperimentService:
         digestable["analysis_version"] = version
         base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
         candidate = pending["policy"]
+        entry_selection = pending_entry_selection(pending)
         learned = candidate["kind"] == "rules"
         key = (hashlib.sha256(encode([base_key, policy_id(candidate), self.learning.version,
             {key: value for key, value in frame.items() if key != "observed_at"}]).encode()).hexdigest()
@@ -841,7 +885,7 @@ class ExperimentService:
         decisions = deepcopy(signal_inputs["baseline_signals"]) if signal_inputs is not None else [
             item for item in baseline["signals"] if not item.get("policy_id")]
         if learned:
-            decisions += signals(candidate, frame)
+            decisions += signals(candidate, frame, entry_context=entry_selection['context'] if entry_selection else None)
         analysis = {"decisions": decisions, "input_hash": input_hash, "version_id": version,
                     "llm_status": baseline.get("llm_status"), "input": normalized}
         run = {"id": uuid4().hex, "as_of": signal_day, "created_at": self._timestamp(),
@@ -850,7 +894,31 @@ class ExperimentService:
                "llm_status": baseline.get("llm_status"), "analysis": analysis,
                "learning_policy": candidate, "learning_engine_version": self.learning.version,
                "daily_decision_id": pending["decision_id"]}
+        if entry_selection is not None:
+            run['entry_selection'] = entry_selection
         return self.learning.daily.prepare(pending, run)
+
+    def _entry_selection_book(self):
+        """Read owned held/reserved symbols for a new close-time signal run."""
+        orders = self._owned_orders(self._policy())
+        positions, _ = self._portfolio(orders)
+        return {'positions': [{'symbol': item['symbol']} for item in positions],
+                'reserved_entries': [{'symbol': item['symbol']} for item in orders
+                                     if item['side'] == 'buy' and item['status'] in ACTIVE]}
+
+    @staticmethod
+    def _sold_today(orders, today):
+        return {item['symbol'] for item in orders if item['side'] == 'sell'
+                and item['order_date'] == today.isoformat() and item.get('filled_quantity', 0) > 0}
+
+    def _entry_still_available(self, policy, symbol, *, own_order_id=None):
+        orders = self._owned_orders(policy)
+        positions, _ = self._portfolio(orders)
+        if symbol in self._sold_today(orders, self.now().astimezone(KST).date()):
+            return False
+        return (not any(item['symbol'] == symbol for item in positions)
+                and not any(item['id'] != own_order_id and (item['status'] == 'unknown'
+                    or item['symbol'] == symbol and item['status'] in ACTIVE) for item in orders))
 
     def _activate_daily(self, today, days):
         """The broker's first traded bar confirms the day; signals predate its open."""
@@ -937,8 +1005,12 @@ class ExperimentService:
                     if value:
                         book['account_protection'] = {'units': value['units'], 'peak': value['risk']['peak'],
                             'active': value['risk']['active'], 'limit_pct': self.risk_limit}
+                    context['observed_at'] = self._timestamp()
                 except ValueError:
                     context['book_error'] = 'AI 보유 평가가격 확인 필요'
+                if getattr(getattr(self.learning, 'daily', None), 'enabled', False):
+                    from backend.learning_research import public_competition_context
+                    context['competition_context'] = public_competition_context(self._competition_research_context())
             self.learning.enqueue(data, baseline, policy, source_id=run["collection_hash"], context=context)
 
     def _decision_quote(self, symbol, price):
@@ -969,7 +1041,7 @@ class ExperimentService:
         """One small decision-price observation per symbol/day, including a frozen challenger."""
         if policy.get('execution_strategy') != ALL_STRATEGIES:
             return
-        from backend.learning_policy import BASELINE_POLICY, signals
+        from backend.learning_policy import BASELINE_POLICY, signals, canonical_entry_context
         frames = self.learning.frames(1)
         if not frames:
             return
@@ -979,20 +1051,46 @@ class ExperimentService:
                 self.now().astimezone(KST).date(), daytime(9), KST):
             return
         state = self.learning.state()
-        policies = [BASELINE_POLICY, self.learning.active_policy()]
+        active_policy = self.learning.active_policy()
+        policies = [BASELINE_POLICY, active_policy]
         if state.get('trial'):
             policies.append(state['trial']['policy'])
-        wanted = {row['symbol'] for candidate in policies for row in signals(candidate, frame)}
-        for candidate in (state.get('scorecard_book') or {}).get('positions', []):
-            wanted.add(candidate['symbol'])
+        # Observation is not an executable signal rerank. Include the actual
+        # frozen run as well as each prospective book's required quote set.
+        live_context = canonical_entry_context(self._entry_selection_book())
+        wanted = {row['symbol'] for candidate in policies for row in signals(candidate, frame,
+                  entry_context=live_context if candidate.get('held_before_top_n') else None)}
+        for run in self.store.runs(100, details=False):
+            if run['as_of'] == frame['as_of']:
+                wanted.update(row['symbol'] for row in run.get('signals', []))
+        def include_book(book, candidate):
+            if not isinstance(book, dict):
+                return
+            # Profiles carry independent normal/stress books. Their frozen
+            # pending entries and backfilled ranks can differ from the live book.
+            if 'positions' in book:
+                for key in ('positions', 'reserved_entries', 'pending_entries'):
+                    wanted.update(row['symbol'] for row in book.get(key, []))
+                wanted.update(row['symbol'] for row in signals(candidate, frame,
+                    entry_context=canonical_entry_context(book)
+                        if candidate.get('held_before_top_n') else None))
+            for key in ('normal', 'stress'):
+                include_book(book.get(key), candidate)
+            for nested in (book.get('scenarios') or {}).values():
+                include_book(nested, candidate)
+
+        include_book(state.get('scorecard_book'), BASELINE_POLICY)
         trial = state.get('trial') or {}
         wanted.update(trial.get('attribution_quote_symbols', []))
-        wanted.update(row['symbol'] for row in (trial.get('initial_state') or {}).get('positions', []))
-        for metric in trial.get('metrics', {}).values():
+        trial_policies = {'champion': trial.get('incumbent') or active_policy,
+                          'challenger': trial.get('policy') or active_policy}
+        for candidate in trial_policies.values():
+            include_book(trial.get('initial_state'), candidate)
+        for role, metric in trial.get('metrics', {}).items():
             if isinstance(metric, dict):
                 for replay in [metric, *(metric.get('scenario_results') or {}).values()]:
                     for key in ('final_state', 'stress_final_state'):
-                        wanted.update(row['symbol'] for row in (replay.get(key) or {}).get('positions', []))
+                        include_book(replay.get(key), trial_policies.get(role, active_policy))
         quotes = self.store.setting('learning_quotes', {})
         seen = quotes.get('quotes', {}) if quotes.get('day') == today and quotes.get('fingerprint') == policy.get('fingerprint') else {}
         missing = sorted(wanted - seen.keys())[:5]
@@ -1344,6 +1442,8 @@ class ExperimentService:
                 continue
             orders = self._owned_orders(policy)
             positions, portfolio_results = self._portfolio(orders)
+            if learned and execution.get('no_same_day_reentry') and symbol in self._sold_today(orders, today):
+                continue
             if any(item["symbol"] == symbol for item in positions) or any(item["symbol"] == symbol and item["status"] in ACTIVE for item in orders):
                 continue
             if learned:
@@ -1443,6 +1543,8 @@ class ExperimentService:
         excluded = {item["symbol"] for item in positions} | {
             item["symbol"] for item in orders if item["status"] in ACTIVE or
             item["side"] == "buy" and item["order_date"] == today.isoformat()}
+        if execution.get('no_same_day_reentry'):
+            excluded |= self._sold_today(orders, today)
         candidates, quotes, sources = [], {}, {}
         for decision in decisions:
             if not self.store.setting("enabled", False) or self.stopping or self._blocked():
@@ -1476,6 +1578,8 @@ class ExperimentService:
                 row["symbol"] for row in orders if row["status"] in ACTIVE or
                 row["side"] == "buy" and row["order_date"] == today.isoformat()} | {
                 symbol for symbol, holding in account["holdings"].items() if holding.get("quantity", 0)}
+            if execution.get('no_same_day_reentry'):
+                excluded |= self._sold_today(orders, today)
             retained = [row for row in candidates if row["symbol"] not in excluded]
             needs_plan = needs_plan or len(retained) != len(candidates)
             candidates = retained
@@ -1522,7 +1626,8 @@ class ExperimentService:
             candidates = [row for row in candidates if row["symbol"] != symbol]
             plans = [row for row in plans if row["symbol"] != symbol]
             if item:
-                decision = sources[(symbol, item["strategy_id"])]
+                decision = dict(sources[(symbol, item["strategy_id"])],
+                                no_same_day_reentry=execution.get('no_same_day_reentry', False))
                 self._submit(policy, broker, decision, "buy", item["quantity"], price,
                              f"entry:{policy['fingerprint']}:{today.isoformat()}:{symbol}", run_id=run["id"])
 
@@ -1572,6 +1677,9 @@ class ExperimentService:
         execution = run.get("learning_policy")
         if (self.learning.enabled and policy["execution_strategy"] == ALL_STRATEGIES
                 and execution and execution["kind"] == "rules"):
+            from backend.daily_inputs import validate_entry_selection
+            if not validate_entry_selection(run, execution):
+                raise OperationalBlock('동결한 보유 선제외 신호 근거가 없어 신규 매수를 보류합니다.', 'entry_selection')
             from backend.learning_policy import policy_id
             weights = {item["id"]: Decimal(str(item["weight"])) for item in execution["strategies"]}
             groups = {key: [dict(item, cancel_after_minutes=execution["cancel_after_minutes"]) for item in run["signals"]
@@ -1580,7 +1688,8 @@ class ExperimentService:
             caps = {key: min(decimal(policy["order_cap"]), decimal(policy["daily_buy_limit"]) * weights[key] / max(1, len(items)))
                     for key, items in groups.items()}
             ordered = [dict(item, cancel_after_minutes=execution["cancel_after_minutes"],
-                            learning_engine_version=run.get("learning_engine_version")) for item in run["signals"]
+                            learning_engine_version=run.get("learning_engine_version"),
+                            no_same_day_reentry=execution.get('no_same_day_reentry', False)) for item in run["signals"]
                        if item["strategy_id"] in groups and item.get("policy_id") == policy_id(execution)
                        and item["action"] == "buy" and item.get("status", "ready") == "ready"]
             return ordered, caps
@@ -1601,6 +1710,12 @@ class ExperimentService:
         return ordered, caps
 
     def _submit(self, policy, broker, decision, side, quantity, price, intent_key, *, run_id):
+        entry_check = None
+        own_order_id = None
+        if side == 'buy' and decision.get('no_same_day_reentry'):
+            entry_check = lambda: self._entry_still_available(policy, decision['symbol'], own_order_id=own_order_id)
+            if not entry_check():
+                return
         pause_epoch = self.store.setting("pause_epoch", 0)
         if self._enforce_deadline() or self.stopping or not self.store.setting("enabled", False) or not self._market_open():
             return
@@ -1614,6 +1729,7 @@ class ExperimentService:
                  "remaining_quantity": quantity, "status": "submitting", "order_id": None, "branch_id": None,
                  "order_date": self.now().astimezone(KST).date().isoformat(), "created_at": self._timestamp(),
                  "error": None, "fingerprint": policy["fingerprint"], "run_id": run_id, "pause_epoch": pause_epoch}
+        own_order_id = order['id']
         order['decision_price'] = str(price)
         context = self._decision_quote(decision['symbol'], price)
         if context:
@@ -1644,7 +1760,7 @@ class ExperimentService:
         from backend.paper_broker import BrokerRejected, BrokerStopped
         try:
             ack = broker.submit(order["symbol"], side, quantity, str(price),
-                                send_guard=lambda: self._submission_guard(pause_epoch))
+                                send_guard=lambda: self._submission_guard(pause_epoch, entry_check=entry_check))
         except BrokerStopped as error:
             self._enforce_deadline()
             order.update(status="cancelled", remaining_quantity=0, submission_skipped=True,

@@ -630,6 +630,7 @@ class DailyPolicyTests(unittest.TestCase):
 
     def test_new_decision_and_pending_freeze_complete_signal_inputs_once(self):
         self.add_market_row()
+        self.frames = [build_frame(self.data)]
         original_hash = market_input_hash(self.data)
         pending = self.prepare()
         original_record = self.service.history()[0]
@@ -682,28 +683,30 @@ class DailyPolicyTests(unittest.TestCase):
         frozen = {'symbol': '000660', 'strategy_id': 'last-baseline', 'action': 'buy'}
         other_day = {'symbol': '035420', 'strategy_id': 'other-day', 'action': 'buy'}
         self.frames = [
+            {**build_frame(self.data), 'as_of': '2026-10-09', 'baseline_signals': [other_day]},
             {**build_frame(self.data), 'baseline_signals': [first]},
             {**build_frame(self.data), 'baseline_signals': [frozen]},
-            {**build_frame(self.data), 'as_of': '2026-10-09', 'baseline_signals': [other_day]},
         ]
         self.process()
         record, pending = self.service.history()[0], self.service.pending()
         self.assertEqual(record['signal_inputs']['baseline_signals'], [frozen])
         self.assertEqual(record['signal_inputs']['baseline_hash'], _hash([frozen]))
         self.assertEqual(record['signal_inputs'], pending['signal_inputs'])
-        self.frames[1]['baseline_signals'][0]['action'] = 'hold'
+        self.frames[2]['baseline_signals'][0]['action'] = 'hold'
         self.assertEqual(self.service.pending(), pending)
         self.assertEqual(self.service.history()[0], record)
 
-    def test_new_contract_has_explicit_empty_baseline_when_signal_day_frame_is_absent(self):
+    def test_new_contract_blocks_when_latest_signal_day_frame_is_absent(self):
         self.frames = [{**build_frame(self.data), 'as_of': '2026-10-09',
                         'baseline_signals': [{'symbol': '005930', 'action': 'buy'}]}]
         self.process()
-        self.assertEqual(self.service.pending()['signal_inputs']['baseline_signals'], [])
-        self.assertEqual(self.service.pending()['signal_inputs']['baseline_hash'], _hash([]))
+        self.assertIsNone(self.service.pending())
+        self.assertEqual(self.service.snapshot()['status'], 'blocked')
+        self.proposer.assert_not_called()
 
     def test_legacy_retry_keeps_exact_hash_guard_and_never_gains_input_contract(self):
         self.add_market_row()
+        self.frames = [build_frame(self.data)]
         self.evaluator.side_effect = RuntimeError('evaluation error')
         with self.assertRaises(RuntimeError):
             self.process()
@@ -726,6 +729,7 @@ class DailyPolicyTests(unittest.TestCase):
 
     def test_new_input_contract_still_blocks_changed_frozen_symbol_price(self):
         self.add_market_row()
+        self.frames = [build_frame(self.data)]
         pending = self.prepare()
         original = self.service.history()[0]
         self.data['histories']['005930']['2026-10-12']['close'] = 10001

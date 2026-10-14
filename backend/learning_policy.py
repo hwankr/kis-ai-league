@@ -22,7 +22,7 @@ BASELINE_POLICY = {"kind": "legacy", "name": "기존 네 전략", "strategies": 
                    "cash_reserve": 0.0, "max_positions": 20,
                    "entry_slippage_bps": 100, "cancel_after_minutes": 10}
 LEGACY_IDS = ("trend-breakout-v1", "pullback-recovery-v1", "relative-strength-v1", "llm-evidence-v1")
-POLICY_OPTIONS = {"allocation_mode", "candidate_scope"}
+POLICY_OPTIONS = {"allocation_mode", "candidate_scope", "held_before_top_n", "no_same_day_reentry"}
 STRATEGY_OPTIONS = {"exit_mode", "max_holding_sessions"}
 KST = timezone(timedelta(hours=9))
 FEE, TAX = Decimal("0.000140527"), Decimal("0.002")
@@ -104,6 +104,11 @@ def validate_policy(policy):
                          ("candidate_scope", {"unrestricted", "liquid_top20", "liquid_all"})):
         if key in policy:
             if policy[key] not in allowed:
+                raise ValueError("invalid_" + key)
+            result[key] = policy[key]
+    for key in ("held_before_top_n", "no_same_day_reentry"):
+        if key in policy:
+            if type(policy[key]) is not bool:
                 raise ValueError("invalid_" + key)
             result[key] = policy[key]
     fields = {"id", "name", "weight", "conditions", "rank_by", "descending", "top_n",
@@ -270,9 +275,49 @@ def _strategies(policy):
     return policy["strategies"]
 
 
-def signals(policy, frame):
-    """Return deterministic buy signals; a hold/exit remains the executor's job."""
+def canonical_entry_context(initial_state):
+    """Freeze the held/reserved symbol sets without changing the supplied book."""
+    if not isinstance(initial_state, dict) or not isinstance(initial_state.get("positions"), list):
+        raise ValueError("invalid_entry_context_state")
+    if "reserved_entries" not in initial_state and _state_decimal(initial_state.get("reserved_cash", 0)):
+        raise ValueError("reserved_entries_required")
+    reserved = initial_state.get("reserved_entries", [])
+    if not isinstance(reserved, list):
+        raise ValueError("invalid_entry_context_state")
+    result = {}
+    for key, values in (("held_symbols", initial_state["positions"]), ("reserved_symbols", reserved)):
+        if any(not isinstance(value, dict) for value in values):
+            raise ValueError("invalid_entry_context_state")
+        result[key] = sorted({_symbol(value.get("symbol")) for value in values})
+    return result
+
+
+def signals(policy, frame, *, entry_context=None):
+    """Return close-frozen entries, optionally excluding the supplied close book.
+
+    The context is required for opt-in policies. A later execution-time book must
+    not silently replace the book used to prepare an immutable signal run.
+    """
     policy = validate_policy(policy)
+    excluded = set()
+    if policy.get("held_before_top_n", False):
+        if entry_context is None:
+            raise ValueError("entry_context_required")
+        if not isinstance(entry_context, dict) or set(entry_context) != {"held_symbols", "reserved_symbols"}:
+            raise ValueError("invalid_entry_context")
+        for key in ("held_symbols", "reserved_symbols"):
+            values = entry_context[key]
+            if not isinstance(values, list):
+                raise ValueError("invalid_entry_context")
+            symbols = [_symbol(value) for value in values]
+            if len(set(symbols)) != len(symbols):
+                raise ValueError("duplicate_entry_context_symbol")
+            excluded.update(symbols)
+    return _rule_signals(policy, frame, excluded_symbols=excluded)
+
+
+def _rule_signals(policy, frame, *, excluded_symbols=()):
+    """Apply the full-frame data contract before optional entry-only exclusions."""
     identity = policy_id(policy)
     rows = {row["symbol"]: row for row in frame["rows"]}
     scope = policy.get("candidate_scope", "unrestricted")
@@ -299,6 +344,8 @@ def signals(policy, frame):
             groups.append([])
             continue
         for row in rows.values():
+            if row["symbol"] in excluded_symbols:
+                continue
             if not row.get("learning_eligible", True):
                 continue
             score = 0.
@@ -389,7 +436,9 @@ def position_exit_due(exit_policy, *, symbol, held_sessions, entry_price, last_c
     if not frame or _decimal(quantity) * _decimal(last_close) * (1 - _decimal(fee_rate) - _decimal(tax_rate)) <= _decimal(cost):
         return True
     try:
-        maintained = signals(rule["continuation_policy"], frame)
+        # Entry-only exclusions must never make a held lot fail its frozen
+        # continuation rule merely because it is already owned.
+        maintained = _rule_signals(validate_policy(rule["continuation_policy"]), frame)
     except (ValueError, KeyError, TypeError):
         return True
     return not any(item["symbol"] == symbol and item["strategy_id"] == rule["continuation_strategy"]
@@ -541,6 +590,7 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
     buy_fills, sell_fills = 0, 0
     for index, frame in enumerate(frames):
         day_buy, day_sell = Decimal(0), Decimal(0)
+        sold_today = set()
         rows = {row["symbol"]: row for row in frame["rows"]}
         bars = {}
         protection_observed_at = None
@@ -664,6 +714,7 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                 price = execution_price(symbol, "sell", position=position)
                 quantity = fill_quantity(position["quantity"], "sell", position) if price is not None else 0
                 if quantity:
+                    sold_today.add(symbol)
                     proceeds = quantity * price
                     gross_sell += proceeds
                     day_sell += proceeds
@@ -701,7 +752,8 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             quoted = {}
             for signal in pending:
                 symbol = signal["symbol"]
-                if symbol in positions or symbol in reserved_symbols:
+                if (symbol in positions or symbol in reserved_symbols
+                        or policy.get("no_same_day_reentry", False) and symbol in sold_today):
                     continue
                 if symbol not in quoted:
                     limit = _decimal(signal["reference_close"]) * (1 + _decimal(policy["entry_slippage_bps"]) / 10000)
@@ -721,7 +773,8 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
             pending = [by_key[(item["symbol"], item["strategy_id"])] for item in plan]
         for signal in pending:
             symbol, strategy = signal["symbol"], signal["strategy_id"]
-            if symbol in positions or policy["kind"] != "legacy" and len(positions) >= policy["max_positions"]:
+            if (symbol in positions or policy["kind"] != "legacy" and len(positions) >= policy["max_positions"]
+                    or policy.get("no_same_day_reentry", False) and symbol in sold_today):
                 continue
             used = sum((position["cost"] for position in positions.values()), Decimal(0))
             strategy_used = sum((position["cost"] for position in positions.values() if position["strategy_id"] == strategy), Decimal(0))
@@ -770,7 +823,8 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                       "position_value": float(position_value), "reserved_cash": float(reserved),
                       "gross_buy_amount": float(day_buy), "gross_sell_amount": float(day_sell),
                       **({"protection_active": protection["active"]} if protection is not None else {})})
-        pending = signals(policy, frame)
+        pending = signals(policy, frame, entry_context={"held_symbols": sorted(positions),
+                          "reserved_symbols": sorted(reserved_symbols)})
         if not index and saved and saved.get("policy_id") == identity and "pending_entries" in saved:
             supplied = saved["pending_entries"]
             if not isinstance(supplied, list) or supplied != pending:
