@@ -209,6 +209,8 @@ class ProtectiveExecutionTests(unittest.TestCase):
         self.assertEqual(len(self.broker.submissions), before)
 
     def test_loss_protection_cancels_pending_buys_before_any_new_exposure(self):
+        # Both fixture buys must fit the same fee-inclusive daily allowance.
+        self.service._configure({**self.policy, 'order_cap': '90000', 'daily_buy_limit': '100000'})
         self.submit(quantity=8)
         self.fill(8, status='filled')
         second = self.submit(quantity=1, symbol='000660', key='pending')

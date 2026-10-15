@@ -256,35 +256,8 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
         return result
 
 
-def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None, evaluation_context=None,
-                           award_context=None):
-    """One final decision from a bounded, already generated development pool.
-
-    Every candidate sees the same inputs and gates. Reusing these data for
-    selection remains development evidence; this is not a multiplicity-adjusted
-    test. Old saved single-proposal records retain their single-candidate path.
-    """
+def _apply_capacity_dependencies(champion, records):
     from backend.learning_policy import policy_id
-    from backend.learning_research import MAX_CANDIDATES
-    evaluate = evaluator or evaluate_daily_candidate
-    pool = proposal.get("candidate_pool") if isinstance(proposal, dict) else None
-    supplied = pool if pool is not None else [proposal]
-    try:
-        if not isinstance(supplied, list) or not 1 <= len(supplied) <= MAX_CANDIDATES:
-            raise ValueError("invalid_candidate_pool")
-        ids = [policy_id(item["policy"]) for item in supplied]
-        if len(set(ids)) != len(ids):
-            raise ValueError("duplicate_candidate_pool")
-    except (ValueError, TypeError, KeyError):
-        return deepcopy(proposal), {"decision": "blocked", "reason": "개발 후보 묶음을 확인할 수 없습니다.",
-            "metrics": {"basis": "development_only", "error": "invalid_candidate_pool"}, "changes": [], "version": VERSION}
-    records = []
-    for item, identity in zip(supplied, ids):
-        options = {"evaluation_context": deepcopy(evaluation_context)} if evaluation_context is not None else {}
-        if evaluate is evaluate_daily_candidate:
-            options['candidate_pool'] = deepcopy(supplied)
-        result = evaluate(deepcopy(champion), deepcopy(item), deepcopy(frames), deepcopy(limits), **options)
-        records.append((item, identity, result))
     # The compound exception needs measured controls, not just well-formed
     # policies. A valid but unimproved control is still evidence; a failed
     # computation cannot authorize the allocation/exit interaction.
@@ -327,6 +300,65 @@ def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None
         if failures:
             outcome.update(decision='blocked', reason='배분·청산 공동 변경의 대조군 비교 자료를 확인할 수 없습니다.')
             metrics.update(error='capacity_control_evidence_unavailable', capacity_control_failures=failures)
+    return original_evidence
+
+
+def validate_capacity_result_records(champion, records, frames, limits):
+    """Recheck required measured controls on an immutable native replay receipt."""
+    from backend.learning_policy import policy_id
+    from backend.policy_capacity import validate_capacity_member
+    if not isinstance(records, list) or not records:
+        raise ValueError('capacity_result_records_invalid')
+    pool = [record[0] for record in records]
+    for proposal, identity, outcome in records:
+        if identity != policy_id(proposal['policy']):
+            raise ValueError('capacity_result_identity_changed')
+        if outcome.get('decision') not in {'apply', 'keep', 'blocked'}:
+            raise ValueError('capacity_result_decision_invalid')
+        if 'capacity_packets' in proposal:
+            expected = validate_capacity_member(champion, proposal, pool, frames=frames, limits=limits)
+            if (outcome.get('metrics') or {}).get('capacity_contract') != expected:
+                raise ValueError('capacity_result_contract_changed')
+            if (expected.get('changes') and outcome.get('decision') in {'apply', 'keep'}
+                    and (outcome.get('metrics') or {}).get('change_family') != 'capacity'):
+                raise ValueError('capacity_result_family_changed')
+    checked = deepcopy(records)
+    _apply_capacity_dependencies(champion, checked)
+    if checked != records:
+        raise ValueError('capacity_result_controls_unverified')
+    return True
+
+
+def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None, evaluation_context=None,
+                           award_context=None):
+    """One final decision from a bounded, already generated development pool.
+
+    Every candidate sees the same inputs and gates. Reusing these data for
+    selection remains development evidence; this is not a multiplicity-adjusted
+    test. Old saved single-proposal records retain their single-candidate path.
+    """
+    from backend.learning_policy import policy_id
+    from backend.learning_research import MAX_CANDIDATES
+    evaluate = evaluator or evaluate_daily_candidate
+    pool = proposal.get("candidate_pool") if isinstance(proposal, dict) else None
+    supplied = pool if pool is not None else [proposal]
+    try:
+        if not isinstance(supplied, list) or not 1 <= len(supplied) <= MAX_CANDIDATES:
+            raise ValueError("invalid_candidate_pool")
+        ids = [policy_id(item["policy"]) for item in supplied]
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate_candidate_pool")
+    except (ValueError, TypeError, KeyError):
+        return deepcopy(proposal), {"decision": "blocked", "reason": "개발 후보 묶음을 확인할 수 없습니다.",
+            "metrics": {"basis": "development_only", "error": "invalid_candidate_pool"}, "changes": [], "version": VERSION}
+    records = []
+    for item, identity in zip(supplied, ids):
+        options = {"evaluation_context": deepcopy(evaluation_context)} if evaluation_context is not None else {}
+        if evaluate is evaluate_daily_candidate:
+            options['candidate_pool'] = deepcopy(supplied)
+        result = evaluate(deepcopy(champion), deepcopy(item), deepcopy(frames), deepcopy(limits), **options)
+        records.append((item, identity, result))
+    original_evidence = _apply_capacity_dependencies(champion, records)
     eligible = [record for record in records if record[2].get("decision") == "apply"]
     def rank(record):
         metrics = record[2].get("metrics") or {}
@@ -348,10 +380,11 @@ def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None
         reason = {"return_improvement_with_capacity": "현재 보유 전이와 비용 후 수익 개선을 확인한 잠정 적용",
                   "qualification_tradeoff": "허용 수익 범위에서 동일 경로의 수상요건 개선을 확인한 잠정 적용",
                   "joint_qualification_robust": "공통 기본·예비 경로의 공동 수상요건과 위험 한도를 충족한 잠정 적용",
-                  "joint_qualification_conditional": "공통 기본 경로의 수상요건·예비 경로의 자산·위험 한도를 충족한 조건부 적용",
-                  "qualified_progress": "공통 경로의 자산·위험 한도 안에서 거래금액 부족 개선을 확인한 잠정 적용",
+                  "joint_qualification_conditional": "기본 경로의 공동 요건 충족·현행 대비 최악 자산 비악화를 확인한 조건부 적용",
+                  "partial_joint_challenge": "기본 경로의 공동 충족 증가·거래금액 부족 개선·최악 자산 비악화를 확인한 조건부 도전",
+                  "qualified_progress": "현행 대비 최악 자산을 낮추지 않고 거래금액 부족 개선을 확인한 잠정 적용",
                   "risk_reduction": "현재 신규 노출·비교 낙폭 감소를 확인한 위험 축소 적용",
-                  "no_supported_plan": "공동 수상요건·위험 한도를 뒷받침하는 개선 근거 부족: 현행 유지",
+                  "no_supported_plan": "수상요건 미달 위험: 검증된 대안 미확보로 현행 유지",
                   "no_supported_award_improvement": "수상요건·현재 보유를 반영한 개선 근거 부족: 현행 유지",
                   "incumbent_tie_or_qualification_preference": "공동 평가에서 현행 유지 우선",
                   "account_protection_active": "누적 손실 보호 중: 현행 보호·청산 유지",
@@ -407,7 +440,7 @@ def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None
                           "stress_return_pct": (outcome.get("metrics") or {}).get("selection_stress_return_pct")}
                          for _, identity, outcome in records]}
         if award is not None:
-            metrics["selection"].update(objective="joint_award_qualification_with_absolute_equity_and_risk_gates",
+            metrics["selection"].update(objective="joint_award_qualification_with_incumbent_relative_equity_and_risk_gates",
                 eligible_candidates=award.get("eligible_candidates", 0),
                 selected_candidate_id=selected[1] if award_index is not None else policy_id(champion),
                 incumbent_selected=award_index is None,

@@ -291,6 +291,12 @@ class EntrySelectionTransmissionTests(unittest.TestCase):
         self.allocate()
         self.assertEqual([item[0] for item in self.broker.submissions], list(fixtures.SYMBOLS[1:]))
         # A direct ordinary legacy submit keeps its existing semantics.
+        # Leave money available after allocation so this comparison isolates
+        # same-day reentry from the independent final money-limit guard.
+        policy = self.service._policy()
+        self.service.store.save_setting('policy', {**policy,
+            'budget': str(Decimal(policy['budget']) * 2),
+            'daily_buy_limit': str(Decimal(policy['daily_buy_limit']) * 2)})
         self.service._submit(self.service._policy(), self.broker, self.signals[0], "buy", 1,
                              Decimal(10000), "explicit-legacy-path", run_id="legacy")
         self.assertEqual(self.broker.submissions[-1][0], fixtures.SYMBOLS[0])

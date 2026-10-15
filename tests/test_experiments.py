@@ -139,7 +139,20 @@ class ExperimentsTests(unittest.TestCase):
 
     def submit(self, quantity=5, *, symbol="005930", side="buy", key="one"):
         self.enable()
-        self.service._submit(self.service._policy(), self.broker, decision(symbol), side, quantity, Decimal("10000"), key, run_id="run1")
+        # Protocol/fill fixtures use five shares independently of the smaller
+        # cycle-allocation policy. Fund this fixture explicitly; production now
+        # checks fee-inclusive limits again at the transport boundary.
+        original = self.service._policy()
+        fixture_policy = dict(original)
+        if side == 'buy':
+            required = (Decimal(quantity * 10000) * (1 + FEE)).to_integral_value(rounding='ROUND_CEILING')
+            fixture_policy['order_cap'] = str(max(Decimal(original['order_cap']), required))
+            fixture_policy['daily_buy_limit'] = str(max(Decimal(original['daily_buy_limit']), required))
+            self.service.store.save_setting('policy', fixture_policy)
+        try:
+            self.service._submit(fixture_policy, self.broker, decision(symbol), side, quantity, Decimal("10000"), key, run_id="run1")
+        finally:
+            self.service.store.save_setting('policy', original)
         with self.service.store.connect() as db:
             row = db.execute("SELECT payload FROM orders WHERE intent_key=?", (key,)).fetchone()
         return json.loads(row[0])

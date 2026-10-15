@@ -11,7 +11,7 @@ from backend.daily_inputs import validate_award_context
 from backend.policy_transition import transition_preview
 
 
-VERSION = "award-selection-v2"
+VERSION = "award-selection-v3"
 # Relative backtest return is an opportunity-cost audit, not an award gate.
 # The separate safety-only exception still cannot worsen matched returns.
 RISK_RETURN_TOLERANCE_PP = 0.0
@@ -40,7 +40,10 @@ def selection_contract():
             "risk_reduction_return_tolerance_pp": RISK_RETURN_TOLERANCE_PP,
             "core_environments": ["normal", "cost_stress"],
             "reserve_environments": ["partial_delayed", "partial_delayed_cost_stress"],
-            "promotion_order": ["joint_qualification_robust", "joint_qualification_conditional", "qualified_progress", "risk_reduction"],
+            "promotion_order": ["joint_qualification_robust", "joint_qualification_conditional", "partial_joint_challenge", "qualified_progress", "risk_reduction"],
+            "relative_risk_gate": "worst_final_equity_not_below_frozen_incumbent",
+            "partial_joint_gate": "preserve_and_add_core_joint_witnesses_with_qualified_progress",
+            "hypothetical_all_path_principal_floor": False,
             "progress_threshold": "ceil_remaining_gross_shortfall_divided_by_remaining_sessions",
             "turnover_above_target_reward": 0, "win_probability": None}
 
@@ -221,7 +224,10 @@ def _family_status(paths, qualification, plan, cap):
                        ('gross_amount', 'trading_days', 'symbols', 'final_equity', 'max_drawdown_pct'))):
             return 'scenario_coverage_unknown'
         first_buy = item['first_buy_session']
-        if first_buy is not None and (type(first_buy) is not int or first_buy < 1
+        prefix_buy = (plan.get('version') == 'intraday-quality-only-common-windows-v1'
+            and item.get('intraday_modelled_fills_are_actual') is False
+            and (_number((item.get('intraday_prefix') or {}).get('gross_buy_amount')) or 0) > 0)
+        if first_buy is not None and (type(first_buy) is not int or first_buy < (0 if prefix_buy else 1)
                 or type(item.get('horizon')) is not int or first_buy > item['horizon']):
             return 'scenario_coverage_unknown'
         if any(float(item[key]) < 0 for key in ('gross_amount', 'trading_days', 'symbols', 'final_equity')):
@@ -234,13 +240,38 @@ def _family_status(paths, qualification, plan, cap):
 def _absolute_class(qualification, family):
     if family != 'ready':
         return 0, family
-    if any(item['checks']['final_equity'] is not True for item in qualification['scenarios']):
-        return 0, 'final_equity_floor'
     if qualification['status'] == 'all_met':
-        return 4, 'joint_qualification_robust'
+        return 5, 'joint_qualification_robust'
     if qualification['groups']['core']['status'] == 'all_met':
-        return 3, 'joint_qualification_conditional'
+        return 4, 'joint_qualification_conditional'
     return 0, 'qualification_shortfall'
+
+
+def _relative_risk(candidate_paths, parent_paths, candidate_family, parent_family):
+    result = {'supported': False, 'reason': 'paired_scenario_evidence_unavailable'}
+    if candidate_family != 'ready' or parent_family != 'ready':
+        return result
+    left = {item['id']: item for item in candidate_paths['scenarios']}
+    right = {item['id']: item for item in parent_paths['scenarios']}
+    if (left.keys() != right.keys()
+            or candidate_paths.get('scenario_plan_hash') != parent_paths.get('scenario_plan_hash')
+            or any(left[key].get('path_hash') != right[key].get('path_hash')
+                   or left[key].get('start_book_hash') != right[key].get('start_book_hash') for key in left)):
+        return result
+    candidate_worst = min(item['final_equity'] for item in left.values())
+    parent_worst = min(item['final_equity'] for item in right.values())
+    deltas = {key: left[key]['final_equity'] - right[key]['final_equity'] for key in left}
+    result.update(candidate_worst_final_equity=candidate_worst, incumbent_worst_final_equity=parent_worst,
+        worst_equity_improvement=candidate_worst - parent_worst,
+        worst_same_path_equity_delta=min(deltas.values()),
+        same_path_equity_worsened=sorted(key for key, value in deltas.items() if value < -1e-6),
+        supported=candidate_worst + 1e-6 >= parent_worst,
+        reason='worst_equity_nonworse' if candidate_worst + 1e-6 >= parent_worst else 'worst_equity_worsened')
+    return result
+
+
+def _core_witnesses(qualification):
+    return {item['id'] for item in qualification['scenarios'] if item['group'] == 'core' and item['joint_met'] is True}
 
 
 def _progress_evidence(candidate, parent, candidate_paths, parent_paths, *, candidate_family, parent_family, threshold):
@@ -256,9 +287,17 @@ def _progress_evidence(candidate, parent, candidate_paths, parent_paths, *, cand
             or any(left[key].get('path_hash') != right[key].get('path_hash')
                    or left[key].get('start_book_hash') != right[key].get('start_book_hash') for key in left)):
         return result
-    if any(any(item['checks'][key] is not True for key in ('final_equity', 'trading_days', 'symbols', 'api_orders'))
+    relative = _relative_risk(candidate_paths, parent_paths, candidate_family, parent_family)
+    result['relative_risk'] = relative
+    if not relative['supported']:
+        result['reason'] = relative['reason']
+        return result
+    if any(any(item['checks'][key] is not True for key in ('trading_days', 'symbols', 'api_orders'))
            for item in proposed.values()):
         result['reason'] = 'non_turnover_qualification_failed'
+        return result
+    if not _core_witnesses(parent) <= _core_witnesses(candidate):
+        result['reason'] = 'incumbent_core_joint_witness_lost'
         return result
     if any(proposed[key]['deficits']['gross_amount'] > incumbent[key]['deficits']['gross_amount'] + 1e-6 for key in proposed):
         result['reason'] = 'some_path_turnover_shortfall_worsened'
@@ -281,21 +320,31 @@ def _plan_rank(item):
     worst = min(equities) if equities and all(value is not None for value in equities) else -math.inf
     ordinary = min(normal) if normal and all(value is not None for value in normal) else -math.inf
     risk = max(drawdowns) if drawdowns and all(value is not None for value in drawdowns) else item['return']['stress_drawdown_pct']
-    progress_rank = -item['qualification']['gross_shortfall_amount'] if item['class'] == 2 else 0
-    return item['class'], progress_rank, worst, ordinary, -risk, item['index'] is None, item['id']
+    coverage = len({'_'.join(identity.split('_')[:2]) for identity in _core_witnesses(item['qualification'])})
+    shortfall = item['qualification'].get('gross_shortfall_amount')
+    progress_rank = -shortfall if shortfall is not None else -math.inf
+    return item['class'], coverage, progress_rank, worst, ordinary, -risk, item['index'] is None, item['id']
 
 
-def select_award_record(champion, records, frames, limits, context):
+def _select_award_record(champion, records, frames, limits, context, *, evidence=None):
     """Promote absolute joint qualification, with separately named exceptions."""
     from backend.policy_award_scenarios import award_scenarios, scenario_plan
+    context_validator, previewer = validate_award_context, transition_preview
+    context_day = context.get('signal_day') if isinstance(context, dict) else None
+    if isinstance(context, dict) and context.get('version') == 'intraday-award-context-v1':
+        from backend.intraday_scenarios import (validate_intraday_context, transition_preview as intraday_preview,
+                                                award_scenarios as intraday_scenarios, scenario_plan as intraday_plan)
+        context_validator, previewer = validate_intraday_context, intraday_preview
+        award_scenarios, scenario_plan = intraday_scenarios, intraday_plan
+        context_day = context.get('activation_day')
     audit = {**selection_contract(), 'status': 'blocked', 'reason': 'invalid_award_context',
              'incumbent_included': True, 'outcomes': [], 'timefolio': separate_contest_status()}
-    if (not validate_award_context(context) or context['limits'] != limits
+    if (not context_validator(context) or context['limits'] != limits
             or not isinstance(frames, list) or not frames or frames[-1] != context['latest_frame']):
         return None, audit
     progress = context['competition_context']
     if (not isinstance(progress, dict) or progress.get('contest') != 'kis_ai_2026'
-            or not progress.get('reliable') or progress.get('period', {}).get('as_of') != context['signal_day']):
+            or not progress.get('reliable') or progress.get('period', {}).get('as_of') != context_day):
         audit['reason'] = 'contest_progress_unavailable'
         return None, audit
     remaining = _number(progress.get('pace', {}).get('remaining_sessions'))
@@ -309,7 +358,7 @@ def select_award_record(champion, records, frames, limits, context):
     threshold = math.ceil(max(0., CONTESTS['kis_ai_2026']['targets']['gross_amount'] - actual_gross) / remaining)
     audit['progress_threshold_amount'] = threshold
     frame = context['latest_frame']
-    parent_preview = transition_preview(champion, frame, limits, context)
+    parent_preview = previewer(champion, frame, limits, context)
     audit['incumbent_transition'] = parent_preview
     if parent_preview['status'] != 'ready':
         audit['reason'] = 'incumbent_transition_unavailable'
@@ -320,8 +369,11 @@ def select_award_record(champion, records, frames, limits, context):
     plan = scenario_plan(frames, context)
     audit['scenario_plan'] = plan
     def replay(policy):
-        evidence = award_scenarios(policy, frames, limits, context, plan=plan)
-        return {key: value for key, value in evidence.items() if key != 'scenario_plan'}
+        if evidence is not None:
+            from backend.learning_policy import policy_id
+            return deepcopy(evidence[policy_id(policy)])
+        calculated = award_scenarios(policy, frames, limits, context, plan=plan)
+        return {key: value for key, value in calculated.items() if key != 'scenario_plan'}
     parent_paths = replay(champion)
     parent_qualification = joint_qualification(parent_paths, progress, limits['budget'])
     parent_family = _family_status(parent_paths, parent_qualification, plan, 15.)
@@ -333,7 +385,7 @@ def select_award_record(champion, records, frames, limits, context):
     for index, (proposal, identity, outcome) in enumerate(records):
         metrics = outcome.get('metrics') or {}
         candidate_return, comparison_parent = _returns(metrics, 'candidate'), _returns(metrics, 'champion')
-        preview = transition_preview(proposal['policy'], frame, limits, context)
+        preview = previewer(proposal['policy'], frame, limits, context)
         paths = replay(proposal['policy'])
         qualification = joint_qualification(paths, progress, limits['budget'])
         detail = {'candidate_id': identity, 'return_gate_decision': outcome.get('decision'),
@@ -361,8 +413,12 @@ def select_award_record(champion, records, frames, limits, context):
         category, reason = _absolute_class(qualification, family)
         progress_proof = _progress_evidence(qualification, parent_qualification, paths, parent_paths,
             candidate_family=family, parent_family=parent_family, threshold=threshold)
+        relative_risk = _relative_risk(paths, parent_paths, family, parent_family)
         if not category and progress_proof['supported']:
             category, reason = 2, 'qualified_progress'
+            old_witnesses, new_witnesses = _core_witnesses(parent_qualification), _core_witnesses(qualification)
+            if old_witnesses < new_witnesses:
+                category, reason = 3, 'partial_joint_challenge'
         comparisons = list((metrics.get('scenario_comparisons') or {}).values()) or [metrics]
         reduced_risk = (float(preview['gross_buy_amount']) < float(parent_preview['gross_buy_amount'])
             and _within_return_budget(profiles, parent_profiles, RISK_RETURN_TOLERANCE_PP)
@@ -377,17 +433,22 @@ def select_award_record(champion, records, frames, limits, context):
             category, reason = 0, 'no_current_or_supported_later_improvement'
         if not category and reduced_risk:
             category, reason = 1, 'risk_reduction'
+        if not relative_risk['supported']:
+            category, reason = 0, relative_risk['reason']
         detail.update(scenario_status=family, progress_evidence=progress_proof,
+            relative_risk_evidence=relative_risk,
             transition_class='immediate_entry' if immediate else 'after_natural_exits' if natural else 'no_entry_evidence',
             risk_reduction_evidence=reduced_risk, promotion_reason=reason, eligible=bool(category),
-            award_plan_supported=category >= 3, plan_class=category)
+            award_plan_supported=category >= 4, plan_class=category)
         if category:
             assessable.append({'index': index, 'id': identity, 'class': category, 'return': candidate_return,
                 'qualification': qualification, 'paths': paths})
     if parent_return is None:
         audit['reason'] = 'paired_return_evidence_unavailable'
         return None, audit
-    audit.update(status='keep', reason='no_supported_plan', eligible_candidates=len(assessable))
+    audit.update(status='keep', reason='no_supported_plan', eligible_candidates=len(assessable),
+                 qualification_risk=parent_class < 4, decision_needed=not assessable and parent_class < 4,
+                 incumbent_has_supported_qualification_plan=parent_class >= 4)
     if not assessable:
         return None, audit
     incumbent = {'index': None, 'id': '', 'class': parent_class, 'return': parent_return,
@@ -398,7 +459,38 @@ def select_award_record(champion, records, frames, limits, context):
         return None, audit
     audit.update(status='apply', reason=audit['outcomes'][chosen['index']]['promotion_reason'],
                  selected_qualification=chosen['qualification']['status'], selected_plan_class=chosen['class'],
-                 award_plan_supported=chosen['class'] >= 3)
+                 award_plan_supported=chosen['class'] >= 4,
+                 qualification_risk=chosen['class'] < 4, decision_needed=False)
     return chosen['index'], audit
+
+
+def select_award_record(champion, records, frames, limits, context):
+    """Run the native full scenario evaluation and apply the selection contract."""
+    return _select_award_record(champion, records, frames, limits, context)
+
+
+def verify_award_record_evidence(champion, records, frames, limits, context, audit):
+    """Recompute gates/rank from a sealed native replay without simulating again.
+
+    This verifies the decision, not authenticity of supplied path returns. The
+    caller must additionally bind the immutable replay artifact and exact runtime.
+    Context, common plan and current entry preview are recomputed normally.
+    """
+    from backend.learning_policy import policy_id
+    if not isinstance(audit, dict) or audit.get('version') != VERSION:
+        raise ValueError('award_evidence_contract_changed')
+    outcomes = audit.get('outcomes')
+    if (not isinstance(outcomes, list) or len(outcomes) != len(records)
+            or [row.get('candidate_id') for row in outcomes] != [row[1] for row in records]):
+        raise ValueError('award_evidence_pool_changed')
+    evidence = {row['candidate_id']: row['scenario_evidence'] for row in outcomes}
+    parent_id = policy_id(champion)
+    if parent_id in evidence and evidence[parent_id] != audit['incumbent_scenarios']:
+        raise ValueError('award_evidence_incumbent_changed')
+    evidence[parent_id] = audit['incumbent_scenarios']
+    index, reproduced = _select_award_record(champion, records, frames, limits, context, evidence=evidence)
+    if reproduced != audit:
+        raise ValueError('award_evidence_decision_mismatch')
+    return index, reproduced
 
 

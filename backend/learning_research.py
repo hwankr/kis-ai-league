@@ -69,11 +69,16 @@ liquidation marks. Do not shorten holding periods solely to create turnover,
 relax signal quality, repeat meaningless trades or treat turnover as profit.
 Trading activity is a qualification constraint, not profit or a reward beyond
 the target. Joint qualification and final NAV at least the original capital come
-before relative development return. Core normal/cost scenarios require all
-qualification conditions; execution-reserve paths also retain the capital floor
-and risk cap but report turnover shortfalls separately. Relative return is an
+before relative development return. All-path and core joint qualification are
+the strongest tiers. Partial joint challenges preserve and add incumbent core
+witnesses, never worsen any gross shortfall or worst final NAV, and improve the
+worst shortfall by a predeclared required session amount. Supported progress
+uses the same relative risk and non-turnover activity checks; it does not impose
+an all-hypothetical-path principal floor. Actual final principal qualification
+still applies. Relative return is an
 opportunity-cost diagnostic, not a zero-sacrifice veto of qualifying policies.
-No qualifying or supported progress plan means keep, not a return-only fallback.
+No qualifying or supported progress plan means unresolved qualification risk;
+keep does not establish that the incumbent is good or can qualify.
 A scenario pass rate is not a win probability. Missing
 or stale progress is unknown, never zero. transition_context describes the
 CURRENT frozen holdings: never insert it into older historical evaluations.

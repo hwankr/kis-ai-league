@@ -110,6 +110,7 @@ class LearningRuntimeTests(unittest.TestCase):
 
     def test_live_owned_book_is_recorded_only_after_1600_for_the_same_session(self):
         self.current = self.current.replace(hour=10, minute=0)
+        self.service.store.save_setting('user_paused', False)
         self.submit(quantity=2)
         self.fill(2, status="filled")
         self.service.store.save_settings({"enabled": False, "user_paused": True})
@@ -160,6 +161,7 @@ class LearningRuntimeTests(unittest.TestCase):
     def test_prediction_is_saved_before_submit_and_only_prior_terminal_results_update_it(self):
         from backend.learning_account import execution_profile
         self.current = self.current.replace(hour=10, minute=0)
+        self.service.store.save_setting('user_paused', False)
         self.service._symbol_quote(self.broker, "005930")
         original = self.broker.submit
         def inspect(*args, **kwargs):
@@ -195,6 +197,7 @@ class LearningRuntimeTests(unittest.TestCase):
 
     def test_unresolved_source_order_delays_trial_handoff_without_counting_as_failure(self):
         self.current = self.current.replace(hour=10, minute=0)
+        self.service.store.save_setting('user_paused', False)
         self.broker.submit_error = BrokerUnknown("offline missing acknowledgement")
         order = self.submit(quantity=2)
         self.service.store.save_settings({"enabled": False, "user_paused": True})

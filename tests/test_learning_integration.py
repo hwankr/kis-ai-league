@@ -306,7 +306,10 @@ class LearningIntegrationTests(unittest.TestCase):
         snapshot = self.service.snapshot()
         json.dumps(snapshot, allow_nan=False)
         learning = snapshot["learning"]
-        self.assertEqual(set(learning), {"enabled", "status", "champion", "challenger", "last_evaluation", "last_change", "error", "account"})
+        self.assertEqual(set(learning), {"enabled", "status", "champion", "challenger", "last_evaluation", "last_change", "error", "account", "intraday"})
+        self.assertEqual(learning['intraday']['staged'], [])
+        self.assertIsNone(learning['intraday']['active'])
+        self.assertIsNone(learning['intraday']['error'])
         self.assertTrue(learning["enabled"])
         self.assertEqual(learning["champion"]["id"], policy_id(rules_policy()))
         self.assertEqual(learning["champion"]["name"], "검증 후보")

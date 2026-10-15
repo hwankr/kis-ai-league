@@ -230,16 +230,26 @@ def scenario_plan(frames, context):
     return result
 
 
-def _path(policy, source, latest, book):
+def _path(policy, source, latest, book, *, simulation_anchor_day=None):
     """Keep the current anchor, then transplant a per-symbol relative OHLC path."""
     current, anchor = _rows(latest), _rows(source[0])
-    dates = _assumed_days(latest['as_of'], len(source) - 1)
+    anchor_day = simulation_anchor_day or latest['as_of']
+    if (date.fromisoformat(anchor_day).isoformat() != anchor_day
+            or anchor_day < latest['as_of']):
+        raise ValueError('invalid_simulation_anchor_day')
+    dates = _assumed_days(anchor_day, len(source) - 1)
     scales = {symbol: Decimal(str(current[symbol]['close'])) / Decimal(str(row['close']))
               for symbol, row in anchor.items() if symbol in current}
     needed = {position['symbol'] for position in book['positions']}
     if not needed <= scales.keys():
         raise ValueError('holding_anchor_price_missing')
     result = [deepcopy(latest)]
+    if simulation_anchor_day is not None:
+        # This is a model-only time label, never a newly observed market frame.
+        result[0].update(as_of=anchor_day, observed_at=anchor_day + 'T16:05:00+09:00',
+            simulation_anchor={'basis': 'no_further_intraday_fills_counterfactual',
+                'source_as_of': latest['as_of'], 'source_observed_at': latest['observed_at'],
+                'source_frame_hash': _hash(latest), 'observed_close': False})
     result[0]['session_days'] = [dates[0]]
     for index, original in enumerate(source[1:], 1):
         rows = _rows(original)

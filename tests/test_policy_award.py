@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from backend.daily_inputs import freeze_award_context
 from backend.learning_policy import policy_id
-from backend.policy_award import joint_qualification, select_award_record, separate_contest_status
+from backend.policy_award import (joint_qualification, select_award_record, separate_contest_status,
+                                 verify_award_record_evidence, _family_status)
 from backend.learning_research import public_competition_context
 from tests.test_policy_transition import fixture, lot, candidate, LIMITS
 from tests.test_turnover_research import competition
@@ -146,6 +147,17 @@ class JointQualificationTests(unittest.TestCase):
         self.assertIsNone(diagnostics['unfilled_orders'])
         self.assertIsNone(diagnostics['limit_blocked'])
         self.assertNotIn('arbitrary', diagnostics)
+
+    def test_session_zero_requires_explicit_intraday_prefix_fill_evidence(self):
+        supplied, plan = paths(first_buy=0), common_plan()
+        qualification = joint_qualification(supplied, progress(), LIMITS['budget'])
+        self.assertEqual(_family_status(supplied, qualification, plan, 15), 'scenario_coverage_unknown')
+        plan['version'] = 'intraday-quality-only-common-windows-v1'
+        for row in supplied['scenarios']:
+            row.update(intraday_modelled_fills_are_actual=False, intraday_prefix={'gross_buy_amount': 100})
+        self.assertEqual(_family_status(supplied, qualification, plan, 15), 'ready')
+        supplied['scenarios'][0]['intraday_prefix']['gross_buy_amount'] = 0
+        self.assertEqual(_family_status(supplied, qualification, plan, 15), 'scenario_coverage_unknown')
 
 
 class AwardSelectionTests(unittest.TestCase):
@@ -292,7 +304,10 @@ class AwardSelectionTests(unittest.TestCase):
                                       lambda *args, **kwargs: paths(gross=100000000, equity=9900))
         self.assertIsNone(selected)
         self.assertEqual(audit['reason'], 'no_supported_plan')
-        self.assertEqual(audit['outcomes'][0]['promotion_reason'], 'final_equity_floor')
+        self.assertEqual(audit['outcomes'][0]['promotion_reason'], 'qualification_shortfall')
+        self.assertTrue(audit['qualification_risk'])
+        self.assertTrue(audit['decision_needed'])
+        self.assertFalse(audit['incumbent_has_supported_qualification_plan'])
 
     def test_absolute_qualified_candidate_can_have_lower_paired_returns_than_parent(self):
         selected, audit = self.choose(self.no_signal_parent(), [candidate(maximum=20)],
@@ -301,7 +316,7 @@ class AwardSelectionTests(unittest.TestCase):
         self.assertEqual(audit['reason'], 'joint_qualification_robust')
         self.assertEqual(audit['outcomes'][0]['relative_return_audit']['paired']['net_return_pct'], -3.)
 
-    def test_reserve_turnover_miss_is_conditional_but_reserve_loss_is_not(self):
+    def test_conditional_plan_can_have_reserve_loss_without_worsening_parent_worst_nav(self):
         parent = self.no_signal_parent()
         def scenarios(policy, *args, **kwargs):
             value = paths() if policy != parent else paths(gross=0, equity=9900)
@@ -317,10 +332,10 @@ class AwardSelectionTests(unittest.TestCase):
             value['scenarios'][2]['final_equity'] = 9900
             return value
         selected, audit = self.choose(parent, [candidate(maximum=20)], [outcome()], losses)
-        self.assertIsNone(selected)
-        self.assertEqual(audit['outcomes'][0]['promotion_reason'], 'final_equity_floor')
+        self.assertEqual(selected, 0)
+        self.assertEqual(audit['outcomes'][0]['promotion_reason'], 'joint_qualification_conditional')
 
-    def test_parent_unknown_allows_absolute_proof_but_not_progress_fallback(self):
+    def test_parent_unknown_cannot_establish_relative_risk_for_any_promotion(self):
         parent = self.no_signal_parent()
         def scenarios(policy, *args, **kwargs):
             value = paths()
@@ -330,7 +345,8 @@ class AwardSelectionTests(unittest.TestCase):
                     row.update(status='unavailable', gross_amount=None, final_equity=None)
             return value
         selected, audit = self.choose(parent, [candidate(maximum=20)], [outcome()], scenarios)
-        self.assertEqual(selected, 0)
+        self.assertIsNone(selected)
+        self.assertEqual(audit['outcomes'][0]['promotion_reason'], 'paired_scenario_evidence_unavailable')
         self.assertEqual(audit['incumbent_scenario_status'], 'scenario_coverage_unknown')
         def insufficient(policy, *args, **kwargs):
             value = scenarios(policy)
@@ -400,7 +416,7 @@ class AwardSelectionTests(unittest.TestCase):
             return value
         selected, audit = self.choose(parent, [conditional, robust], [outcome(net=10.), outcome(net=-1.)], scenarios)
         self.assertEqual(selected, 1)
-        self.assertEqual(audit['selected_plan_class'], 4)
+        self.assertEqual(audit['selected_plan_class'], 5)
 
     def test_progress_ranks_smallest_worst_turnover_deficit_before_nav(self):
         parent, first, second = self.no_signal_parent(), candidate(maximum=20), candidate(maximum=19)
@@ -429,6 +445,79 @@ class AwardSelectionTests(unittest.TestCase):
         self.assertEqual(audit['scenario_plan'], plan)
         self.assertNotIn('scenario_plan', audit['incumbent_scenarios'])
         self.assertNotIn('scenario_plan', audit['outcomes'][0]['scenario_evidence'])
+
+    def test_partial_joint_challenge_promotes_without_requiring_all_paths_nonnegative(self):
+        parent = self.no_signal_parent()
+        def scenarios(policy, *args, **kwargs):
+            value = paths(gross=100000000, equity=9700) if policy == parent else paths(equity=9750)
+            if policy != parent:
+                value['scenarios'][0]['final_equity'] = 10100
+            return value
+        selected, audit = self.choose(parent, [candidate(maximum=20)], [outcome()], scenarios)
+        self.assertEqual(selected, 0)
+        self.assertEqual(audit['reason'], 'partial_joint_challenge')
+        self.assertEqual(audit['selected_plan_class'], 3)
+        self.assertTrue(audit['qualification_risk'])
+        self.assertFalse(audit['award_plan_supported'])
+        self.assertEqual(audit['selected_qualification'], 'some_met')
+
+    def test_progress_has_no_hidden_all_path_principal_floor(self):
+        parent = self.no_signal_parent()
+        def scenarios(policy, *args, **kwargs):
+            return paths(gross=100000000, equity=9700) if policy == parent else paths(gross=300000000, equity=9750)
+        selected, audit = self.choose(parent, [candidate(maximum=20)], [outcome()], scenarios)
+        self.assertEqual(selected, 0)
+        self.assertEqual(audit['reason'], 'qualified_progress')
+        self.assertEqual(audit['selected_qualification'], 'none_met')
+
+    def test_better_worst_nav_does_not_hide_worse_matching_path(self):
+        parent = self.no_signal_parent()
+        def scenarios(policy, *args, **kwargs):
+            value = paths(gross=100000000, equity=9700) if policy == parent else paths(gross=300000000, equity=9750)
+            if policy == parent:
+                value['scenarios'][0]['final_equity'] = 11000
+            return value
+        selected, audit = self.choose(parent, [candidate(maximum=20)], [outcome()], scenarios)
+        self.assertEqual(selected, 0)
+        risk = audit['outcomes'][0]['relative_risk_evidence']
+        self.assertEqual(risk['worst_equity_improvement'], 50)
+        self.assertEqual(risk['worst_same_path_equity_delta'], -1250)
+        self.assertEqual(risk['same_path_equity_worsened'], ['first_full_normal'])
+
+    def test_losing_parent_joint_witness_cannot_be_relabelled_as_progress(self):
+        parent = self.no_signal_parent()
+        def scenarios(policy, *args, **kwargs):
+            value = paths(gross=100000000, equity=9700) if policy == parent else paths(equity=9750)
+            row = value['scenarios'][0 if policy == parent else 4]
+            row.update(gross_amount=500000000, final_equity=10100)
+            return value
+        selected, audit = self.choose(parent, [candidate(maximum=20)], [outcome()], scenarios)
+        self.assertIsNone(selected)
+        self.assertEqual(audit['outcomes'][0]['progress_evidence']['reason'], 'incumbent_core_joint_witness_lost')
+
+    def test_qualified_absolute_plan_cannot_lower_incumbent_worst_nav(self):
+        parent = self.no_signal_parent()
+        selected, audit = self.choose(parent, [candidate(maximum=20)], [outcome()],
+            lambda policy, *args, **kwargs: paths(gross=0, equity=12000) if policy == parent else paths(equity=11000))
+        self.assertIsNone(selected)
+        self.assertEqual(audit['outcomes'][0]['promotion_reason'], 'worst_equity_worsened')
+
+    def test_sealed_replay_gate_verification_recomputes_decision_and_rejects_tampering(self):
+        parent, policy = self.no_signal_parent(), candidate(maximum=20)
+        selected, audit = self.choose(parent, [policy], [outcome()])
+        frame, context = self.setup_context()
+        records = [({'policy': policy}, policy_id(policy), outcome())]
+        with patch('backend.policy_award_scenarios.scenario_plan', return_value=common_plan()), patch(
+                'backend.policy_award_scenarios.award_scenarios') as replay:
+            verified, reproduced = verify_award_record_evidence(parent, records, [frame], LIMITS, context, audit)
+            self.assertEqual(verified, selected)
+            self.assertEqual(reproduced, audit)
+            replay.assert_not_called()
+            for field, value in [('status', 'keep'), ('reason', 'qualified_progress'), ('selected_plan_class', 3)]:
+                forged = deepcopy(audit)
+                forged[field] = value
+                with self.assertRaisesRegex(ValueError, 'award_evidence_decision_mismatch'):
+                    verify_award_record_evidence(parent, records, [frame], LIMITS, context, forged)
 
 
 if __name__ == "__main__":

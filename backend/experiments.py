@@ -121,6 +121,9 @@ class ExperimentService:
             daily_enabled=settings.get("learning", {}).get("daily_enabled", True) is True,
             now=self.now, llm_factory=self._get_llm, development_reader=self._development_inputs,
             proposer=self._propose_learning)
+        from backend.intraday_runtime import create_service
+        self.intraday_policy = create_service(self.store, config_path=self.config_path,
+                                             now=self.now, stopping=lambda: self.stopping)
         # Never resubmit a mutation interrupted between durable intent and response.
         try:
             with file_lock(self.directory / "runner.lock", blocking=False):
@@ -177,7 +180,7 @@ class ExperimentService:
                 self._pause_requests -= 1
 
     @contextmanager
-    def _submission_guard(self, pause_epoch, *, entry_check=None):
+    def _submission_guard(self, pause_epoch, *, entry_check=None, final_check=None):
         # A pause either commits before this check, or follows a request that
         # has already crossed the HTTP boundary. Never unlock between the two.
         from backend.paper_broker import BrokerRejected, BrokerStopped
@@ -201,6 +204,17 @@ class ExperimentService:
                     raise BrokerStopped("매수 직전 보유·주문 상태를 확인하지 못해 전송하지 않았습니다.") from None
                 if not available:
                     raise BrokerStopped("매수 직전 보유·주문 상태가 달라 재진입을 차단했습니다.")
+            if final_check is not None:
+                try:
+                    final_check()
+                except BrokerStopped:
+                    raise
+                except Exception:
+                    raise BrokerStopped("전송 직전 운영 권한·한도를 확인하지 못해 보내지 않았습니다.") from None
+            # Local DB/config checks can also wait. Keep the original 15:15
+            # boundary effective at the last instruction before HTTP entry.
+            if ended(self.now(), KIS_LAST_DAY) or self.stopping or not self._market_open():
+                raise BrokerStopped("전송 직전 주문 가능 시간이 끝나 보내지 않았습니다.")
             yield
 
     def _enforce_deadline(self):
@@ -547,7 +561,8 @@ class ExperimentService:
                     "strategies": self._specs(), "runs": self.store.runs(30, details=False),
                     "orders": list(reversed(orders[-200:])), "positions": positions,
                     "metrics": metrics, "events": self.store.events(), "learning": {
-                        **self.learning.snapshot(), 'account': learning_account}}
+                        **self.learning.snapshot(), 'account': learning_account,
+                        'intraday': self.intraday_policy.snapshot()}}
 
     def mirror_snapshot(self, *, after=0, limit=100):
         """Read verified fill observations without fetching data or enabling orders."""
@@ -782,6 +797,14 @@ class ExperimentService:
         from backend.daily_inputs import freeze_entry_selection, validate_entry_selection
         from backend.experiment_analysis import analyze_experiments, analysis_version, build_snapshot
         from backend.learning_policy import build_frame, policy_id, signals
+        current = self.now().astimezone(KST)
+        active = self.learning.daily.active()
+        if (active and active.get('type') == 'intraday_override'
+                and active.get('effective_day') == current.date().isoformat() and current.time() < daytime(16)):
+            approved = self.intraday_policy.resolve_analysis_run()
+            if approved is None:
+                raise OperationalBlock('승인한 장중 정책 원본을 확인할 수 없어 분석을 보류합니다.', 'intraday_policy')
+            return approved
         data = self.input_reader()
         # Do not reroll LLM recommendations from the same frozen daily input.
         normalized = build_snapshot(**data)
@@ -1397,6 +1420,15 @@ class ExperimentService:
         # The latest completed analysis must have existed before this session opened.
         runs = [run for run in self.store.runs(100, details=False) if run["as_of"] == prior_days[-1]
                 and stamp(run["created_at"]) < datetime.combine(today, daytime(9), KST)]
+        active = self.learning.daily.active()
+        if (active and active.get('type') == 'intraday_override'
+                and active.get('effective_day') == today.isoformat()):
+            approved = self.intraday_policy.resolve_run(today=today.isoformat(), broker_days=days)
+            runs = [approved] if approved is not None else []
+            if approved is None:
+                self._issue('intraday_policy', '승인한 장중 정책 근거가 일치하지 않아 신규 매수를 보류합니다.', blocking=False)
+            else:
+                self._resolve_issue('intraday_policy')
         adopted = self._adopted_policy()
         if adopted:
             from backend.learning_policy import BASELINE_POLICY, policy_id
@@ -1709,7 +1741,72 @@ class ExperimentService:
                    for key in strategies if index < len(groups[key])]
         return ordered, caps
 
+    def _maintenance_gate(self):
+        from backend.maintenance import MaintenanceGate
+        if not hasattr(self, '_maintenance'):
+            self._maintenance = MaintenanceGate(self.directory, now=self.now)
+        return self._maintenance
+
+    def _active_submission_pin(self, policy):
+        state = self.store.setting('daily_policy:' + str(policy.get('fingerprint')), {})
+        active = state.get('active')
+        if active is None:
+            return (state.get('revision', 0), None, None, None)
+        if active.get('revision') != state.get('revision'):
+            raise ValueError('active_revision_mismatch')
+        return (state['revision'], active.get('candidate_id'), active.get('run_id'), active.get('effective_day'))
+
+    def _final_submission_check(self, policy, decision, side, quantity, price, *,
+                                run_id, own_order_id, gate_revision, active_pin):
+        """Local checks inside submission.lock, after token/request-spacing waits.
+
+        No network read belongs here: the transport already holds its request
+        lock. The worker reconciles broker state before planning these orders.
+        """
+        from backend.paper_broker import BrokerStopped
+        gate = self._maintenance_gate().snapshot()
+        if gate['closed'] or gate['revision'] != gate_revision:
+            raise BrokerStopped('운영 전환 중이거나 전송 계획 이후 운영 게이트가 바뀌어 보내지 않았습니다.')
+        if self._policy() != policy or self.store.setting('user_paused', False):
+            raise BrokerStopped('전송 계획 이후 계좌·금액 한도·운영 권한이 바뀌어 보내지 않았습니다.')
+        self._profile(policy)
+        if side != 'buy':
+            return  # Existing lot exits are independent of a new entry policy.
+        current_pin = self._active_submission_pin(policy)
+        today = self.now().astimezone(KST).date().isoformat()
+        if current_pin != active_pin or (current_pin[3] == today and current_pin[2] != run_id):
+            raise BrokerStopped('활성 정책 revision 또는 승인된 분석 실행이 바뀌어 매수하지 않았습니다.')
+        if self._blocked() or self.learning_account.state(policy.get('fingerprint', '')).get('risk', {}).get('active'):
+            raise BrokerStopped('전송 직전 주문 차단 또는 손실 보호 상태를 확인해 매수하지 않았습니다.')
+        orders = [item for item in self._owned_orders(policy) if item['id'] != own_order_id]
+        if any(item['status'] in {'submitting', 'unknown', 'cancel_pending'} for item in orders):
+            raise BrokerStopped('전송 직전 다른 주문의 접수 여부가 미확정이어서 매수하지 않았습니다.')
+        cost = decimal(price, positive=True) * quantity * (1 + FEE)
+        daily = reserved = Decimal(0)
+        for item in orders:
+            if item['side'] != 'buy':
+                continue
+            pending = (decimal(item['limit_price']) * item.get('remaining_quantity', item['quantity'])
+                       * (1 + FEE) if item['status'] in ACTIVE else Decimal(0))
+            reserved += pending
+            if item['order_date'] == today:
+                daily += decimal(item['filled_amount']) * (1 + FEE) + pending
+        positions, _ = self._portfolio(orders)
+        used = sum((decimal(item['cost']) for item in positions), Decimal(0)) + reserved
+        if (cost > decimal(policy['order_cap']) or daily + cost > decimal(policy['daily_buy_limit'])
+                or used + cost > decimal(policy['budget'])):
+            raise BrokerStopped('전송 직전 주문·일일 매수·보유 금액 한도를 다시 확인해 매수하지 않았습니다.')
+
     def _submit(self, policy, broker, decision, side, quantity, price, intent_key, *, run_id):
+        try:
+            gate = self._maintenance_gate().snapshot()
+            active_pin = self._active_submission_pin(policy) if side == 'buy' else None
+        except Exception:
+            return  # Fail closed before reserving an intent when authority is unreadable.
+        if gate['closed'] or (side == 'buy' and active_pin[3] == self.now().astimezone(KST).date().isoformat()
+                             and active_pin[2] != run_id):
+            return
+        policy = deepcopy(policy)
         entry_check = None
         own_order_id = None
         if side == 'buy' and decision.get('no_same_day_reentry'):
@@ -1760,7 +1857,10 @@ class ExperimentService:
         from backend.paper_broker import BrokerRejected, BrokerStopped
         try:
             ack = broker.submit(order["symbol"], side, quantity, str(price),
-                                send_guard=lambda: self._submission_guard(pause_epoch, entry_check=entry_check))
+                                send_guard=lambda: self._submission_guard(pause_epoch, entry_check=entry_check,
+                                    final_check=lambda: self._final_submission_check(policy, decision, side, quantity, price,
+                                        run_id=run_id, own_order_id=own_order_id, gate_revision=gate['revision'],
+                                        active_pin=active_pin)))
         except BrokerStopped as error:
             self._enforce_deadline()
             order.update(status="cancelled", remaining_quantity=0, submission_skipped=True,
