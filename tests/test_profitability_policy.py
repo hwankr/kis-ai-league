@@ -1,12 +1,18 @@
 """Regression cases for bounded profitability options and inherited account risk."""
 from copy import deepcopy
+from datetime import datetime
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
+from backend.experiment_store import ExperimentStore
+from backend.learning import LearningService
 from backend.learning_history import enrich_selection
 from backend.learning_policy import (BASELINE_POLICY, build_frame, portfolio_metrics,
                                      position_exit_due, signals, validate_policy)
 from tests.test_learning_policy import LIMITS, days, frames, policy, row
+from tests.test_learning import raw_input
 
 
 class CandidateScopeTests(unittest.TestCase):
@@ -205,6 +211,79 @@ class InheritedProtectionTests(unittest.TestCase):
             self.assertFalse(result['valid'], kind)
             self.assertIn(result['error'], {'protection_quote_missing', 'execution_quote_outside_session', 'invalid_execution_quote'})
 
+    def test_separate_early_protection_quote_preserves_later_execution_prices(self):
+        observations = self.quoted_frames(holding_time='09:10:00', holding_price=107)
+        observations[1]['protection_quotes'] = {'005930': {
+            'price': 100, 'observed_at': observations[1]['as_of'] + 'T09:04:00+09:00'}}
+        initial = self.initial()
+        initial['account_protection']['peak'] = '1'
+        initial['positions'][0]['exit_policy']['holding_sessions'] = 1
+        before = deepcopy((observations, initial))
+        result = portfolio_metrics(policy(), observations, LIMITS, initial_state=initial,
+                                   execution_model={'mode': 'observed_quotes'})
+        self.assertTrue(result['valid'], result)
+        self.assertEqual(result['trading_activity']['gross_sell_amount'], 1070)
+        self.assertGreater(result['trading_activity']['gross_buy_amount'], 0)
+        self.assertEqual(result['final_state']['positions'][0]['symbol'], '000660')
+        self.assertEqual(result['final_state']['positions'][0]['entry_price'], '100')
+        self.assertEqual((observations, initial), before)
+
+    def test_explicit_protection_map_never_falls_back_and_keeps_time_price_checks(self):
+        cases = {'empty': ({}, 'protection_quote_missing'),
+                 'null': (None, 'protection_quote_missing'),
+                 'wrong_shape': ([], 'protection_quote_missing'),
+                 'late': ('09:06:00', 'protection_quote_after_decision'),
+                 'future': ('16:06:00', 'execution_quote_outside_session'),
+                 'zero': (0, 'invalid_execution_quote')}
+        for kind, (value, error) in cases.items():
+            with self.subTest(kind=kind):
+                observations = self.quoted_frames()
+                if kind in {'late', 'future', 'zero'}:
+                    value = {'005930': {'price': 0 if kind == 'zero' else 100,
+                        'observed_at': observations[1]['as_of'] + 'T' +
+                            ('09:04:00' if kind == 'zero' else value) + '+09:00'}}
+                observations[1]['protection_quotes'] = value
+                before = deepcopy(observations)
+                result = portfolio_metrics(policy(), observations, LIMITS, initial_state=self.initial(),
+                                           execution_model={'mode': 'observed_quotes'})
+                self.assertFalse(result['valid'], kind)
+                self.assertEqual(result['error'], error)
+                self.assertEqual(observations, before)
+
+    def test_protection_quotes_never_grant_trade_permission_or_supply_execution_quotes(self):
+        for missing in (False, True):
+            with self.subTest(missing_execution_quote=missing):
+                observations = self.quoted_frames()
+                observations[1]['protection_quotes'] = deepcopy(observations[1]['execution_quotes'])
+                if missing:
+                    del observations[1]['execution_quotes']['000660']
+                else:
+                    observations[1]['execution_quotes']['000660']['eligible'] = False
+                initial = self.initial()
+                initial['account_protection']['peak'] = '1'
+                result = portfolio_metrics(policy(), observations, LIMITS, initial_state=initial,
+                                           execution_model={'mode': 'observed_quotes'})
+                if missing:
+                    self.assertFalse(result['valid'])
+                    self.assertEqual(result['error'], 'execution_quote_missing')
+                else:
+                    self.assertTrue(result['valid'], result)
+                    self.assertEqual(result['trading_activity']['gross_buy_amount'], 0)
+
+    def test_absent_protection_map_retains_legacy_replay_without_mutating_frames(self):
+        observations = self.quoted_frames()
+        before = deepcopy(observations)
+        legacy = portfolio_metrics(policy(), observations, LIMITS, initial_state=self.initial(),
+                                   execution_model={'mode': 'observed_quotes'})
+        explicit = deepcopy(observations)
+        explicit[1]['protection_quotes'] = deepcopy(explicit[1]['execution_quotes'])
+        separate = portfolio_metrics(policy(), explicit, LIMITS, initial_state=self.initial(),
+                                     execution_model={'mode': 'observed_quotes'})
+        self.assertTrue(legacy['valid'], legacy)
+        self.assertEqual(legacy, separate)
+        self.assertEqual(observations, before)
+        self.assertTrue(all('protection_quotes' not in frame for frame in observations))
+
     def test_later_close_does_not_change_earlier_buy_but_can_activate_close_protection(self):
         initial = self.initial()
         initial['account_protection']['peak'] = '1'
@@ -219,6 +298,35 @@ class InheritedProtectionTests(unittest.TestCase):
         self.assertGreater(outputs[0]['equity_curve'][1]['buy_cost'], 0)
         self.assertFalse(outputs[0]['final_state']['account_protection']['active'])
         self.assertTrue(outputs[1]['final_state']['account_protection']['active'])
+
+
+class ProtectionQuoteFrameTests(unittest.TestCase):
+    def test_both_learning_modes_freeze_optional_quotes_without_retrofitting_old_frames(self):
+        for daily in (False, True):
+            for supplied in (False, True):
+                with self.subTest(daily=daily, supplied=supplied), tempfile.TemporaryDirectory() as directory:
+                    store = ExperimentStore(Path(directory) / 'experiments.sqlite3')
+                    data = raw_input(0)
+                    current = datetime.fromisoformat(data['observed_at'])
+                    learner = LearningService(store, enabled=True, daily_enabled=daily, now=lambda: current)
+                    self.addCleanup(learner.close)
+                    context = {'execution_quotes': {}}
+                    quotes = {'005930': {'price': 100, 'observed_at': data['as_of'] + 'T09:04:00+09:00'}}
+                    if supplied:
+                        context['protection_quotes'] = deepcopy(quotes)
+                    learner.process(data, [], LIMITS, context=context)
+                    frozen = learner.frames()[0]
+                    with store.connect() as db:
+                        original = db.execute('SELECT digest,payload FROM learning_frames').fetchone()
+                    self.assertEqual('protection_quotes' in frozen, supplied)
+                    if supplied:
+                        self.assertEqual(frozen['protection_quotes'], quotes)
+                    learner.process(data, [], LIMITS, context=context)
+                    context['protection_quotes'] = {'005930': {**quotes['005930'], 'price': 1}}
+                    learner.process(data, [], LIMITS, context=context)
+                    self.assertEqual(learner.frames()[0], frozen)
+                    with store.connect() as db:
+                        self.assertEqual(db.execute('SELECT digest,payload FROM learning_frames').fetchone(), original)
 
 
 if __name__ == "__main__":

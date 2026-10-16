@@ -18,6 +18,7 @@ VERSION = "daily-award-development-v5"
 EPSILON = 1e-9
 MAXIMUM_DRAWDOWN_PCT = 15.
 METRICS = ("net_return_pct", "stress_return_pct", "max_drawdown_pct", "stress_drawdown_pct")
+PORTFOLIO_INPUT_ERRORS = frozenset({"protection_quote_missing", "protection_quote_after_decision"})
 
 
 def _finite(value):
@@ -33,6 +34,10 @@ def _finite(value):
 
 def _metrics(raw, dates, recent):
     _finite(raw)
+    if isinstance(raw, dict) and raw.get("valid") is False:
+        error = raw.get("error")
+        if isinstance(error, str) and error in PORTFOLIO_INPUT_ERRORS:
+            raise ValueError(error)
     normal, stress, actual_dates = _series(raw)
     if actual_dates != dates or len(normal) != len(dates) - 1:
         raise ValueError("unpaired_evaluation_dates")
@@ -53,6 +58,18 @@ def _metrics(raw, dates, recent):
     result["recent_stress_return_pct"] = math.expm1(math.fsum(stress[-recent:])) * 100
     _finite(result)
     return result
+
+
+def _replay_input_errors(raw):
+    if not isinstance(raw, dict):
+        return set()
+    outcomes = [raw]
+    scenarios = raw.get("scenario_results")
+    if isinstance(scenarios, dict):
+        outcomes.extend(scenarios.values())
+    return {item["error"] for item in outcomes
+            if isinstance(item, dict) and item.get("valid") is False
+            and isinstance(item.get("error"), str) and item["error"] in PORTFOLIO_INPUT_ERRORS}
 
 
 def _observed_legacy_suffix(frames):
@@ -145,6 +162,7 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
     """
     result = {"decision": "blocked", "reason": "일일 비교 자료를 확인할 수 없습니다.",
               "metrics": {"basis": "development_only"}, "changes": [], "version": VERSION}
+    replay_errors = set()
     try:
         _finite((champion, proposal, frames, limits, evaluation_context))
         drawdown_limit = (evaluation_context or {}).get("maximum_drawdown_pct", MAXIMUM_DRAWDOWN_PCT)
@@ -210,6 +228,7 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
             raw_candidate = evaluate(deepcopy(candidate), deepcopy(frames), deepcopy(limits), **deepcopy(options))
         except Exception:
             raise ValueError("evaluation_failed") from None
+        replay_errors = _replay_input_errors(raw_parent) | _replay_input_errors(raw_candidate)
         a, b = (_metrics(raw, dates, recent) for raw in (raw_parent, raw_candidate))
         compared = _comparison(a, b, drawdown_limit)
         scenarios = {}
@@ -251,8 +270,14 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
                  "inconsistent_evaluation_summary", "insufficient_observed_baseline", "invalid_evaluation_context",
                  "unresolved_evaluation_book", "evaluation_anchor_missing", "insufficient_context_intervals",
                  "evaluation_context_not_known_at_anchor", "unpaired_execution_scenarios"}
-        known.update({"invalid_evaluation_drawdown_limit", "invalid_capacity_contract"})
+        known.update({"invalid_evaluation_drawdown_limit", "invalid_capacity_contract",
+                      "invalid_portfolio_evaluation", "invalid_daily_return", "missing_daily_returns",
+                      "interval_count_mismatch", "missing_evaluation_dates", "invalid_evaluation_dates",
+                      "cost_scenarios_not_aligned"})
+        known.update(PORTFOLIO_INPUT_ERRORS)
         result["metrics"]["error"] = reason if reason in known else "invalid_evaluation_input"
+        if replay_errors:
+            result["metrics"]["replay_diagnostics"] = {"stage": "portfolio_replay", "codes": sorted(replay_errors)}
         return result
 
 

@@ -68,6 +68,22 @@ def evaluation_context(store, fingerprint, frames, limits, version):
     return None
 
 
+def observation_books(store, fingerprint, as_of, limits, version):
+    """Quote requirements only: never substitute live holdings into a frozen book."""
+    if not fingerprint:
+        return []
+    expected = {key: str(limits[key]) for key in ('budget', 'order_cap', 'daily_buy_limit')}
+    with store.connect() as db:
+        rows = db.execute('''SELECT payload FROM daily_policy_contexts
+            WHERE fingerprint=? AND day<=? ORDER BY day DESC LIMIT 120''', (fingerprint, as_of)).fetchall()
+    books = []
+    for (payload,) in rows:
+        value = json.loads(payload)
+        if value['engine_version'] == version and value['limits'] == expected:
+            books.append(deepcopy(value['initial_state']))
+    return books
+
+
 def _brief(result):
     keys = ('net_return_pct', 'stress_return_pct', 'max_drawdown_pct', 'stress_drawdown_pct', 'closed_trades')
     value = {key: result.get(key) for key in keys}

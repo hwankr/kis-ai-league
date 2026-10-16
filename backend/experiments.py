@@ -1012,6 +1012,10 @@ class ExperimentService:
             quotes = self.store.setting('learning_quotes', {})
             if quotes.get('day') == str(data['as_of']) and quotes.get('fingerprint') == policy.get('fingerprint'):
                 context['execution_quotes'] = quotes.get('quotes', {})
+            protection_quotes = self.store.setting('learning_protection_quotes', {})
+            if (protection_quotes.get('day') == str(data['as_of'])
+                    and protection_quotes.get('fingerprint') == policy.get('fingerprint')):
+                context['protection_quotes'] = protection_quotes.get('quotes', {})
             current = self.now().astimezone(KST)
             if current.date().isoformat() == str(data['as_of']) and current.time() >= daytime(16):
                 orders = self._owned_orders(policy)
@@ -1060,6 +1064,36 @@ class ExperimentService:
                 'eligible': eligible, 'buy_eligible': buy_eligible, 'observed_at': self._timestamp(), **context}
             self.store.save_setting('learning_quotes', state)
 
+    def _save_protection_quotes(self, observations):
+        """Retain the first real valuation observation; never grant execution eligibility."""
+        policy = self._policy()
+        if not self.learning.enabled or policy.get('execution_strategy') != ALL_STRATEGIES:
+            return
+        now = self.now()
+        today = now.astimezone(KST).date().isoformat()
+        state = self.store.setting('learning_protection_quotes', {})
+        changed = state.get('day') != today or state.get('fingerprint') != policy.get('fingerprint')
+        if changed:
+            state = {'day': today, 'fingerprint': policy.get('fingerprint'), 'quotes': {}}
+        for symbol, observation in observations.items():
+            if symbol in state['quotes']:
+                continue
+            try:
+                observed = stamp(observation['observed_at'])
+                source = observation['source']
+                if source not in {'account_snapshot', 'decision_quote', 'unavailable'}:
+                    continue
+                price = None if source == 'unavailable' else decimal(observation['price'], positive=True)
+                if observed.astimezone(KST).date().isoformat() != today or not 0 <= (now - observed).total_seconds() <= 180:
+                    continue
+            except (KeyError, TypeError, ValueError, KisError):
+                continue
+            state['quotes'][symbol] = {'price': str(price) if price is not None else None,
+                                      'observed_at': observed.isoformat(), 'source': source}
+            changed = True
+        if changed:
+            self.store.save_setting('learning_protection_quotes', state)
+
     def _observe_learning_quotes(self, policy):
         """One small decision-price observation per symbol/day, including a frozen challenger."""
         if policy.get('execution_strategy') != ALL_STRATEGIES:
@@ -1080,7 +1114,9 @@ class ExperimentService:
             policies.append(state['trial']['policy'])
         # Observation is not an executable signal rerank. Include the actual
         # frozen run as well as each prospective book's required quote set.
-        live_context = canonical_entry_context(self._entry_selection_book())
+        live_book = self._entry_selection_book()
+        live_context = canonical_entry_context(live_book)
+        held = set()
         wanted = {row['symbol'] for candidate in policies for row in signals(candidate, frame,
                   entry_context=live_context if candidate.get('held_before_top_n') else None)}
         for run in self.store.runs(100, details=False):
@@ -1092,6 +1128,7 @@ class ExperimentService:
             # Profiles carry independent normal/stress books. Their frozen
             # pending entries and backfilled ranks can differ from the live book.
             if 'positions' in book:
+                held.update(row['symbol'] for row in book.get('positions', []))
                 for key in ('positions', 'reserved_entries', 'pending_entries'):
                     wanted.update(row['symbol'] for row in book.get(key, []))
                 wanted.update(row['symbol'] for row in signals(candidate, frame,
@@ -1102,6 +1139,13 @@ class ExperimentService:
             for nested in (book.get('scenarios') or {}).values():
                 include_book(nested, candidate)
 
+        include_book(live_book, active_policy)
+        daily = getattr(self.learning, 'daily', None)
+        if daily is not None and daily.enabled:
+            from backend.daily_comparison import observation_books
+            for book in observation_books(self.store, policy.get('fingerprint'), frame['as_of'],
+                                          policy, daily.engine_version):
+                include_book(book, active_policy)
         include_book(state.get('scorecard_book'), BASELINE_POLICY)
         trial = state.get('trial') or {}
         wanted.update(trial.get('attribution_quote_symbols', []))
@@ -1116,7 +1160,13 @@ class ExperimentService:
                         include_book(replay.get(key), trial_policies.get(role, active_policy))
         quotes = self.store.setting('learning_quotes', {})
         seen = quotes.get('quotes', {}) if quotes.get('day') == today and quotes.get('fingerprint') == policy.get('fingerprint') else {}
-        missing = sorted(wanted - seen.keys())[:5]
+        # A holding is needed for NAV even when held-before-top-N excludes it
+        # from every buy signal. Observe these before extra research entries.
+        protection = self.store.setting('learning_protection_quotes', {})
+        marked = (protection.get('quotes', {}) if protection.get('day') == today
+                  and protection.get('fingerprint') == policy.get('fingerprint') else {})
+        missing_marks = held - marked.keys()
+        missing = (sorted(missing_marks) + sorted(wanted - seen.keys() - missing_marks))[:5]
         if missing:
             broker = self._broker(policy)
             if today not in broker.session_days(frame['as_of'], today):
@@ -1129,8 +1179,14 @@ class ExperimentService:
             for symbol in missing:
                 buy_eligible = account['holdings'].get(symbol, {}).get('quantity', 0) <= owned.get(symbol, 0)
                 try:
-                    self._save_learning_quote(symbol, self._live_quote(broker, symbol), buy_eligible=buy_eligible)
+                    price = self._live_quote(broker, symbol)
+                    self._save_protection_quotes({symbol: {'price': price,
+                        'observed_at': self._decision_quote(symbol, price).get('observed_at'),
+                        'source': 'decision_quote'}})
+                    self._save_learning_quote(symbol, price, buy_eligible=buy_eligible)
                 except SymbolUnavailable:
+                    self._save_protection_quotes({symbol: {'price': None,
+                        'observed_at': self._timestamp(), 'source': 'unavailable'}})
                     self._save_learning_quote(symbol, eligible=False, buy_eligible=buy_eligible)
 
     def _llm_retry_state(self, run):
@@ -1322,6 +1378,24 @@ class ExperimentService:
         return price
 
     def _cycle(self):
+        self._cycle_protection_quotes = None
+        try:
+            return self._trade_cycle()
+        finally:
+            # Research persistence follows all trading work, including protective
+            # cancellations/exits. It must not hide an original trading error.
+            try:
+                if self._cycle_protection_quotes is not None:
+                    self._save_protection_quotes(self._cycle_protection_quotes)
+                    self._resolve_issue('protection_observation')
+            except Exception:
+                try:
+                    self._issue('protection_observation', '연구용 보호 시세 저장 실패 · 평가 자료 확인 필요',
+                                blocking=False)
+                except Exception:
+                    pass
+
+    def _trade_cycle(self):
         self._enforce_deadline()
         policy = self._policy()
         broker = self._reconcile(policy)
@@ -1363,14 +1437,20 @@ class ExperimentService:
         if policy.get('fingerprint'):
             from backend.learning_account import owned_book
             prices = {}
+            valuation_observations = {}
             for position in positions:
                 symbol = position['symbol']
                 price = account['holdings'].get(symbol, {}).get('price')
                 if price is None:
                     price = self._symbol_quote(broker, symbol,
                         buy_eligible=account['holdings'].get(symbol, {}).get('quantity', 0) <= owned[symbol])
+                    observed_at = self._decision_quote(symbol, price).get('observed_at')
+                    source = 'decision_quote'
+                else:
+                    observed_at, source = account.get('as_of'), 'account_snapshot'
                 if price is not None:
                     prices[symbol] = price
+                    valuation_observations[symbol] = {'price': price, 'observed_at': observed_at, 'source': source}
             _, metrics = self._portfolio(orders)
             try:
                 book = owned_book(policy, positions, metrics, orders, prices,
@@ -1380,6 +1460,7 @@ class ExperimentService:
             except ValueError:
                 raise OperationalBlock('AI 보유 평가가격이 없어 손실 한도를 확인할 수 없습니다.', 'risk_valuation') from None
             self._resolve_issue('risk_valuation')
+            self._cycle_protection_quotes = valuation_observations
             if protected:
                 for order in orders:
                     if order['side'] == 'buy' and order['status'] in {'submitted', 'partial'} and order['order_date'] == today.isoformat():

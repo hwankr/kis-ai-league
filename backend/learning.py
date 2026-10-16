@@ -339,6 +339,8 @@ class LearningService:
         frame = build_frame(data, baseline_signals)
         frame['captured_at'] = self._timestamp()
         frame['execution_quotes'] = deepcopy(context.get('execution_quotes', {}))
+        if 'protection_quotes' in context:
+            frame['protection_quotes'] = deepcopy(context['protection_quotes'])
         digest = _hash({key: value for key, value in frame.items() if key not in {'observed_at', 'captured_at'}})
         state = self.state()
         with self.store.connect() as db:
@@ -516,6 +518,8 @@ class LearningService:
         frame = build_frame(data, baseline_signals)
         frame['captured_at'] = self._timestamp()
         frame['execution_quotes'] = deepcopy((context or {}).get('execution_quotes', {}))
+        if 'protection_quotes' in (context or {}):
+            frame['protection_quotes'] = deepcopy(context['protection_quotes'])
         with self.store.connect() as db:
             prior = db.execute('SELECT payload FROM learning_frames WHERE day=?', (frame['as_of'],)).fetchone()
             if prior is None:
@@ -535,6 +539,8 @@ class LearningService:
                 frame.update(captured_at=self._timestamp(),
                              execution_quotes=deepcopy((context or {}).get('execution_quotes', {})),
                              signal_inputs=deepcopy(frozen['signal_inputs']))
+                if 'protection_quotes' in (context or {}):
+                    frame['protection_quotes'] = deepcopy(context['protection_quotes'])
             ignored = {'observed_at', 'captured_at', 'benchmark_prices'}
             comparable = enrich_selection(frozen, frame)
             if ({key: value for key, value in comparable.items() if key not in ignored}

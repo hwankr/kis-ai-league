@@ -435,6 +435,130 @@ class DailyEvaluationTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["error"], "evaluation_failed")
         self.assertNotIn("private", json.dumps(result))
 
+    def test_series_validation_errors_are_preserved_for_either_policy(self):
+        errors = ("invalid_portfolio_evaluation", "invalid_daily_return", "missing_daily_returns",
+                  "interval_count_mismatch", "missing_evaluation_dates", "invalid_evaluation_dates",
+                  "cost_scenarios_not_aligned")
+        for error in errors:
+            for side in (0, 1):
+                outputs = [evidence([0.]), evidence([.001])]
+                raw = outputs[side]
+                if error == "invalid_portfolio_evaluation":
+                    raw["valid"] = False
+                elif error == "invalid_daily_return":
+                    raw["daily_log_returns"][0] = "private value"
+                elif error == "missing_daily_returns":
+                    raw["stress_daily_log_returns"] = []
+                elif error == "interval_count_mismatch":
+                    raw["intervals"] = 2
+                elif error == "missing_evaluation_dates":
+                    raw["equity_curve"].pop()
+                elif error == "invalid_evaluation_dates":
+                    raw["equity_curve"][1]["as_of"] = raw["equity_curve"][0]["as_of"]
+                else:
+                    raw["stress_equity_curve"][1]["as_of"] = "2026-07-03"
+                with self.subTest(error=error, side=side):
+                    result = self.evaluate(*outputs)
+                    self.assertEqual(result["decision"], "blocked")
+                    self.assertEqual(result["metrics"]["error"], error)
+                    self.assertNotIn("private", json.dumps(result, allow_nan=False))
+
+    def test_failed_replay_exposes_only_allowlisted_errors(self):
+        safe = {"protection_quote_missing", "protection_quote_after_decision"}
+        for error in (*sorted(safe), "private token=secret", "private_secret", ["private secret"]):
+            for side in (0, 1):
+                outputs = [evidence([0.]), evidence([.001])]
+                outputs[side].update(valid=False, error=error)
+                with self.subTest(error=error, side=side):
+                    result = self.evaluate(*outputs)
+                    expected = error if isinstance(error, str) and error in safe else "invalid_portfolio_evaluation"
+                    self.assertEqual(result["decision"], "blocked")
+                    self.assertEqual(result["metrics"]["error"], expected)
+                    self.assertNotIn("private", json.dumps(result, allow_nan=False))
+
+    def test_scenario_diagnostics_survive_unknown_primary_and_unpaired_results(self):
+        observations = frames(2)
+        context = {"initial_state": {"as_of": observations[0]["as_of"], "cash": "10000"},
+                   "execution_model": {"scenarios": [{"id": "base"}, {"id": "adverse"}]},
+                   "observed_at": observations[0]["observed_at"]}
+        outcomes = [("private first", {"valid": False, "error": "private token=secret"}),
+                    ("private missing", {"valid": False, "error": "protection_quote_missing"}),
+                    ("private late", {"valid": False, "error": "protection_quote_after_decision"})]
+        for valid in (False, True):
+            for side in (0, 1):
+                for reverse in (False, True):
+                    outputs = [evidence([0.]), evidence([.001])]
+                    outputs[1 - side]["scenario_results"] = {"base": evidence([0.]), "adverse": evidence([0.])}
+                    outputs[side].update(valid=valid, error="private top-level",
+                        scenario_results=dict(reversed(outcomes) if reverse else outcomes))
+                    with self.subTest(valid=valid, side=side, reverse=reverse):
+                        result = evaluate_daily_candidate(policy(), changed(), observations, LIMITS,
+                            evaluator=Mock(side_effect=outputs), evaluation_context=context)
+                        self.assertEqual(result["decision"], "blocked")
+                        self.assertEqual(result["metrics"]["error"],
+                            "unpaired_execution_scenarios" if valid else "invalid_portfolio_evaluation")
+                        self.assertEqual(result["metrics"]["replay_diagnostics"], {
+                            "stage": "portfolio_replay",
+                            "codes": ["protection_quote_after_decision", "protection_quote_missing"]})
+                        self.assertNotIn("private", json.dumps(result, allow_nan=False))
+
+    def test_valid_replay_result_is_unchanged_by_unused_error_field(self):
+        outputs = [evidence([0.]), evidence([.001])]
+        expected = self.evaluate(*outputs)
+        outputs[0]["error"] = "protection_quote_missing"
+        outputs[1]["error"] = "private token=secret"
+        self.assertEqual(self.evaluate(*outputs), expected)
+
+    def test_two_frame_protected_replay_requires_quotes_in_every_scenario(self):
+        from backend.learning_account import execution_profile
+        observations = frames(2)
+        for frame in observations:
+            frame["rows"][0]["learning_eligible"] = False
+        context = {
+            "initial_state": {
+                "as_of": observations[0]["as_of"], "cash": "9000", "positions": [
+                    {"symbol": "005930", "strategy_id": "momentum", "quantity": 10,
+                     "cost": "1000", "entry_price": "100", "last_close": "100", "held_sessions": 0,
+                     "exit_policy": {"holding_sessions": 5, "stop_loss_pct": 0, "take_profit_pct": 0}}],
+                "account_protection": {"units": "10000", "peak": "1", "active": False, "limit_pct": 15}},
+            "execution_model": execution_profile([]),
+            "observed_at": observations[0]["observed_at"]}
+        before = deepcopy((observations, context, LIMITS))
+        blocked = evaluate_daily_candidate(policy(), changed(), observations, LIMITS, evaluation_context=context)
+        self.assertEqual(blocked["decision"], "blocked")
+        self.assertEqual(blocked["metrics"]["error"], "protection_quote_missing")
+        self.assertEqual((observations, context, LIMITS), before)
+
+        observations[1]["execution_quotes"] = {"005930": {
+            "price": 100, "volume": 1000, "eligible": True,
+            "observed_at": observations[1]["as_of"] + "T09:10:00+09:00"}}
+        before = deepcopy((observations, context, LIMITS))
+        result = evaluate_daily_candidate(policy(), changed(), observations, LIMITS, evaluation_context=context)
+        self.assertEqual(result["decision"], "keep")
+        self.assertNotIn("error", result["metrics"])
+        self.assertEqual(result["metrics"]["intervals"], 1)
+        self.assertTrue(result["metrics"]["account_protection_inherited"])
+        self.assertEqual(result["metrics"]["maximum_drawdown_pct"], 15)
+        self.assertEqual(set(result["metrics"]["scenario_comparisons"]),
+                         {"partial_fill", "delayed_sell", "adverse_buy"})
+        for comparison in result["metrics"]["scenario_comparisons"].values():
+            self.assertEqual(comparison["champion"], comparison["candidate"])
+            self.assertFalse(comparison["eligible"])
+        self.assertEqual((observations, context, LIMITS), before)
+
+        for frame in observations:
+            frame["rows"].append({**deepcopy(frame["rows"][0]), "symbol": "000660", "learning_eligible": True})
+        observations[1]["execution_quotes"]["000660"] = {
+            "price": 100, "volume": 1000, "eligible": True,
+            "observed_at": observations[1]["as_of"] + "T09:05:00+09:00"}
+        before = deepcopy((observations, context, LIMITS))
+        blocked = evaluate_daily_candidate(policy(), changed(), observations, LIMITS, evaluation_context=context)
+        self.assertEqual(blocked["decision"], "blocked")
+        self.assertEqual(blocked["metrics"]["error"], "protection_quote_after_decision")
+        self.assertEqual(blocked["metrics"]["replay_diagnostics"], {
+            "stage": "portfolio_replay", "codes": ["protection_quote_after_decision"]})
+        self.assertEqual((observations, context, LIMITS), before)
+
     def test_real_replay_uses_same_costs_and_does_not_require_60_sessions(self):
         observations = observed_frames(5)
         for index, frame in enumerate(observations):

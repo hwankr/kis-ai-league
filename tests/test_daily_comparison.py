@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from backend.daily_comparison import (ensure_tables, evaluation_context, freeze_context,
-                                     followup_summaries, update_followups)
+                                     followup_summaries, observation_books, update_followups)
 from backend.experiment_store import ExperimentStore, encode
 from backend.learning_policy import BASELINE_POLICY, LEGACY_IDS, portfolio_metrics
 from tests.test_learning_policy import LIMITS, frames, policy
@@ -97,6 +97,75 @@ class DailyComparisonTests(unittest.TestCase):
         self.freeze()
         selected = evaluation_context(self.store, 'a', self.frames, LIMITS, self.version)
         self.assertEqual(selected['initial_state']['as_of'], self.frames[0]['as_of'])
+
+    def test_observation_books_separates_account_engine_and_every_limit(self):
+        self.freeze()
+        other_book = {**self.book, 'cash': '8000'}
+        self.freeze(fingerprint='b', book=other_book)
+        for fingerprint in (None, '', 'other'):
+            with self.subTest(fingerprint=fingerprint):
+                self.assertEqual(observation_books(self.store, fingerprint, self.day, LIMITS, self.version), [])
+        self.assertEqual(observation_books(self.store, 'a', self.day, LIMITS, 'other-version'), [])
+        for key in ('budget', 'order_cap', 'daily_buy_limit'):
+            with self.subTest(limit=key):
+                changed = {**LIMITS, key: str(int(LIMITS[key]) + 1)}
+                self.assertEqual(observation_books(self.store, 'a', self.day, changed, self.version), [])
+        numeric_limits = {key: int(value) for key, value in LIMITS.items()}
+        self.assertEqual(observation_books(self.store, 'a', self.day, numeric_limits, self.version), [self.book])
+        self.assertEqual(observation_books(self.store, 'b', self.day, LIMITS, self.version), [other_book])
+
+    def test_observation_books_includes_same_day_but_excludes_future_and_incompatible_contexts(self):
+        self.freeze()
+        for index, changes in ((1, {'version': 'old-engine'}),
+                               (2, {'limits': {**LIMITS, 'budget': '20000'}}), (3, {})):
+            frame = self.frames[index]
+            self.freeze(frame=frame, book={**self.book, 'as_of': frame['as_of']},
+                        observed=frame['observed_at'], **changes)
+        saved = self.contexts()
+        self.assertEqual(observation_books(self.store, 'a', '0001-01-01', LIMITS, self.version), [])
+        self.assertEqual(observation_books(self.store, 'a', self.day, LIMITS, self.version), [self.book])
+        self.assertEqual(observation_books(self.store, 'a', self.frames[2]['as_of'], LIMITS, self.version), [self.book])
+        found = observation_books(self.store, 'a', self.frames[3]['as_of'], LIMITS, self.version)
+        self.assertEqual([book['as_of'] for book in found], [self.frames[3]['as_of'], self.day])
+        self.assertEqual(self.contexts(), saved)
+
+    def test_observation_books_are_deep_copies_and_keep_original_payloads(self):
+        book = {**deepcopy(self.book),
+                'positions': [{'symbol': '005930', 'quantity': 2,
+                               'exit_policy': {'holding_sessions': 5, 'stop_loss_pct': 0}}],
+                'reserved_entries': [{'symbol': '000660', 'quantity': 1}],
+                'pending_entries': [{'symbol': '035420', 'quantity': 1}],
+                'account_protection': {'units': '10000', 'peak': '1.1', 'active': False, 'limit_pct': 15}}
+        original = deepcopy(book)
+        self.freeze(book=book)
+        frame = self.frames[1]
+        self.freeze(frame=frame, book={**self.book, 'as_of': frame['as_of']},
+                    observed=frame['observed_at'], version='old-engine')
+        saved = self.contexts()
+        found = observation_books(self.store, 'a', frame['as_of'], LIMITS, self.version)
+        self.assertEqual(found, [original])
+        found[0]['positions'][0]['exit_policy']['holding_sessions'] = 1
+        found[0]['reserved_entries'].clear()
+        found[0]['pending_entries'][0]['symbol'] = '000001'
+        found[0]['account_protection']['peak'] = '99'
+        found.append({'positions': []})
+        self.assertEqual(observation_books(self.store, 'a', frame['as_of'], LIMITS, self.version), [original])
+        self.assertEqual(self.contexts(), saved)
+        self.assertEqual(book, original)
+
+    def test_observation_books_retains_frozen_holding_after_later_actual_book_is_empty(self):
+        frozen = {**deepcopy(self.book), 'positions': [{'symbol': '005930', 'quantity': 2,
+                    'exit_policy': {'holding_sessions': 5, 'stop_loss_pct': 0, 'take_profit_pct': 0}}]}
+        self.freeze(book=frozen)
+        later = self.frames[1]
+        sold_book = {**deepcopy(self.book), 'as_of': later['as_of']}
+        self.freeze(frame=later, book=sold_book, observed=later['observed_at'])
+        saved = self.contexts()
+        found = observation_books(self.store, 'a', later['as_of'], LIMITS, self.version)
+        self.assertEqual(found, [sold_book, frozen])
+        self.assertEqual({item['symbol'] for book in found for item in book['positions']}, {'005930'})
+        self.assertEqual(found[0]['positions'], [])
+        self.assertEqual(self.contexts(), saved)
 
     def test_followup_matches_direct_paired_replay_and_preserves_immutable_seed(self):
         record = self.record()

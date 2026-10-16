@@ -149,6 +149,58 @@ class DailyPolicyTests(unittest.TestCase):
         self.assertIsNone(self.service.pending())
         self.assertEqual(self.service.policy(), self.parent)
 
+    def test_blocked_decision_survives_engine_change_and_restarts_without_research_or_preparation(self):
+        prior = self.prepare()
+        self.allow_orders()
+        self.next_session()
+        self.assertTrue(self.service.activate(prior, effective_day='2026-10-13'))
+        active, preparations = self.service.active(), self.preparations()
+        self.completed_next_day()
+        self.proposer.reset_mock()
+        self.evaluator.reset_mock()
+        self.result.update(decision='blocked', reason='비교 자료 미확인',
+                           metrics={'error': 'invalid_evaluation_input'})
+        self.process()
+        blocked = self.service.history()[0]
+        self.assertEqual(blocked['decision'], 'blocked')
+        self.assertEqual(blocked['metrics']['error'], 'invalid_evaluation_input')
+        self.assertIn('research_inputs', blocked)
+        self.assertIsNone(self.service.pending())
+
+        def original_rows():
+            with self.store.connect() as db:
+                return {table: db.execute(f'SELECT * FROM {table} ORDER BY 1').fetchall()
+                        for table in ('settings', 'runs', 'run_index', 'learning_policies',
+                                      'daily_policy_decisions', 'daily_policy_preparations')}
+
+        originals = original_rows()
+        # A fixed evaluator could now apply, but a completed blocked decision is
+        # not a retryable error. A new engine must not reopen today's research.
+        self.result.update(decision='apply', reason='수정된 평가', metrics=None)
+        with patch('backend.daily_policy.source_version', return_value='changed-test-engine'):
+            for restarted in (False, True, True):
+                with self.subTest(restarted=restarted):
+                    service = self.make_service(store=ExperimentStore(self.path)) if restarted else self.service
+                    if restarted:
+                        self.assertNotEqual(service.engine_version, blocked['engine_version'])
+                        self.assertNotEqual(service.learning_engine_version, prior['prepared_run']['learning_engine_version'])
+                    for _ in range(2):
+                        self.current += timedelta(minutes=1)
+                        self.process(data={**self.data, 'observed_at': self.current.isoformat()}, service=service)
+                    self.assertEqual(service.history()[0], blocked)
+                    self.assertEqual(service.state()['status'], 'blocked')
+                    self.assertEqual(service.active(), active)
+                    self.assertIsNone(service.pending())
+                    self.assertEqual(self.preparations(), preparations)
+                    self.assertEqual(original_rows(), originals)
+        self.proposer.assert_called_once()
+        self.evaluator.assert_called_once()
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM daily_policy_decisions WHERE fingerprint=? AND day=?',
+                                        ('account-a', self.data['as_of'])).fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM daily_policy_preparations WHERE day=?',
+                                        (self.data['as_of'],)).fetchone()[0], 0)
+
     def test_pool_winner_is_persisted_and_prepared_with_matching_metadata(self):
         alternate = deepcopy(self.candidate)
         alternate['name'] = '수익 우위 후보'

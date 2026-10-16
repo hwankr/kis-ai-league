@@ -675,7 +675,11 @@ def _replay(policy, frames, limits, model, initial_state, *, stress=False, execu
                 bar = bar_for(symbol)
                 price = bar["open"]
                 if model["mode"] == "observed_quotes":
-                    quote = frame.get("execution_quotes", {}).get(symbol)
+                    # A valuation observation never supplies an execution price
+                    # or trading permission. Legacy frames retain their source.
+                    quotes = (frame["protection_quotes"] if "protection_quotes" in frame
+                              else frame.get("execution_quotes", {}))
+                    quote = quotes.get(symbol) if isinstance(quotes, dict) else None
                     if not isinstance(quote, dict) or quote.get("price") is None:
                         raise ValueError("protection_quote_missing")
                     observed = _instant(quote.get("observed_at"))
