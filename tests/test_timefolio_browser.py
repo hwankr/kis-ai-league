@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from backend.kis import KST
 from backend.mirror_runtime import MirrorBlocked, MirrorRejected, MirrorUnknown
 from backend.timefolio_browser import CONTEST, GRID_DOM, GUIDELINE_DOM, ORIGIN, TimefolioBrowser, match_receipt
+from backend.timefolio_dom import parse_receipts
 
 
 NOW = datetime(2026, 10, 12, 10, 0, tzinfo=KST)
@@ -695,6 +696,248 @@ class TimefolioBrowserTests(unittest.TestCase):
         with self.assertRaisesRegex(MirrorBlocked, "changed_during_scroll"):
             self.browser._grid_dom(SimpleNamespace(evaluate=evaluate), expected=3)
         self.assertEqual(position["top"], 40)
+
+
+class _ReadRemountPage(FakePage):
+    """A post-submit view whose Orders link cannot complete its click."""
+    def __init__(self):
+        super().__init__()
+        self.navigations = []
+        self.order_link_blocked = True
+        self.after_navigation = None
+        self.waits = []
+
+    def goto(self, url, **kwargs):
+        self.navigations.append((url, kwargs))
+        self.url = url
+        self.order_link_blocked = False
+        if self.after_navigation:
+            self.after_navigation()
+
+    def get_by_role(self, role, name=None, **kwargs):
+        locator = super().get_by_role(role, name=name, **kwargs)
+        if role == "link" and name == "주문" and self.order_link_blocked:
+            locator.click = Mock(side_effect=TimeoutError("synthetic post-submit Orders link is blocked"))
+        return locator
+
+    def wait_for_function(self, expression):
+        self.waits.append(expression)
+
+
+class TimefolioReadRemountTests(unittest.TestCase):
+    def setUp(self):
+        prevent_open = patch.object(TimefolioBrowser, "open", side_effect=AssertionError("No browser may open in tests"))
+        self.addCleanup(prevent_open.stop)
+        prevent_open.start()
+        self.browser = TimefolioBrowser("unused-offline-profile", now=lambda: NOW, sleep=lambda _: None)
+        self.page = _ReadRemountPage()
+        self.browser.page = self.page
+        self.browser._account_key = "account"
+        self.browser._portfolio_id = "pf13"
+
+    def test_receipt_view_reloads_exact_origin_without_clicking_blocked_link(self):
+        self.browser._main(receipts_only=True)
+        self.assertEqual(self.page.navigations, [(ORIGIN, {"wait_until": "domcontentloaded"})])
+        self.assertNotIn("role:link:주문", self.page.clicks)
+        self.assertEqual(self.page.waits, [])
+
+    def test_full_view_keeps_nav_validation_after_reload(self):
+        self.browser._main(receipts_only=False)
+        self.assertEqual(len(self.page.navigations), 1)
+        self.assertEqual(len(self.page.waits), 1)
+        self.assertIn("NAV", self.page.waits[0])
+
+    def test_document_ready_before_app_mount_waits_for_view_before_binding(self):
+        for receipts_only, table in ((True, "table:has(th#w2o)"), (False, "table:has(th#pos)")):
+            with self.subTest(receipts_only=receipts_only):
+                visible = []
+                self.page.after_navigation = lambda: self.page.counts.update({"select": 0})
+
+                def locator(selector, **kwargs):
+                    result = FakePage.locator(self.page, selector, **kwargs)
+                    if selector == table:
+                        result.wait_for = lambda **kw: visible.append((table, kw))
+                    return result
+
+                def get_by_role(role, name=None, **kwargs):
+                    result = FakePage.get_by_role(self.page, role, name=name, **kwargs)
+                    if role == "button" and getattr(name, "pattern", name) == "신규 주문":
+                        def app_mounted(**kw):
+                            self.assertEqual(visible, [(table, {"state": "visible"})])
+                            visible.append(("new_order", kw))
+                            self.page.counts["select"] = 1
+                        result.wait_for = app_mounted
+                    return result
+
+                with patch.object(self.page, "locator", side_effect=locator), \
+                     patch.object(self.page, "get_by_role", side_effect=get_by_role):
+                    self.browser._main(receipts_only=receipts_only)
+                self.assertEqual(visible[-1], ("new_order", {"state": "visible"}))
+                self.assertEqual(self.browser._portfolio_id, "pf13")
+
+    def test_login_page_before_reload_blocks_without_navigation(self):
+        self.page.url = ORIGIN + "/auth/login"
+        with self.assertRaisesRegex(MirrorBlocked, "timefolio_login_required"):
+            self.browser._main(receipts_only=True)
+        self.assertEqual(self.page.navigations, [])
+
+    def test_login_redirect_after_reload_blocks_and_clears_binding(self):
+        self.page.after_navigation = lambda: setattr(self.page, "url", ORIGIN + "/auth/login")
+        with self.assertRaisesRegex(MirrorBlocked, "timefolio_login_required"):
+            self.browser._main(receipts_only=True)
+        self.assertIsNone(self.browser._account_key)
+
+    def test_changed_portfolio_after_reload_does_not_rebind(self):
+        self.page.after_navigation = lambda: setattr(self.page, "portfolio_id", "different")
+        with self.assertRaisesRegex(MirrorBlocked, "destination_binding_changed"):
+            self.browser._main(receipts_only=True)
+        self.assertEqual(self.browser._portfolio_id, "pf13")
+
+    def test_reload_timeout_after_submit_never_repeats_submission(self):
+        self.browser._prepared = proposal()
+        self.page.goto = Mock(side_effect=TimeoutError("synthetic document GET timeout"))
+        with self.assertRaises(TimeoutError):
+            self.browser.submit(proposal())
+        self.assertEqual(self.page.clicks.count('button[type="submit"]'), 1)
+        with self.assertRaises(MirrorBlocked):
+            self.browser.submit(proposal())
+        self.assertEqual(self.page.clicks.count('button[type="submit"]'), 1)
+
+    def test_postsubmit_reload_confirms_only_exact_receipt_with_one_submission(self):
+        self.browser._prepared = proposal()
+        observed = []
+        def receipt_snapshot():
+            self.browser._main(receipts_only=True)
+            # The first observation has a wrong CSV weight. A second read can
+            # resolve the exact receipt, but must never cause a second submit.
+            observed.append(True)
+            row = receipt(weight="2.01" if len(observed) == 1 else "2.00")
+            return {"verified": True, "account_key": "account", "contest": CONTEST,
+                    "session_date": "2026-10-12", "orders": [row]}
+        self.browser.receipt_snapshot = receipt_snapshot
+        self.assertEqual(self.browser.submit(proposal())["order_id"], "new")
+        self.assertEqual(self.page.clicks.count('button[type="submit"]'), 1)
+        self.assertEqual(len(self.page.navigations), 2)
+
+
+# Synthetic 38-row order history with the observed 21 -> 36 -> 38 window shape.
+_VIRTUAL_TAIL_COLUMNS = ("genT", "prodId", "sgn", "wei", "cumQty")
+_VIRTUAL_TAIL_VALUES = [["2026-10-19 09:00", f"A{i:06d}", "1", "1", "0"] for i in range(38)]
+_VIRTUAL_TAIL_FULL = {
+    "headers": [{"id": key, "text": key} for key in _VIRTUAL_TAIL_COLUMNS],
+    "rows": [{"cells": {key: {"id": f"cell{i}_{key}", "text": value}
+                        for key, value in zip(_VIRTUAL_TAIL_COLUMNS, values)}}
+             for i, values in enumerate(_VIRTUAL_TAIL_VALUES)],
+    "filtered": False, "count_text": "전체 38"}
+_VIRTUAL_TAIL_CSV = "\n".join([",".join(_VIRTUAL_TAIL_COLUMNS)] +
+                                [",".join(values) for values in _VIRTUAL_TAIL_VALUES])
+
+
+class DelayedTail(FakeLocator):
+    def __init__(self, page, *, delay=2, growing=False, corruption=None):
+        super().__init__(page, "table")
+        self.top, self.original = 40, 40
+        self.extent = 299 if growing else 426
+        self.delay, self.growing, self.corruption = delay, growing, corruption
+        self.bottom_reads = 0
+        self.positions = []
+
+    def evaluate(self, script, *args):
+        if script != GRID_DOM:
+            original = self.top
+            if args[0] is not None:
+                self.top = min(args[0], self.extent)
+                self.positions.append(self.top)
+                if self.top == 0:
+                    self.bottom_reads = 0
+            return {"top": self.top, "original": original, "max": self.extent, "height": 399}
+        result = deepcopy(_VIRTUAL_TAIL_FULL)
+        if self.growing and self.top == 299:
+            self.extent = 426
+            result["rows"] = result["rows"][19:36]
+        elif self.top >= 426:
+            self.bottom_reads += 1
+            end = 38 if self.bottom_reads >= self.delay else 36
+            result["rows"] = result["rows"][19:end]
+            if end == 38:
+                if self.corruption == "fixed":
+                    result["rows"][0]["cells"]["prodId"]["text"] = "A999999"
+                elif self.corruption == "duplicate":
+                    result["rows"][1] = deepcopy(result["rows"][0])
+                elif self.corruption == "reorder":
+                    result["rows"][0:2] = reversed(result["rows"][0:2])
+                elif self.corruption == "new_tail_reorder":
+                    result["rows"][-2:] = reversed(result["rows"][-2:])
+        else:
+            result["rows"] = result["rows"][:21]
+        return result
+
+
+class VirtualTailTests(unittest.TestCase):
+    def make(self, browser_class=TimefolioBrowser, **kwargs):
+        waits = []
+        browser = browser_class("unused-offline-profile", sleep=waits.append)
+        page = FakePage()
+        page.dialog_handler = browser._dialog
+        browser.page = page
+        return browser, DelayedTail(page, **kwargs), waits
+
+    def test_observed_36_of_38_tail_delay_is_reproduced_and_recovered(self):
+        new, table, waits = self.make()
+        result = new._grid_dom(table, 38)
+        self.assertEqual(result["rows"], _VIRTUAL_TAIL_FULL["rows"])
+        self.assertEqual(waits, [.05])
+        self.assertEqual(table.top, table.original)
+
+    def test_tail_can_settle_on_last_bounded_observation(self):
+        browser, table, waits = self.make(delay=5)
+        self.assertEqual(browser._grid_dom(table, 38)["rows"], _VIRTUAL_TAIL_FULL["rows"])
+        self.assertEqual(waits, [.05] * 4)
+        self.assertEqual(table.top, table.original)
+
+    def test_ready_tail_needs_no_added_wait(self):
+        browser, table, waits = self.make(delay=1)
+        self.assertEqual(browser._grid_dom(table, 38)["rows"], _VIRTUAL_TAIL_FULL["rows"])
+        self.assertEqual(waits, [])
+
+    def test_extent_growth_after_render_does_not_use_old_bottom(self):
+        browser, table, waits = self.make(delay=1, growing=True)
+        self.assertEqual(browser._grid_dom(table, 38)["rows"], _VIRTUAL_TAIL_FULL["rows"])
+        self.assertIn(426, table.positions)
+        self.assertEqual(table.top, table.original)
+
+    def test_permanent_missing_tail_remains_incomplete_and_unverified(self):
+        browser, table, waits = self.make(delay=999)
+        with patch.object(Path, "read_text", return_value=_VIRTUAL_TAIL_CSV):
+            grid = browser._grid(table, "orders")
+        self.assertFalse(grid["complete"])
+        self.assertEqual(len(grid["rows"]), 36)
+        self.assertLessEqual(len(waits), 16)
+        self.assertEqual(table.top, table.original)
+        parsed = parse_receipts({"url": ORIGIN, "account_key": "account",
+            "contest": CONTEST, "session_date": "2026-10-19", "tables": [grid]},
+            "account", CONTEST)
+        self.assertFalse(parsed["verified"])
+
+    def test_late_reorder_duplicate_or_fixed_field_change_is_blocked(self):
+        for corruption in ("reorder", "duplicate", "fixed"):
+            with self.subTest(corruption=corruption):
+                browser, table, _ = self.make(corruption=corruption)
+                with self.assertRaisesRegex(MirrorBlocked, "changed_during_scroll"):
+                    browser._grid_dom(table, 38)
+                self.assertEqual(table.top, table.original)
+
+    def test_new_tail_wrong_order_is_still_rejected_by_csv_dom_join(self):
+        browser, table, _ = self.make(corruption="new_tail_reorder")
+        with patch.object(Path, "read_text", return_value=_VIRTUAL_TAIL_CSV):
+            grid = browser._grid(table, "orders")
+        self.assertTrue(grid["complete"])
+        parsed = parse_receipts({"url": ORIGIN, "account_key": "account",
+            "contest": CONTEST, "session_date": "2026-10-19", "tables": [grid]},
+            "account", CONTEST)
+        self.assertFalse(parsed["verified"])
+        self.assertTrue(any("행 순서 불일치" in error for error in parsed["errors"]))
+
 
 
 class TimefolioGridDOMBrowserTests(unittest.TestCase):

@@ -206,10 +206,13 @@ class TimefolioBrowser:
     def _main(self, *, receipts_only=False):
         self._origin()
         self._close_form()
-        self.page.get_by_role("link", name="주문", exact=True).click()
-        self._binding(initialize=True)
+        # Re-mount the read view after submit with an explicit document GET.
+        # Recheck origin and the existing binding before reading any receipt.
+        self.page.goto(ORIGIN, wait_until="domcontentloaded")
+        self._origin()
         self.page.locator("table:has(th#w2o)" if receipts_only else "table:has(th#pos)").wait_for(state="visible")
         self.page.get_by_role("button", name=re.compile("신규 주문")).wait_for(state="visible")
+        self._binding(initialize=True)
         if not receipts_only:
             self.page.wait_for_function("""() => Array.from(document.querySelectorAll('fieldset'))
           .some(e => e.querySelector('legend')?.textContent==='NAV' &&
@@ -302,7 +305,7 @@ class TimefolioBrowser:
             return state
         original, seen, ordered = info["top"], {}, []
         try:
-            top = 0
+            top, bottom_reads = 0, 0
             for step in range(500):
                 position = table.evaluate(scroll, top)
                 if not position:
@@ -334,8 +337,21 @@ class TimefolioBrowser:
                         ordered.append(row)
                     else:
                         ordered[seen[key][0]] = row
+                # Scroll geometry and virtual rows can settle after different
+                # frames. Re-read the extent before deciding this is the end.
+                position = table.evaluate(scroll, None)
+                if not position:
+                    raise MirrorBlocked("destination_grid_scroll_changed")
                 if position["top"] >= position["max"] - 1:
-                    break
+                    bottom_reads += 1
+                    if len(ordered) >= expected or bottom_reads >= 5:
+                        break
+                    # A short, bounded read-only wait at the same bottom lets
+                    # delayed tail rows render. Missing rows remain incomplete.
+                    self.sleep(.05)
+                    top = position["max"]
+                    continue
+                bottom_reads = 0
                 top = min(position["max"], position["top"] + max(1, position["height"] * .75))
             state["rows"] = ordered
             return state
