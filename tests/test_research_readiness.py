@@ -1,11 +1,11 @@
 """Transient source failures wait before freezing; accepted decisions never reroll."""
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta
 import unittest
 
 from backend.research_readiness import WAITING, input_readiness
 from tests.test_daily_learning import DailyLearningTests
-from tests.test_learning import LIMITS
+from tests.test_learning import LIMITS, raw_input
 
 
 class ResearchReadinessTests(unittest.TestCase):
@@ -31,23 +31,41 @@ class ResearchReadinessTests(unittest.TestCase):
         with self.store.connect() as db:
             return db.execute('SELECT * FROM ' + table + ' ORDER BY 1').fetchall()
 
+    def next_session_after_frozen_anchor(self):
+        self.ready()
+        self.process()
+        anchor_frames = self.learner.frames()
+        self.assertEqual(len(anchor_frames), 1)
+        self.assertEqual(len(self.rows('daily_policy_contexts')), 1)
+        self.assertEqual(self.learner.daily.history(), [])
+        self.assertEqual(self.calls, [])
+        self.data = raw_input(1)
+        self.now = datetime.fromisoformat(self.data['observed_at'])
+        self.context['initial_state']['as_of'] = self.data['as_of']
+        return anchor_frames
+
     def test_failure_then_recovery_freezes_once_and_preserves_responses(self):
+        anchor_frames = self.next_session_after_frozen_anchor()
+        prior_observations = self.rows('daily_research_preparation_observations')
         self.ready()
         original_controls = {key: self.store.setting(key) for key in ('policy', 'enabled', 'user_paused')}
         self.context['competition_context']['reliable'] = False
         self.assertEqual(self.process(), WAITING)
-        self.assertEqual(self.learner.frames(), [])
+        self.assertEqual(self.learner.frames(), anchor_frames)
         self.assertEqual(self.learner.daily.history(), [])
         self.assertEqual(self.calls, [])
         failed = self.rows('daily_research_preparation_observations')
+        self.assertEqual(len(failed), len(prior_observations) + 1)
         self.now += timedelta(minutes=1)
         self.ready()
         self.process()
         frozen = self.rows('daily_policy_decisions')
         self.assertEqual(len(frozen), 1)
         self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.learner.daily.history()[0]['evaluation_context']['initial_state']['as_of'],
+                         anchor_frames[0]['as_of'])
         saved = self.rows('daily_research_preparation_observations')
-        self.assertEqual(len(saved), 2)
+        self.assertEqual(len(saved), len(prior_observations) + 2)
         self.assertTrue(all(row in saved for row in failed))
         self.context['competition_context']['reliable'] = False
         self.process()
@@ -59,6 +77,7 @@ class ResearchReadinessTests(unittest.TestCase):
         self.assertEqual({key: self.store.setting(key) for key in original_controls}, original_controls)
 
     def test_worker_retries_same_source_after_bounded_preparation_wait(self):
+        anchor_frames = self.next_session_after_frozen_anchor()
         self.ready()
         self.context['competition_context']['reliable'] = False
         self.learner.enqueue(self.data, [], LIMITS, source_id='unchanged', context=deepcopy(self.context))
@@ -68,6 +87,8 @@ class ResearchReadinessTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         self.assertIsNone(self.learner.attempted)
         self.assertEqual(self.learner.retry_after, self.now + timedelta(seconds=60))
+        self.assertEqual(self.learner.frames(), anchor_frames)
+        self.assertEqual(self.learner.daily.history(), [])
         self.ready()
         self.learner.enqueue(self.data, [], LIMITS, source_id='unchanged', context=self.context)
         self.assertEqual(self.calls, [])
@@ -80,6 +101,8 @@ class ResearchReadinessTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(self.learner.daily.history()), 1)
+        self.assertEqual(self.learner.daily.history()[0]['evaluation_context']['initial_state']['as_of'],
+                         anchor_frames[0]['as_of'])
 
     def test_missing_stale_wrong_period_future_and_incomplete_inputs_wait(self):
         self.ready()

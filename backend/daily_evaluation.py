@@ -7,14 +7,17 @@ completed trades are not required. No account limits or observations are changed
 from copy import deepcopy
 from datetime import date, datetime, time
 from decimal import Decimal
+import hashlib
 import math
 
+from backend.experiment_store import encode
 from backend.learning_evaluation import _return_and_drawdown, _series
 from backend.learning_policy import KST, LEGACY_IDS, _day, _instant, portfolio_metrics, validate_policy
 from backend.learning_research import _behavior_id, _policy_changes, _public_activity
 
 
-VERSION = "daily-award-development-v6"
+VERSION = "daily-award-development-v7"
+ANCHOR_SELECTION_VERSION = "consecutive-observed-sessions-v1"
 EPSILON = 1e-9
 MAXIMUM_DRAWDOWN_PCT = 15.
 METRICS = ("net_return_pct", "stress_return_pct", "max_drawdown_pct", "stress_drawdown_pct")
@@ -124,6 +127,16 @@ def _evaluation_window(frames, context):
     selected = frames[index:]
     if len(selected) < 2:
         raise ValueError("insufficient_context_intervals")
+    selection = context.get('anchor_selection')
+    if selection is not None:
+        if (not isinstance(selection, dict) or selection.get('version') != ANCHOR_SELECTION_VERSION
+                or selection.get('selected_anchor') != anchor
+                or selection.get('end_day') != selected[-1]['as_of']
+                or selection.get('frame_days') != [frame['as_of'] for frame in selected]
+                or selection.get('frames_hash') != hashlib.sha256(encode(selected).encode()).hexdigest()
+                or selection.get('book_hash') != hashlib.sha256(encode(book).encode()).hexdigest()
+                or any(frame.get('role') == 'development_only' for frame in selected)):
+            raise ValueError('invalid_anchor_selection')
     observed = _instant(context.get("observed_at"))
     if (observed < datetime.combine(date.fromisoformat(anchor), time(16), KST)
             or observed >= datetime.combine(date.fromisoformat(_day(selected[1]["as_of"])), time(9), KST)):
@@ -132,7 +145,8 @@ def _evaluation_window(frames, context):
         "replay_basis": "frozen_book_execution_model", "context_applied": True,
         "account_protection_inherited": isinstance(book.get("account_protection"), dict),
         "context_anchor": anchor, "context_observed_at": observed.isoformat(),
-        "context_excluded_frames": index}
+        "context_excluded_frames": index,
+        **({'anchor_selection': deepcopy(selection)} if selection is not None else {})}
 
 
 def _comparison(a, b, drawdown_limit):
@@ -269,7 +283,7 @@ def evaluate_daily_candidate(champion, proposal, frames, limits, *, evaluator=No
                  "unpaired_evaluation_dates", "invalid_equity_curve", "inconsistent_evaluation_returns",
                  "inconsistent_evaluation_summary", "insufficient_observed_baseline", "invalid_evaluation_context",
                  "unresolved_evaluation_book", "evaluation_anchor_missing", "insufficient_context_intervals",
-                 "evaluation_context_not_known_at_anchor", "unpaired_execution_scenarios"}
+                 "evaluation_context_not_known_at_anchor", "unpaired_execution_scenarios", "invalid_anchor_selection"}
         known.update({"invalid_evaluation_drawdown_limit", "invalid_capacity_contract",
                       "invalid_portfolio_evaluation", "invalid_daily_return", "missing_daily_returns",
                       "interval_count_mismatch", "missing_evaluation_dates", "invalid_evaluation_dates",

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import errno
 import io
 import json
@@ -6,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -71,6 +73,34 @@ class SupervisorTests(unittest.TestCase):
 
     def state(self):
         return _read(self.supervisor.directory / "state.json")
+
+    @contextmanager
+    def failed_supervision(self, supervisor, child):
+        waiting, release = threading.Event(), threading.Event()
+        failures = []
+        original_poll = child.poll
+        def poll():
+            if supervisor.state["status"] == "stop_failed" and child.returncode is None:
+                waiting.set()
+                release.wait(5)
+            return original_poll()
+        def run():
+            try:
+                supervisor.run()
+            except BaseException as error:
+                failures.append(error)
+        worker = threading.Thread(target=run, daemon=True)
+        with patch.object(child, "poll", side_effect=poll):
+            worker.start()
+            try:
+                self.assertTrue(waiting.wait(3), "failed supervision was not reached")
+                self.assertTrue(worker.is_alive())
+                yield failures
+            finally:
+                child.returncode = 9
+                release.set()
+                worker.join(3)
+        self.assertFalse(worker.is_alive())
 
     def test_launches_only_dashboard_hidden_with_runtime_python_and_owned_stop_path(self):
         self.assertTrue(self.supervisor.step())
@@ -202,6 +232,231 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse(self.supervisor.step())
         self.assertEqual(owned.wait_calls, [30, 5, 5])
         self.assertEqual((owned.terminate_count, owned.kill_count), (1, 1))
+
+    def test_persistent_state_and_stop_file_failures_cannot_skip_owned_child_cleanup(self):
+        for fail_state, fail_stop in ((True, False), (False, True), (True, True)):
+            with self.subTest(state=fail_state, stop=fail_stop):
+                child = FakeChild(13000)
+                child.wait_timeouts = 2
+                supervisor = Supervisor(self.root / f"failure-{fail_state}-{fail_stop}",
+                    port_busy=lambda: False, interval=0)
+                self.addCleanup(supervisor._close_logs)
+                def spawn(*args, **kwargs):
+                    supervisor.stop_event.set()
+                    return child
+                supervisor.popen = Mock(side_effect=spawn)
+                primary = OSError(errno.EACCES, "private-state-path")
+                stop_error = OSError(errno.ENOSPC, "private-stop-path")
+                state_failed = False
+                def write(path, value):
+                    nonlocal state_failed
+                    if path.name == "state.json" and fail_state:
+                        state_failed = state_failed or supervisor.child is not None
+                        if state_failed:
+                            raise primary
+                    if path.name == "child-stop.json" and fail_stop:
+                        raise stop_error
+                    return _write(path, value)
+                with patch("backend.supervisor._write", side_effect=write):
+                    if fail_state:
+                        with self.assertRaises(OSError) as raised:
+                            supervisor.run()
+                        self.assertIs(raised.exception, primary)
+                        self.assertEqual(supervisor.state["failure"], {"type": "PermissionError", "errno": errno.EACCES})
+                    else:
+                        self.assertEqual(supervisor.run(), 0)
+                self.assertIsNone(supervisor.child)
+                self.assertEqual(child.wait_calls, [30, 5, 5])
+                self.assertEqual((child.terminate_count, child.kill_count), (1, 1))
+                self.assertEqual(supervisor.state["status"], "stopped")
+                stages = [item["stage"] for item in supervisor.state.get("cleanup_errors", [])]
+                if fail_state:
+                    self.assertEqual(stages.count("state_publish"), 2)
+                if fail_stop:
+                    self.assertIn("child_stop_file", stages)
+                self.assertNotIn("private", json.dumps(supervisor.state))
+                with file_lock(supervisor.directory / "supervisor.lock", blocking=False):
+                    pass
+
+    def test_failed_stop_file_still_allows_graceful_exit_without_forced_termination(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        with patch("backend.supervisor._write", side_effect=OSError(errno.EACCES, "private")):
+            self.supervisor._stop_child()
+        self.assertIsNone(self.supervisor.child)
+        self.assertEqual(child.wait_calls, [30])
+        self.assertEqual((child.terminate_count, child.kill_count), (0, 0))
+        self.assertEqual(self.supervisor.state["cleanup_errors"], [
+            {"stage": "child_stop_file", "type": "PermissionError", "errno": errno.EACCES}])
+
+    def test_initial_state_publish_failure_still_cleans_up_an_already_owned_child(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        failure = OSError(errno.ENOSPC, "private-state-path")
+        def write(path, value):
+            if path.name == "state.json":
+                raise failure
+            return _write(path, value)
+        with patch("backend.supervisor._write", side_effect=write), self.assertRaises(OSError) as raised:
+            self.supervisor.run()
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(child.wait_calls, [30])
+        self.assertIsNone(self.supervisor.child)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_already_exited_child_needs_no_stop_file_or_signals(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        child.returncode = 9
+        with patch("backend.supervisor._write", side_effect=OSError("private")) as write:
+            self.supervisor._stop_child()
+        write.assert_not_called()
+        self.assertIsNone(self.supervisor.child)
+        self.assertEqual(child.wait_calls, [])
+        self.assertEqual((child.terminate_count, child.kill_count), (0, 0))
+        self.assertEqual(self.supervisor.state["last_exit_code"], 9)
+
+    def test_unconfirmed_exit_retains_handle_and_never_reports_stopped_or_restarts(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        child.wait_timeouts = 3
+        logs = list(self.supervisor.logs)
+        self.supervisor.stop_event.set()
+        with self.failed_supervision(self.supervisor, child) as failures:
+            self.assertIs(self.supervisor.child, child)
+            self.assertTrue(all(not stream.closed for stream in logs))
+            self.assertEqual(child.wait_calls, [30, 5, 5])
+            self.assertEqual((child.terminate_count, child.kill_count), (1, 1))
+            self.assertEqual(self.state()["status"], "stop_failed")
+            self.assertEqual(self.state()["child_pid"], child.pid)
+            self.assertIsNone(self.state()["next_retry"])
+            self.supervisor.stop_event.clear()
+            with self.assertRaises(SupervisorError):
+                self.supervisor.step()
+            with self.assertRaises(SupervisorError):
+                self.supervisor._launch()
+            second = Supervisor(self.root, popen=Mock(), port_busy=lambda: False)
+            with self.assertRaisesRegex(SupervisorError, "이미 실행"):
+                second.run()
+            second.popen.assert_not_called()
+            self.assertEqual(self.state()["status"], "stop_failed")
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(failures, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], SupervisorError)
+        self.assertIsNone(self.supervisor.child)
+        self.assertTrue(all(stream.closed for stream in logs))
+        self.assertEqual(self.state()["status"], "stopped")
+        self.assertEqual(self.state()["last_exit_code"], 9)
+        self.assertEqual(child.wait_calls, [30, 5, 5])
+        with file_lock(self.supervisor.directory / "supervisor.lock", blocking=False):
+            pass
+
+    def test_original_failure_and_unconfirmed_cleanup_failure_remain_distinct(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        child.wait_timeouts = 3
+        primary = RuntimeError("private-original-failure")
+        self.supervisor.probe = Mock(side_effect=primary)
+        with self.failed_supervision(self.supervisor, child) as failures:
+            self.assertEqual(self.state()["failure"], {"type": "RuntimeError"})
+            self.assertEqual(self.state()["status"], "stop_failed")
+            self.assertIn("child_cleanup", [item["stage"] for item in self.state()["cleanup_errors"]])
+            self.assertIs(self.supervisor.child, child)
+        self.assertEqual(failures, [primary])
+        self.assertEqual(self.state()["status"], "stopped")
+        self.assertNotIn("private", json.dumps(self.state()))
+
+    def test_failed_supervision_keeps_owner_lock_despite_persistent_file_failures(self):
+        for fail_state, fail_stop in ((True, False), (False, True), (True, True)):
+            with self.subTest(state=fail_state, stop=fail_stop):
+                child = FakeChild(13000)
+                child.wait_timeouts = 3
+                primary = OSError(errno.ENOSPC, "private-state") if fail_state else RuntimeError("private-original")
+                supervisor = Supervisor(self.root / f"retained-{fail_state}-{fail_stop}",
+                    probe=Mock(side_effect=primary), port_busy=lambda: False, interval=0)
+                supervisor.child = child
+                def write(path, value):
+                    if path.name == "state.json" and fail_state:
+                        raise primary
+                    if path.name == "child-stop.json" and fail_stop:
+                        raise OSError(errno.EACCES, "private-stop")
+                    return _write(path, value)
+                with patch("backend.supervisor._write", side_effect=write):
+                    with self.failed_supervision(supervisor, child) as failures:
+                        self.assertEqual(supervisor.state["status"], "stop_failed")
+                        self.assertIs(supervisor.child, child)
+                        second = Supervisor(supervisor.root, popen=Mock(), port_busy=lambda: False)
+                        with self.assertRaisesRegex(SupervisorError, "이미 실행"):
+                            second.run()
+                        second.popen.assert_not_called()
+                        self.assertEqual(failures, [])
+                    self.assertEqual(failures, [primary])
+                self.assertIsNone(supervisor.child)
+                self.assertEqual(supervisor.state["status"], "stopped")
+                self.assertEqual(supervisor.state["last_exit_code"], 9)
+                self.assertEqual(child.wait_calls, [30, 5, 5])
+                self.assertEqual((child.terminate_count, child.kill_count), (1, 1))
+                self.assertNotIn("private", json.dumps(supervisor.state))
+                with file_lock(supervisor.directory / "supervisor.lock", blocking=False):
+                    pass
+
+    def test_failed_supervision_polling_waits_despite_stop_event_and_write_errors(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        self.supervisor.stop_event.set()
+        delay = Mock()
+        with (patch("backend.supervisor.threading.Event", return_value=delay),
+              patch("backend.supervisor._write", side_effect=OSError(errno.ENOSPC, "private")),
+              patch.object(child, "poll", side_effect=[OSError(errno.EIO, "private"), None, 9])):
+            self.supervisor._wait_for_child_exit()
+        self.assertEqual([call.args for call in delay.wait.call_args_list], [(1,), (1,)])
+        self.assertIsNone(self.supervisor.child)
+        self.assertEqual(self.supervisor.state["last_exit_code"], 9)
+        self.assertEqual((child.terminate_count, child.kill_count), (0, 0))
+        self.assertEqual([item["stage"] for item in self.supervisor.state["cleanup_errors"]],
+                         ["child_poll", "state_publish", "state_publish"])
+
+    def test_signal_failures_still_wait_and_retain_unconfirmed_child(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        child.wait_timeouts = 3
+        with (patch.object(child, "terminate", side_effect=OSError(errno.EACCES, "private")) as terminate,
+              patch.object(child, "kill", side_effect=OSError(errno.EACCES, "private")) as kill,
+              self.assertRaises(SupervisorError)):
+            self.supervisor._stop_child()
+        terminate.assert_called_once_with()
+        kill.assert_called_once_with()
+        self.assertEqual(child.wait_calls, [30, 5, 5])
+        self.assertIs(self.supervisor.child, child)
+        self.assertEqual(self.supervisor.state["status"], "stop_failed")
+        self.assertEqual([item["stage"] for item in self.supervisor.state["cleanup_errors"]],
+                         ["child_terminate", "child_kill"])
+
+    def test_terminate_error_racing_with_exit_does_not_trigger_kill(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        child.wait_timeouts = 1
+        def terminate():
+            child.returncode = 7
+            raise OSError(errno.ESRCH, "private")
+        with patch.object(child, "terminate", side_effect=terminate):
+            self.supervisor._stop_child()
+        self.assertIsNone(self.supervisor.child)
+        self.assertEqual(child.wait_calls, [30, 5])
+        self.assertEqual(child.kill_count, 0)
+        self.assertEqual(self.supervisor.state["last_exit_code"], 7)
+
+    def test_wait_error_does_not_skip_retained_handle_termination(self):
+        self.supervisor.step()
+        child = self.supervisor.child
+        with patch.object(child, "wait", side_effect=[OSError(errno.EIO, "private"), 0]) as wait:
+            self.supervisor._stop_child()
+        self.assertIsNone(self.supervisor.child)
+        self.assertEqual([call.kwargs["timeout"] for call in wait.call_args_list], [30, 5])
+        self.assertEqual((child.terminate_count, child.kill_count), (1, 0))
+        self.assertEqual(self.supervisor.state["cleanup_errors"], [
+            {"stage": "child_wait", "type": "OSError", "errno": errno.EIO}])
 
     def test_old_instance_stop_or_stale_saved_pid_is_never_used_to_stop_child(self):
         _write(self.supervisor.directory / "state.json", {"child_pid": 55555, "supervisor_pid": 44444,

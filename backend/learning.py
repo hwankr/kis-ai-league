@@ -619,7 +619,7 @@ class LearningService:
         anchor = evaluation_context(self.store, fingerprint, frames, limits, self.daily.engine_version)
         if anchor:
             context['daily_evaluation'] = anchor
-        elif context.get('research_observation') is not None:
+        elif any(key in context for key in ('research_observation', 'competition_context', 'competition_observation')):
             # The first new-contract book is a future anchor, not a license to
             # replace the old protected book with cash_daily_open evaluation.
             self.daily.note('waiting', '새 연구 관측과 호환되는 동결 보유 기준일 대기', fingerprint=fingerprint)

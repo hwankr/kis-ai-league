@@ -1,5 +1,6 @@
 """Local dashboard process supervision; never sends brokerage requests or orders."""
 import argparse
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import hashlib
 from http.client import HTTPConnection, HTTPException
@@ -29,6 +30,15 @@ MAX_BACKOFF = 60
 
 class SupervisorError(Exception):
     """Public local supervisor error, without raw commands or credentials."""
+
+
+class _ChildStopError(SupervisorError):
+    """The retained child handle has not confirmed process exit."""
+
+
+def _failure_details(error):
+    return {"type": type(error).__name__, **{name: value for name in ("errno", "winerror")
+            if type(value := getattr(error, name, None)) is int}}
 
 
 def _utc():
@@ -152,6 +162,8 @@ class Supervisor:
         return stream
 
     def _launch(self):
+        if self.child is not None:
+            raise SupervisorError("소유 대시보드 종료가 확인되지 않아 새 프로세스를 시작하지 않습니다.")
         if self.port_busy():
             self._publish(status="conflict", next_retry=None, error="8765 포트를 다른 서버가 사용 중입니다. 기존 프로세스는 종료하지 않았습니다.")
             return False
@@ -185,21 +197,82 @@ class Supervisor:
         if child is None:
             return
         # The retained Popen handle is the only authority to stop a process. Never open a saved PID.
-        try:
-            if child.poll() is None:
+        def poll():
+            try:
+                return child.poll()
+            except Exception as error:
+                self._cleanup_error("child_poll", error)
+                return None
+
+        def wait(timeout):
+            try:
+                return child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return poll()
+            except Exception as error:
+                self._cleanup_error("child_wait", error)
+                return poll()
+
+        code = poll()
+        if code is None:
+            try:
                 _write(self.directory / "child-stop.json", {"instance": self.instance, "child_pid": child.pid})
-                try:
-                    child.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    child.terminate()
-                    try:
-                        child.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        child.kill()
-                        child.wait(timeout=5)
-        finally:
-            self.child = None
+            except Exception as error:
+                self._cleanup_error("child_stop_file", error)
+            # Preserve the graceful window even if the request file was unavailable.
+            code = wait(30)
+        for name in ("terminate", "kill"):
+            if code is not None:
+                break
+            try:
+                getattr(child, name)()
+            except Exception as error:
+                self._cleanup_error("child_" + name, error)
+            # A failed signal may race with exit; always confirm before escalating.
+            code = wait(5)
+        if code is None:
+            self.state.update(status="stop_failed", next_retry=None,
+                              error="소유 대시보드 종료를 확인하지 못했습니다. 새 프로세스를 시작하지 않습니다.")
+            raise _ChildStopError(self.state["error"])
+        self.child = None
+        self.state["last_exit_code"] = code
+        try:
             self._close_logs()
+        except Exception as error:
+            self._cleanup_error("close_logs", error)
+
+    def _cleanup_error(self, stage, error):
+        errors = self.state.setdefault("cleanup_errors", [])
+        errors.append({"stage": stage, **_failure_details(error)})
+        del errors[:-16]
+
+    def _publish_cleanup(self, **changes):
+        try:
+            self._publish(**changes)
+        except Exception as error:
+            self._cleanup_error("state_publish", error)
+
+    def _wait_for_child_exit(self):
+        # Keep the lifetime lock and Popen authority until exit is observed.
+        # The stop event may already be set, so it cannot provide this delay.
+        delay = threading.Event()
+        while self.child is not None:
+            try:
+                code = self.child.poll()
+            except Exception as error:
+                self._cleanup_error("child_poll", error)
+                code = None
+            if code is not None:
+                self.child = None
+                self.state["last_exit_code"] = code
+                try:
+                    self._close_logs()
+                except Exception as error:
+                    self._cleanup_error("close_logs", error)
+                return
+            self._publish_cleanup(status="stop_failed", next_retry=None,
+                                  error="소유 대시보드 종료를 확인하지 못했습니다. 새 프로세스를 시작하지 않습니다.")
+            delay.wait(max(1, self.interval))
 
     def _healthy(self, payload):
         if not isinstance(payload, dict) or payload.get("status") != "ok":
@@ -218,6 +291,8 @@ class Supervisor:
 
     def step(self):
         """One bounded monitor iteration; production calls it only under the lifetime owner lock."""
+        if self.state["status"] == "stop_failed":
+            raise _ChildStopError("소유 대시보드 종료가 확인되지 않아 감시 주기를 재개하지 않습니다.")
         request = _read(self.directory / "stop.json")
         if self.stop_event.is_set() or request.get("instance") == self.instance:
             self._publish(status="stopping", next_retry=None)
@@ -257,20 +332,33 @@ class Supervisor:
 
     def run(self):
         self.directory.mkdir(parents=True, exist_ok=True)
-        try:
-            with file_lock(self.directory / "supervisor.lock", blocking=False):
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(file_lock(self.directory / "supervisor.lock", blocking=False))
+            except BlockingIOError:
+                raise SupervisorError("이 프로젝트의 감시자가 이미 실행 중입니다.") from None
+            try:
                 self._publish()
+                while self.step():
+                    self.stop_event.wait(self.interval)
+            except BaseException as failure:
+                self.state["failure"] = _failure_details(failure)
+                self._publish_cleanup(status="stopping", next_retry=None,
+                                      error="감시자가 중단되어 소유 대시보드를 종료합니다.")
                 try:
-                    while self.step():
-                        self.stop_event.wait(self.interval)
-                except BaseException:
-                    self._publish(status="stopping", error="감시자가 중단되어 소유 대시보드를 종료합니다.")
-                    self._stop_child()
-                    self._publish(status="stopped", next_retry=None)
-                    raise
-                return 0 if self.state["status"] == "stopped" else 1
-        except BlockingIOError:
-            raise SupervisorError("이 프로젝트의 감시자가 이미 실행 중입니다.") from None
+                    if not isinstance(failure, _ChildStopError):
+                        self._stop_child()
+                except Exception as error:
+                    self._cleanup_error("child_cleanup", error)
+                if self.child is None:
+                    self._publish_cleanup(status="stopped", next_retry=None)
+                else:
+                    self._publish_cleanup(status="stop_failed", next_retry=None,
+                                          error="소유 대시보드 종료를 확인하지 못했습니다. 새 프로세스를 시작하지 않습니다.")
+                    self._wait_for_child_exit()
+                    self._publish_cleanup(status="stopped", next_retry=None)
+                raise
+            return 0 if self.state["status"] == "stopped" else 1
 
 
 def request_stop(directory):

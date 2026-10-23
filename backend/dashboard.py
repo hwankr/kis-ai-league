@@ -465,22 +465,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def handle_one_request(self):
+        self._response_started = False
+        return super().handle_one_request()
+
     def send_content(self, status, body, content_type):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; "
-                         "script-src 'self'; style-src 'self'; connect-src 'self'; "
-                         "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
-                         "frame-ancestors 'none'; form-action 'none'")
-        self.end_headers()
+        if getattr(self, "_response_started", False):
+            self.close_connection = True
+            return
+        self._response_started = True
         try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'self'; "
+                             "script-src 'self'; style-src 'self'; connect-src 'self'; "
+                             "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+                             "frame-ancestors 'none'; form-action 'none'")
+            self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+        except Exception:
+            self.close_connection = True
+            raise
 
     def json_response(self, status, payload):
         self.send_content(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -505,18 +516,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.json_response(400, {"error": "대회 요건 조회 조건이 올바르지 않습니다."})
                 else:
                     try:
-                        self.json_response(200, self.server.competition_snapshot())
+                        payload = self.server.competition_snapshot()
                     except Exception:
                         self.json_response(503, {"error": "대회 요건 조회 실패"})
+                    else:
+                        self.json_response(200, payload)
                 return
             if path == "/api/timefolio":
                 if params:
                     self.json_response(400, {"error": "타임폴리오 계좌 조회에는 추가 조건을 지정할 수 없습니다."})
                 else:
                     try:
-                        self.json_response(200, self.server.timefolio_snapshot())
+                        payload = self.server.timefolio_snapshot()
                     except Exception:
                         self.json_response(503, {"error": "타임폴리오 계좌 기록을 읽지 못했습니다."})
+                    else:
+                        self.json_response(200, payload)
                 return
             if path == "/api/operations":
                 if params:
@@ -525,9 +540,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.json_response(503, {"error": "실행 관리가 시작되지 않았습니다."})
                 else:
                     try:
-                        self.json_response(200, self.server.operations_snapshot())
+                        payload = self.server.operations_snapshot()
                     except Exception:
                         self.json_response(503, {"error": "실행 상태를 확인하지 못했습니다."})
+                    else:
+                        self.json_response(200, payload)
                 return
             if path == "/api/health":
                 if params:
@@ -542,9 +559,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.json_response(503, {"error": "실험실이 시작되지 않았습니다."})
                 else:
                     try:
-                        self.json_response(200, self.server.experiment_snapshot())
+                        payload = self.server.experiment_snapshot()
                     except Exception:
                         self.json_response(503, {"error": "실험 기록을 읽지 못했습니다."})
+                    else:
+                        self.json_response(200, payload)
                 return
             if path == "/api/mirror":
                 values = {"after": "0", "limit": "100"}
@@ -561,32 +580,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.json_response(503, {"error": "실험실이 시작되지 않았습니다."})
                 else:
                     try:
-                        self.json_response(200, self.server.experiment_service.mirror_snapshot(after=after, limit=limit))
+                        payload = self.server.experiment_service.mirror_snapshot(after=after, limit=limit)
                     except KisError as error:
                         self.json_response(400, {"error": str(error)})
                     except Exception:
                         self.json_response(503, {"error": "연동 체결 기록을 읽지 못했습니다."})
+                    else:
+                        self.json_response(200, payload)
                 return
             if path == "/api/research":
                 if params:
                     self.json_response(400, {"error": "연구 관찰 조회에는 추가 조건을 지정할 수 없습니다."})
                     return
-                try:
-                    if self.server.research_service is None:
-                        self.json_response(503, {"status": "error", "error": "연구 관찰이 시작되지 않았습니다.", "order_enabled": False})
+                if self.server.research_service is None:
+                    self.json_response(503, {"status": "error", "error": "연구 관찰이 시작되지 않았습니다.", "order_enabled": False})
+                else:
+                    try:
+                        payload = self.server.research_service.snapshot()
+                    except Exception:
+                        self.json_response(503, {"status": "error", "error": "연구 관찰 기록을 읽지 못했습니다.", "order_enabled": False})
                     else:
-                        self.json_response(200, self.server.research_service.snapshot())
-                except Exception:
-                    self.json_response(503, {"status": "error", "error": "연구 관찰 기록을 읽지 못했습니다.", "order_enabled": False})
+                        self.json_response(200, payload)
                 return
             if path == "/api/candidates":
                 if params:
                     self.json_response(400, {"error": "후보 비교 상태 조회에는 추가 조건을 지정할 수 없습니다."})
                     return
                 try:
-                    self.json_response(200, self.server.candidate_service.snapshot())
+                    payload = self.server.candidate_service.snapshot()
                 except Exception:
                     self.json_response(503, {"error": "후보 비교 상태를 읽지 못했습니다."})
+                else:
+                    self.json_response(200, payload)
                 return
             if path == "/api/chart":
                 if (set(params) - {"symbol", "interval", "refresh"}
@@ -601,9 +626,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     payload = self.server.chart_service.snapshot(
                         params["symbol"][0], params.get("interval", ["day"])[0],
                         **({"force": True} if "refresh" in params else {}))
-                    self.json_response(200 if payload["status"] == "ok" else 503, payload)
+                    status = 200 if payload["status"] == "ok" else 503
                 except Exception:
                     self.json_response(503, {"status": "error", "error": "종목 차트를 불러오지 못했습니다."})
+                else:
+                    self.json_response(status, payload)
                 return
             if path == "/api/market":
                 if params:
@@ -611,9 +638,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     payload = self.server.market_service.snapshot()
-                    self.json_response(200 if payload["status"] == "ok" else 503, payload)
+                    status = 200 if payload["status"] == "ok" else 503
                 except Exception:
                     self.json_response(503, {"status": "error", "error": "시세 수집 상태를 읽지 못했습니다."})
+                else:
+                    self.json_response(status, payload)
                 return
             allowed = {"account", "start", "end"} if path == "/api/trades" else {"account"}
             if (set(params) - allowed or
@@ -633,14 +662,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
             try:
                 if path == "/api/accounts":
-                    self.json_response(200, self.server.service.list_accounts())
-                    return
-                selected = params.get("account", [None])[0]
-                if path == "/api/trades":
-                    payload = self.server.service.trades(selected, params["start"][0], params["end"][0])
+                    payload = self.server.service.list_accounts()
                 else:
-                    payload = (self.server.service.snapshot(selected) if selected is not None
-                               else self.server.service.snapshot())
+                    selected = params.get("account", [None])[0]
+                    if path == "/api/trades":
+                        payload = self.server.service.trades(selected, params["start"][0], params["end"][0])
+                    else:
+                        payload = (self.server.service.snapshot(selected) if selected is not None
+                                   else self.server.service.snapshot())
             except UnknownAccount as error:
                 self.json_response(404, {"status": "error", "error": str(error)})
                 return
@@ -653,7 +682,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 self.json_response(503, {"status": "error", "error": "계좌 설정을 처리하지 못했습니다."})
                 return
-            self.json_response(502 if payload["status"] == "error" else 200, payload)
+            self.json_response(502 if path != "/api/accounts" and payload["status"] == "error" else 200, payload)
             return
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -706,16 +735,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if (not isinstance(body, dict) or set(body) != {"action"}
                         or body["action"] not in ("mirror_start", "mirror_stop")):
                     raise ValueError
-                if self.server.operations_service is None:
-                    self.json_response(503, {"error": "실행 관리가 시작되지 않았습니다."})
-                    return
-                payload = self.server.operations_snapshot(self.server.operations_service.command(body))
+                if self.server.operations_service is not None:
+                    payload = self.server.operations_snapshot(self.server.operations_service.command(body))
             except (ValueError, OSError):
                 self.json_response(400, {"error": "실행 요청이 올바르지 않거나 다른 작업이 진행 중입니다."})
             except Exception:
                 self.json_response(503, {"error": "실행 요청 결과를 확인하지 못했습니다. 상태를 다시 조회하세요."})
             else:
-                self.json_response(202 if payload.get("busy") else 200, payload)
+                if self.server.operations_service is None:
+                    self.json_response(503, {"error": "실행 관리가 시작되지 않았습니다."})
+                else:
+                    self.json_response(202 if payload.get("busy") else 200, payload)
             return
         if self.path == "/api/experiments":
             try:
@@ -725,14 +755,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError
                 self.connection.settimeout(5)
                 body = json.loads(self.rfile.read(length))
-                if self.server.experiment_service is None:
-                    self.json_response(503, {"error": "실험실이 시작되지 않았습니다."})
-                    return
-                if isinstance(body, dict) and body.get("action") == "answer" and self.server.autonomous_monitor is not None:
-                    self.server.autonomous_monitor.answer(body)
-                    payload = self.server.experiment_snapshot()
-                else:
-                    payload = self.server.experiment_snapshot(self.server.experiment_service.command(body))
+                if self.server.experiment_service is not None:
+                    if isinstance(body, dict) and body.get("action") == "answer" and self.server.autonomous_monitor is not None:
+                        self.server.autonomous_monitor.answer(body)
+                        payload = self.server.experiment_snapshot()
+                    else:
+                        payload = self.server.experiment_snapshot(self.server.experiment_service.command(body))
             except (ValueError, OSError):
                 self.json_response(400, {"error": "실험 요청 형식이 올바르지 않거나 다른 작업이 진행 중입니다."})
             except KisError as error:
@@ -740,7 +768,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 self.json_response(503, {"error": "실험 요청 결과를 확인할 수 없습니다. 상태를 다시 조회하세요."})
             else:
-                self.json_response(202 if payload.get("busy") else 200, payload)
+                if self.server.experiment_service is None:
+                    self.json_response(503, {"error": "실험실이 시작되지 않았습니다."})
+                else:
+                    self.json_response(202 if payload.get("busy") else 200, payload)
             return
         if self.path != "/api/candidates":
             self.json_response(404, {"error": "페이지를 찾을 수 없습니다."})
@@ -758,9 +789,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self.server.candidate_service.start()
-            self.json_response(202 if payload["status"] == "running" else 200, payload)
+            status = 202 if payload["status"] == "running" else 200
         except Exception:
             self.json_response(503, {"error": "후보 비교를 시작하지 못했습니다."})
+        else:
+            self.json_response(status, payload)
 
 
 def main(argv=None):

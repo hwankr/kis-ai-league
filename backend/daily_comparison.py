@@ -11,7 +11,7 @@ import math
 import re
 
 from backend.experiment_store import encode
-from backend.learning_policy import KST, LEGACY_IDS, portfolio_metrics, validate_policy
+from backend.learning_policy import KST, LEGACY_IDS, _day, portfolio_metrics, validate_policy
 
 
 def ensure_tables(store):
@@ -45,25 +45,83 @@ def freeze_context(store, fingerprint, frame, book, model, limits, observed_at, 
                    (fingerprint, frame['as_of'], encode(value)))
 
 
+def _observed_session_suffix(frames):
+    """Choose by recorded sessions only, before inspecting books or policy returns.
+
+    Historical OHLC cannot fill an observation gap. A malformed recorded frame
+    is not a gap to skip: it leaves the caller waiting for valid evidence.
+    """
+    days, calendars, sessions = [], [], set()
+    for frame in frames:
+        day = _day(frame['as_of'])
+        calendar = frame['session_days']
+        if (days and day <= days[-1] or not isinstance(calendar, list)
+                or day not in calendar or frame.get('role') == 'development_only'):
+            raise ValueError('invalid_observation_calendar')
+        normalized = sorted({_day(session) for session in calendar})
+        if calendar != normalized:
+            raise ValueError('invalid_observation_calendar')
+        calendar = normalized
+        if days and calendar[0] > days[-1]:
+            raise ValueError('insufficient_observation_calendar')
+        for session in calendar:
+            if session > day:
+                raise ValueError('future_observation_session')
+            sessions.add(session)
+        days.append(day)
+        calendars.append(calendar)
+    for calendar in calendars:
+        if set(calendar) != {day for day in sessions if calendar[0] <= day <= calendar[-1]}:
+            raise ValueError('conflicting_observation_calendar')
+    sessions = sorted(day for day in sessions if days[0] <= day <= days[-1])
+    missing = sorted(set(sessions) - set(days))
+    suffix = [day for day in days if not missing or day > missing[-1]]
+    return days, suffix, missing, sessions
+
+
 def evaluation_context(store, fingerprint, frames, limits, version):
     if not fingerprint or len(frames) < 2:
         return None
-    days = {frame['as_of'] for frame in frames[:-1]}
+    try:
+        days, suffix, missing, sessions = _observed_session_suffix(frames)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    if len(suffix) < 2:
+        return None
     expected = {key: str(limits[key]) for key in ('budget', 'order_cap', 'daily_buy_limit')}
     with store.connect() as db:
         rows = db.execute('SELECT day,payload FROM daily_policy_contexts WHERE fingerprint=? ORDER BY day',
                           (fingerprint,)).fetchall()
+    original_anchor = None
     for day, payload in rows:
         value = json.loads(payload)
-        if day in days and value['engine_version'] == version and value['limits'] == expected:
-            context = {key: deepcopy(value[key]) for key in ('initial_state', 'execution_model', 'observed_at')}
+        if day in days[:-1] and value['engine_version'] == version and value['limits'] == expected:
+            if original_anchor is None:
+                original_anchor = day
+            if day not in suffix[:-1]:
+                continue
             # Validate the stored anchor against the actual following frame. A
             # current book alone cannot create a historical evaluation interval.
-            from backend.daily_evaluation import _evaluation_window
+            from backend.daily_evaluation import ANCHOR_SELECTION_VERSION, _evaluation_window
             try:
+                context = {key: deepcopy(value[key]) for key in ('initial_state', 'execution_model', 'observed_at')}
+                if context['initial_state'].get('as_of') != day:
+                    return None
                 _evaluation_window(frames, context)
             except (KeyError, TypeError, ValueError, AttributeError):
-                continue
+                return None
+            # The first eligible book in this fixed suffix wins. Never try a
+            # different book after a replay failure or an unfavourable return.
+            selected = frames[days.index(day):]
+            context['anchor_selection'] = {
+                'version': ANCHOR_SELECTION_VERSION, 'original_anchor': original_anchor,
+                'selected_anchor': day, 'suffix_start': suffix[0], 'end_day': days[-1],
+                'missing_sessions': missing, 'frame_days': suffix[suffix.index(day):],
+                'excluded_observed_range': [days[0], days[days.index(day) - 1]] if day != days[0] else None,
+                'calendar_hash': hashlib.sha256(encode(sessions).encode()).hexdigest(),
+                'frames_hash': hashlib.sha256(encode(selected).encode()).hexdigest(),
+                'book_hash': hashlib.sha256(encode(context['initial_state']).encode()).hexdigest(),
+            }
             return context
     return None
 
