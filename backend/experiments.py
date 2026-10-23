@@ -269,6 +269,71 @@ class ExperimentService:
         value = self.store.setting(setting, {}).get("next_retry_at")
         return not value or self.now() >= stamp(value)
 
+    def _stage_retry_due(self, operation):
+        """A failure delays its own stage, not unrelated safety work."""
+        failures = self._operation_failures()
+        stages = ("cycle", "reconcile") if operation in {"cycle", "reconcile"} else (operation,)
+        return all(operation in {'cycle', 'reconcile'} and failures.get(stage, {}).get('issue_code') == 'entry_selection'
+                   or not failures.get(stage, {}).get("next_retry_at")
+                   or self.now() >= stamp(failures[stage]["next_retry_at"]) for stage in stages)
+
+    def _entry_validation_token(self, operation):
+        failure = self._operation_failures().get(operation)
+        entry_failure = (failure if failure and failure.get('issue_code') == 'entry_selection'
+                         else (failure or {}).get('entry_selection_failure'))
+        if not entry_failure:
+            return None
+        policy = self._policy()
+        daily_key = 'daily_policy:' + str(policy.get('fingerprint'))
+        return deepcopy({'failure': failure, 'entry_failure': entry_failure, 'policy': policy,
+            'active': self.learning.daily.active(), 'adopted': self._adopted_policy(),
+            'daily_key': daily_key, 'daily': self.store.setting(daily_key),
+            'issue': next((item for item in self.store.setting('issues', [])
+                           if item['id'] == 'entry_selection'), None)})
+
+    def _resolve_validated_entry_selection(self, operation, token, run):
+        """Commit only the same owner's validated error generation and policy."""
+        if (not token or run.get('learning_policy') != token['adopted']
+                or self.learning.daily.active() != token['active']
+                or self._adopted_policy() != token['adopted']
+                or token['entry_failure'].get('entry_policy', token['adopted']) != token['adopted']
+                or token['entry_failure'].get('entry_active', token['active']) != token['active']
+                or token['entry_failure'].get('entry_run_id') not in {None, run['id']}):
+            return False
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            def read(key, default=None):
+                row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                return json.loads(row[0]) if row else default
+            health = read('autonomy_status', {})
+            failures = health.get('operation_failures', {})
+            issues = read('issues', [])
+            issue = next((item for item in issues if item['id'] == 'entry_selection'), None)
+            if (failures.get(operation) != token['failure'] or issue != token['issue']
+                    or read('policy') != token['policy'] or read(token['daily_key']) != token['daily']):
+                return False
+            if failures[operation].get('issue_code') == 'entry_selection':
+                failures.pop(operation)
+            else:
+                failures[operation].pop('entry_selection_failure', None)
+            if issue and not any(value.get('issue_code') == 'entry_selection'
+                                 or value.get('entry_selection_failure') for value in failures.values()):
+                issue.update(state='resolved', last_seen=self._timestamp(),
+                             validated_run_id=run['id'], validated_operation=operation)
+            latest = max(reversed(list(failures.items())),
+                         key=lambda item: item[1].get('last_error_at') or '', default=None)
+            value = latest[1] if latest else {}
+            retries = [item['next_retry_at'] for item in failures.values() if item.get('next_retry_at')]
+            health.update(operation_failures=failures, last_error=value.get('last_error'),
+                last_error_operation=latest[0] if latest else None,
+                last_error_request=value.get('last_error_request'),
+                consecutive_failures=max((item.get('consecutive_failures') or 0 for item in failures.values()), default=0),
+                next_retry_at=max(retries, key=stamp) if retries else None)
+            db.executemany('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                           [('autonomy_status', encode(health)), ('issues', encode(issues))])
+        self.error = health['last_error']
+        return True
+
     def _operation_failures(self):
         health = self.store.setting("autonomy_status", {})
         if "operation_failures" in health:
@@ -294,14 +359,20 @@ class ExperimentService:
 
     def _success(self, operation, *, completed=True):
         failures = self._operation_failures()
-        failures.pop(operation, None)
+        def clear_validated(stage):
+            entry_failure = failures.get(stage, {}).get('entry_selection_failure')
+            if entry_failure:
+                failures[stage] = entry_failure
+            elif failures.get(stage, {}).get("issue_code") != "entry_selection":
+                failures.pop(stage, None)
+        clear_validated(operation)
         if operation == "cycle":
-            failures.pop("reconcile", None)  # Every cycle completes reconciliation first.
+            clear_validated("reconcile")  # Every cycle completes reconciliation first.
         if operation in {"cycle", "reconcile"}:
             # Command errors end after account/order checks resume. Ambiguous
             # mutations remain protected by their separate durable order issues.
             for command in ("cancel", "resolve"):
-                failures.pop(command, None)
+                clear_validated(command)
         changes = {}
         if completed:
             self.updated_at = self._timestamp()
@@ -324,6 +395,9 @@ class ExperimentService:
     def _failure(self, error, operation):
         message = str(error) if isinstance(error, KisError) else "실험 조회·처리를 완료하지 못했습니다. 자동 재시도합니다."
         pending = self._operation_failures()
+        previous = pending.get(operation, {})
+        entry_failure = (previous if previous.get('issue_code') == 'entry_selection'
+                         else previous.get('entry_selection_failure'))
         failures = (pending.get(operation, {}).get("consecutive_failures") or 0) + 1
         delay = min(900, 30 * 2 ** min(failures - 1, 5))
         at = self._timestamp()
@@ -332,9 +406,15 @@ class ExperimentService:
                    if isinstance(error, KisRequestError) else None)
         pending.pop(operation, None)
         pending[operation] = {"last_error": message, "last_error_at": at,
+                              "generation": uuid4().hex,
                               "consecutive_failures": failures, "last_error_request": request,
                               "issue_code": error.code if isinstance(error, OperationalBlock) else "temporary_failure",
                               "next_retry_at": (self.now() + timedelta(seconds=delay)).isoformat()}
+        if isinstance(error, OperationalBlock) and error.code == 'entry_selection':
+            pending[operation].update(entry_policy=self._adopted_policy(), entry_active=self.learning.daily.active(),
+                                      entry_run_id=getattr(error, 'run_id', None))
+        elif entry_failure:
+            pending[operation]['entry_selection_failure'] = entry_failure
         self._save_operation_health(pending, last_error_at=at)
         if isinstance(error, OperationalBlock):
             self._issue(error.code, message, question=error.question)
@@ -704,13 +784,16 @@ class ExperimentService:
         self._enforce_deadline()
         if self.worker is not None and self.worker.is_alive():
             return
-        if self._retry_due():
+        if self._stage_retry_due("initialize") and self._stage_retry_due("automatic"):
             self._launch("automatic")
 
     def _automatic(self):
         failure = None
         cycle_completed = analysis_completed = False
+        if not self._stage_retry_due("initialize") or not self._stage_retry_due("automatic"):
+            return False
         operation = "initialize"
+        policy = None
         try:
             self._enforce_deadline()
             policy = self._initialize_policy()
@@ -718,38 +801,48 @@ class ExperimentService:
                 self._success(operation, completed=False)
             # Reconciliation continues during a user pause, without changing intent.
             if policy.get("account_id"):
-                if self.store.setting("enabled", False):
+                if self.store.setting("enabled", False) and self._stage_retry_due("cycle"):
                     operation = "cycle"
                     self._cycle()
                     self._success(operation)
                     cycle_completed = True
-                elif (any(item["status"] in ACTIVE for item in self._owned_orders(policy))
-                      or {"reconcile", "cancel", "resolve"} & self._operation_failures().keys()):
+                elif (not self.store.setting("enabled", False) and self._stage_retry_due("reconcile")
+                      and (any(item["status"] in ACTIVE for item in self._owned_orders(policy))
+                      or {"reconcile", "cancel", "resolve"} & self._operation_failures().keys())):
                     operation = "reconcile"
                     self._reconcile(policy)
                     self._success(operation)
-                if self.learning.enabled and self._market_open():
-                    operation = "learning_quotes"
-                    self._observe_learning_quotes(policy)
-                    self._success(operation)
-                elif "learning_quotes" in self._operation_failures():
-                    # Intraday observations are no longer due; retain the error
-                    # event without claiming a successful quote observation.
-                    self._success("learning_quotes", completed=False)
         except Exception as error:
             failure = error
             self._failure(error, operation)
             self._automatic_failure_recorded = True
+        operation = "learning_quotes"
         try:
-            candidate = self.candidate_service.snapshot() if self.candidate_service else None
-            pending = self.learning.daily.pending() if self.learning.enabled else None
-            prepare_daily = bool(pending and not pending.get("prepared_run")
-                                 and self.now().astimezone(KST).time() < daytime(9))
-            if not self.stopping and (prepare_daily or candidate is None
+            if policy and policy.get("account_id"):
+                if self.learning.enabled and self._market_open() and self._stage_retry_due("learning_quotes"):
+                    operation = "learning_quotes"
+                    self._observe_learning_quotes(policy)
+                    self._success(operation)
+                elif not self._market_open() and "learning_quotes" in self._operation_failures():
+                    # Intraday observations are no longer due; retain the error
+                    # event without claiming a successful quote observation.
+                    self._success("learning_quotes", completed=False)
+        except Exception as error:
+            if failure is None:
+                failure = error
+            self._failure(error, operation)
+            self._automatic_failure_recorded = True
+        try:
+            if not self.stopping and self._stage_retry_due("analyze"):
+                candidate = self.candidate_service.snapshot() if self.candidate_service else None
+                pending = self.learning.daily.pending() if self.learning.enabled else None
+                prepare_daily = bool(pending and not pending.get("prepared_run")
+                                     and self.now().astimezone(KST).time() < daytime(9))
+                if (prepare_daily or candidate is None
                                      or candidate["status"] == "complete" and not candidate.get("stale")):
-                self._analyze(automatic_retry=True)
-                self._success("analyze")
-                analysis_completed = True
+                    self._analyze(automatic_retry=True)
+                    self._success("analyze")
+                    analysis_completed = True
         except Exception as error:
             self._failure(error, "analyze")
             self._automatic_failure_recorded = True
@@ -793,6 +886,80 @@ class ExperimentService:
                 "histories": histories, "calendars": {board: sorted(bars) for board, bars in indices.items()},
                 "benchmarks": indices}
 
+    def _frozen_entry_input(self, data):
+        """Restore metadata only after checking the complete original source contract."""
+        from backend.daily_inputs import frozen_data
+        try:
+            with self.store.connect() as db:
+                row = db.execute('SELECT digest,payload FROM learning_frames WHERE day=?',
+                                 (str(data['as_of']),)).fetchone()
+            if row is None:
+                raise ValueError('missing_frozen_frame')
+            frame = json.loads(row[1])
+            digest = hashlib.sha256(encode({key: value for key, value in frame.items()
+                                            if key not in {'observed_at', 'captured_at'}}).encode()).hexdigest()
+            current = self.now().astimezone(KST)
+            cutoff = datetime.combine(current.date(), daytime(9), KST)
+            contract = frame['signal_inputs']
+            observed = stamp(contract['observed_at']).astimezone(KST)
+            if (digest != row[0] or frame['as_of'] != str(data['as_of'])
+                    or observed.date().isoformat() != frame['as_of'] or observed.time() < daytime(16)
+                    or stamp(frame['captured_at']) >= cutoff or observed >= cutoff
+                    or not isinstance(frame.get('baseline_signals'), list)):
+                raise ValueError('invalid_frozen_frame')
+            return frozen_data(contract, data), frame
+        except (KeyError, TypeError, ValueError):
+            raise OperationalBlock('장후 동결 입력 원본이 일치하지 않아 분석을 보류합니다.', 'entry_selection') from None
+
+    def _validate_frozen_entry_run(self, run, data, frame, adopted, *, session_days=None):
+        from backend.daily_inputs import validate_entry_selection
+        from backend.experiment_analysis import analysis_version, build_snapshot
+        from backend.learning_compatibility import scoped_live_entry_version_matches
+        from backend.learning_policy import build_frame, policy_id
+        try:
+            normalized = build_snapshot(**data)
+            version = analysis_version(self.config_path)
+            digestable = {key: value for key, value in normalized.items() if key != 'observed_at'}
+            digestable['analysis_version'] = version
+            base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
+            learned = build_frame(data)
+            key = hashlib.sha256(encode([base_key, policy_id(adopted), run['learning_engine_version'],
+                {key: value for key, value in learned.items() if key != 'observed_at'}]).encode()).hexdigest()
+            with self.store.connect() as db:
+                raw = db.execute('SELECT payload FROM runs WHERE id=?', (run['id'],)).fetchone()
+                indexed = db.execute('SELECT collection_hash,input_key,summary FROM run_index WHERE id=?',
+                                     (run['id'],)).fetchone()
+            full = json.loads(raw[0]) if raw else {}
+            analysis = full.get('analysis') or {}
+            current = self.now().astimezone(KST)
+            if session_days is None:
+                broker = self._broker(self._policy())
+                session_days = broker.session_days((current.date() - timedelta(days=20)).isoformat(),
+                                                    current.date().isoformat())
+            prior_days = sorted({day for day in session_days if day < current.date().isoformat()})
+            if (not indexed or json.loads(indexed[2]) != run
+                    or current.date().isoformat() not in session_days or not prior_days
+                    or str(data['as_of']) != prior_days[-1]
+                    or {name: value for name, value in full.items() if name != 'analysis'} != run
+                    or indexed[0] != key or indexed[1] != base_key or run.get('collection_hash') != key
+                    or analysis.get('input') != normalized or analysis.get('version_id') != version
+                    or analysis.get('input_hash') != run.get('input_hash')
+                    or run.get('input_hash') != hashlib.sha256(encode(normalized).encode()).hexdigest()
+                    or analysis.get('decisions', run['signals']) != run['signals']
+                    or run.get('version_id') != version or run.get('status') != 'ready'
+                    or run.get('as_of') != str(data['as_of']) or run.get('learning_policy') != adopted
+                    or stamp(run['created_at']) >= datetime.combine(current.date(), daytime(9), KST)
+                    or not scoped_live_entry_version_matches(run, self.learning.version,
+                        execution_day=current.date().isoformat(), active=self.learning.daily.active())
+                    or [item for item in run['signals'] if not item.get('policy_id')] != frame['baseline_signals']
+                    or not validate_entry_selection(run, adopted, frame=learned)):
+                raise ValueError('frozen_run_mismatch')
+            return True
+        except (KeyError, TypeError, ValueError):
+            error = OperationalBlock('동결한 진입 신호 원본이 일치하지 않아 분석을 보류합니다.', 'entry_selection')
+            error.run_id = run.get('id') if isinstance(run, dict) else None
+            raise error from None
+
     def _analyze(self, *, retry_llm=False, automatic_retry=False):
         from backend.daily_inputs import freeze_entry_selection, validate_entry_selection
         from backend.experiment_analysis import analyze_experiments, analysis_version, build_snapshot
@@ -806,12 +973,14 @@ class ExperimentService:
                 raise OperationalBlock('승인한 장중 정책 원본을 확인할 수 없어 분석을 보류합니다.', 'intraday_policy')
             return approved
         data = self.input_reader()
+        validation_token = self._entry_validation_token('analyze')
+        adopted = self._adopted_policy()
+        frozen_frame = None
         # Do not reroll LLM recommendations from the same frozen daily input.
         normalized = build_snapshot(**data)
         digestable = {key: value for key, value in normalized.items() if key != "observed_at"}
         digestable["analysis_version"] = analysis_version(self.config_path)
         base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
-        adopted = self._adopted_policy()
         learned_frame = build_frame(data) if adopted and adopted["kind"] == "rules" else None
         entry_selection = None
         key = (hashlib.sha256(encode([base_key, policy_id(adopted),
@@ -819,6 +988,31 @@ class ExperimentService:
                 {key: value for key, value in learned_frame.items() if key != "observed_at"}]).encode()).hexdigest()
                if learned_frame else base_key)
         previous = self.store.find_run(key, exact=True)
+        if (adopted and adopted.get('held_before_top_n') and adopted.get('kind') == 'rules'
+                and daytime(9) <= current.time() < daytime(16) and str(data['as_of']) < current.date().isoformat()
+                and (previous is None or validation_token is not None)):
+            data, frozen_frame = self._frozen_entry_input(data)
+            normalized = build_snapshot(**data)
+            digestable = {name: value for name, value in normalized.items() if name != 'observed_at'}
+            digestable['analysis_version'] = analysis_version(self.config_path)
+            base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
+            learned_frame = build_frame(data)
+            key = hashlib.sha256(encode([base_key, policy_id(adopted), self.learning.version,
+                {name: value for name, value in learned_frame.items() if name != 'observed_at'}]).encode()).hexdigest()
+            previous = self.store.find_run(key, exact=True)
+        if previous is None and learned_frame:
+            from backend.learning_compatibility import scoped_live_entry_version_matches
+            frozen = self.store.find_run(base_key)
+            if (frozen and frozen.get('learning_engine_version') != self.learning.version
+                    and frozen.get('status') == 'ready' and frozen.get('as_of') == str(data['as_of'])
+                    and frozen.get('learning_policy') == adopted
+                    and scoped_live_entry_version_matches(frozen, self.learning.version,
+                        execution_day=current.date().isoformat(), active=active)):
+                frozen_key = hashlib.sha256(encode([base_key, policy_id(adopted),
+                    frozen['learning_engine_version'],
+                    {name: value for name, value in learned_frame.items() if name != 'observed_at'}]).encode()).hexdigest()
+                if frozen_key == frozen.get('collection_hash'):
+                    previous = frozen
         if learned_frame and adopted.get('held_before_top_n'):
             if previous is not None:
                 if not validate_entry_selection(previous, adopted, frame=learned_frame):
@@ -832,6 +1026,14 @@ class ExperimentService:
                         or signal_day < current.date().isoformat() and current.time() >= daytime(9)):
                     raise OperationalBlock('장중에는 진입 후보를 새로 정하지 않습니다. 장후 동결 신호가 필요합니다.', 'entry_selection')
                 entry_selection = freeze_entry_selection(adopted, self._entry_selection_book())
+        if frozen_frame is not None:
+            self._validate_frozen_entry_run(previous, data, frozen_frame, adopted)
+            self._resolve_validated_entry_selection('analyze', validation_token, previous)
+            # An intraday recovery never rerolls a frozen LLM or baseline signal.
+            self._refresh_shadow(data)
+            self._learn(data, previous)
+            self._prepare_daily(data, previous)
+            return previous
         if previous is not None:
             state = previous.get("llm_status")
             failed = isinstance(state, dict) and state.get("status") in {"error", "unconfigured"}
@@ -1016,6 +1218,9 @@ class ExperimentService:
             if (protection_quotes.get('day') == str(data['as_of'])
                     and protection_quotes.get('fingerprint') == policy.get('fingerprint')):
                 context['protection_quotes'] = protection_quotes.get('quotes', {})
+            if getattr(getattr(self.learning, 'daily', None), 'enabled', False):
+                from backend.research_observation import context as research_quote_context
+                context.update(research_quote_context(self, policy))
             current = self.now().astimezone(KST)
             if current.date().isoformat() == str(data['as_of']) and current.time() >= daytime(16):
                 orders = self._owned_orders(policy)
@@ -1032,12 +1237,21 @@ class ExperimentService:
                     if value:
                         book['account_protection'] = {'units': value['units'], 'peak': value['risk']['peak'],
                             'active': value['risk']['active'], 'limit_pct': self.risk_limit}
-                    context['observed_at'] = self._timestamp()
+                    context['observed_at'] = context['book_observed_at'] = self._timestamp()
                 except ValueError:
                     context['book_error'] = 'AI 보유 평가가격 확인 필요'
                 if getattr(getattr(self.learning, 'daily', None), 'enabled', False):
                     from backend.learning_research import public_competition_context
-                    context['competition_context'] = public_competition_context(self._competition_research_context())
+                    competition = self._competition_research_context()
+                    context['competition_context'] = public_competition_context(competition)
+                    if competition is not None or policy.get('account_id') == 'competition':
+                        source = competition if isinstance(competition, dict) else {}
+                        context['competition_observation'] = {
+                            **{key: source.get(key) for key in ('status', 'coverage', 'stale', 'updated_at')},
+                            'period': {key: (source.get('period') or {}).get(key)
+                                       for key in ('start_date', 'end_date', 'as_of')},
+                            'account_id': (source.get('account') or {}).get('id')}
+                    context['observed_at'] = self._timestamp()
             self.learning.enqueue(data, baseline, policy, source_id=run["collection_hash"], context=context)
 
     def _decision_quote(self, symbol, price):
@@ -1095,9 +1309,16 @@ class ExperimentService:
             self.store.save_setting('learning_protection_quotes', state)
 
     def _observe_learning_quotes(self, policy):
-        """One small decision-price observation per symbol/day, including a frozen challenger."""
+        """Research batches follow live trading; legacy trials retain their observations."""
         if policy.get('execution_strategy') != ALL_STRATEGIES:
             return
+        if getattr(getattr(self.learning, 'daily', None), 'enabled', False):
+            from backend.research_observation import observe
+            return observe(self, policy)
+        return self._observe_legacy_learning_quotes(policy)
+
+    def _observe_legacy_learning_quotes(self, policy):
+        """Preserved first-quote contract for the legacy long-horizon trial mode."""
         from backend.learning_policy import BASELINE_POLICY, signals, canonical_entry_context
         frames = self.learning.frames(1)
         if not frames:
@@ -1522,13 +1743,23 @@ class ExperimentService:
             self._issue("analysis_missing", "직전 거래일의 장전 완료 분석이 없어 신규 진입을 기다립니다.", blocking=False)
             return
         self._resolve_issue("analysis_missing")
-        if not self.store.setting("enabled", False) or self._blocked():
-            return
         run = runs[0]
         if adopted:
-            from backend.learning_compatibility import version_matches
-            if adopted["kind"] == "rules" and not version_matches(run.get("learning_engine_version"), self.learning.version):
+            from backend.learning_compatibility import scoped_live_entry_version_matches
+            if adopted["kind"] == "rules" and not scoped_live_entry_version_matches(run, self.learning.version,
+                    execution_day=today.isoformat(), active=active):
                 return
+        cycle_failure = self._operation_failures().get('cycle', {})
+        if ((cycle_failure.get('issue_code') == 'entry_selection' or cycle_failure.get('entry_selection_failure'))
+                and (not cycle_failure.get('next_retry_at') or self.now() >= stamp(cycle_failure['next_retry_at']))
+                and adopted and adopted.get('held_before_top_n')):
+            validation_token = self._entry_validation_token('cycle')
+            data, frozen_frame = self._frozen_entry_input(self.input_reader())
+            self._validate_frozen_entry_run(run, data, frozen_frame, adopted, session_days=days)
+            self._entry_plan(policy, run, today)
+            self._resolve_validated_entry_selection('cycle', validation_token, run)
+        if not self.store.setting("enabled", False) or self._blocked():
+            return
         execution = run.get("learning_policy") if policy["execution_strategy"] == ALL_STRATEGIES else None
         learned = execution and execution["kind"] == "rules" and self.learning.enabled
         from backend.experiment_analysis import analysis_version

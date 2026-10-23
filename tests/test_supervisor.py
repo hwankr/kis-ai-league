@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import errno
 import io
 import json
 import os
@@ -256,6 +257,101 @@ class SupervisorTests(unittest.TestCase):
         bad = self.supervisor.directory / "bad.json"
         bad.write_text("{}" * 40000)
         self.assertEqual(_read(bad), {})
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows replacement errors')
+    def test_atomic_replace_retries_transient_windows_errors_with_bounded_waits(self):
+        for code in (5, 32, 33):
+            with self.subTest(winerror=code):
+                target = self.root / 'retry-state.json'
+                _write(target, {'value': 'old'})
+                error = OSError(errno.EACCES, 'private-file-path')
+                error.winerror = code
+                original = Path.replace
+                calls = []
+                def replace(source, destination):
+                    calls.append(source)
+                    if len(calls) < 3:
+                        raise error
+                    return original(source, destination)
+                with patch.object(Path, 'replace', replace), patch('backend.supervisor.time.sleep') as sleep:
+                    _write(target, {'value': 'new'})
+                self.assertEqual(_read(target), {'value': 'new'})
+                self.assertEqual(len(calls), 3)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [.05, .1])
+
+    @unittest.skipUnless(os.name == 'nt', 'Real Windows deny-delete handle')
+    def test_real_windows_reader_denies_delete_then_release_allows_atomic_replace(self):
+        target = self.root / 'held-state.json'
+        _write(target, {'value': 'old'})
+        original = Path.replace
+        errors = []
+        with target.open('rb') as held:
+            def replace(source, destination):
+                try:
+                    return original(source, destination)
+                except OSError as error:
+                    errors.append(getattr(error, 'winerror', None))
+                    self.assertEqual(_read(target), {'value': 'old'})
+                    raise
+            with patch.object(Path, 'replace', replace), \
+                    patch('backend.supervisor.time.sleep', side_effect=lambda _: held.close()) as sleep:
+                _write(target, {'value': 'new'})
+        self.assertTrue(errors)
+        self.assertTrue(set(errors) <= {5, 32, 33})
+        sleep.assert_called_once_with(.05)
+        self.assertEqual(_read(target), {'value': 'new'})
+        self.assertEqual({path.name for path in self.root.iterdir()}, {'held-state.json'})
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows replacement errors')
+    def test_persistent_windows_denial_exhausts_then_preserves_original(self):
+        target = self.root / 'persistent-state.json'
+        _write(target, {'value': 'old'})
+        error = OSError(errno.EACCES, 'private-file-path')
+        error.winerror = 5
+        with patch.object(Path, 'replace', side_effect=error) as replace, \
+                patch('backend.supervisor.time.sleep') as sleep:
+            with self.assertRaises(OSError) as raised:
+                _write(target, {'value': 'new'})
+        self.assertIs(raised.exception, error)
+        self.assertEqual(replace.call_count, 5)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [.05, .1, .2, .4])
+        self.assertLess(sum(call.args[0] for call in sleep.call_args_list), 1)
+        self.assertEqual(_read(target), {'value': 'old'})
+        self.assertEqual({path.name for path in self.root.iterdir()}, {'persistent-state.json'})
+
+    def test_nontransient_replace_and_other_write_stages_never_retry(self):
+        target = self.root / 'failure-state.json'
+        _write(target, {'value': 'old'})
+        for winerror in (112, 1117, None):
+            with self.subTest(winerror=winerror):
+                error = OSError(errno.ENOSPC, 'private-file-path')
+                if winerror is not None:
+                    error.winerror = winerror
+                with patch.object(Path, 'replace', side_effect=error) as replace, \
+                        patch('backend.supervisor.time.sleep') as sleep:
+                    with self.assertRaises(OSError):
+                        _write(target, {'value': 'new'})
+                self.assertEqual(replace.call_count, 1)
+                sleep.assert_not_called()
+        error = OSError(errno.EACCES, 'private-file-path')
+        error.winerror = 5
+        with patch('backend.supervisor.os.fsync', side_effect=error), \
+                patch.object(Path, 'replace') as replace, patch('backend.supervisor.time.sleep') as sleep:
+            with self.assertRaises(OSError):
+                _write(target, {'value': 'new'})
+        replace.assert_not_called()
+        sleep.assert_not_called()
+        self.assertEqual(_read(target), {'value': 'old'})
+
+    def test_main_oserror_reports_only_numeric_codes(self):
+        error = OSError(errno.EACCES, 'private-secret-command', 'private-filename')
+        error.winerror = 5
+        with patch('backend.supervisor.Supervisor.run', side_effect=error), \
+                patch('backend.supervisor.signal.signal'), patch('sys.stderr', new_callable=io.StringIO) as output:
+            self.assertEqual(main(['run']), 1)
+        self.assertIn('errno=13', output.getvalue())
+        self.assertIn('winerror=5', output.getvalue())
+        self.assertNotIn('private', output.getvalue())
 
     def test_health_probe_reads_only_local_health_with_required_header(self):
         response = Mock()

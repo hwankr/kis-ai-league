@@ -3,7 +3,7 @@ from copy import deepcopy
 import json
 import math
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from backend.daily_evaluation import VERSION, evaluate_daily_candidate, select_daily_candidate
 from backend.learning_evaluation import daily_metrics
@@ -189,6 +189,47 @@ class DailyEvaluationTests(unittest.TestCase):
                                                  evaluator=evaluate)
             winners.append(selected["policy"])
         self.assertEqual(winners[0], winners[1])
+
+    def test_return_challenge_uses_selected_pool_metadata_and_keeps_qualification_warning(self):
+        from backend.learning_policy import policy_id
+        first, second = changed(), changed()
+        second["policy"]["strategies"][0]["holding_sessions"] = 6
+        first["method"], second["method"] = "first", "second"
+        pool = [first, second]
+        award = {"status": "apply", "reason": "return_challenge", "eligible_candidates": 1,
+                 "return_objective": {"statistic": "core_mean_final_equity", "probability": False},
+                 "award_plan_supported": False, "qualification_risk": True,
+                 "outcomes": [{"candidate_id": policy_id(item["policy"])} for item in pool]}
+        # The valid daily comparison can be keep while the independently
+        # qualified award objective supports a provisional return challenge.
+        evaluate = Mock(return_value={"decision": "keep", "metrics": {}})
+        with patch("backend.policy_award.select_award_record", return_value=(1, award)):
+            selected, result = select_daily_candidate(policy(), {**first, "candidate_pool": pool},
+                frames(3), LIMITS, evaluator=evaluate, award_context={"competition_context": {}})
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual(selected["method"], "second")
+        self.assertEqual(result["decision"], "apply")
+        self.assertIn("수상요건 미달 위험", result["reason"])
+        selection = result["metrics"]["selection"]
+        self.assertEqual(selection["selected_candidate_id"], policy_id(second["policy"]))
+        self.assertFalse(selection["prospective"])
+        self.assertFalse(result["metrics"]["award_selection"]["award_plan_supported"])
+        self.assertEqual(selection["return_objective"], award["return_objective"])
+        selection["return_objective"]["probability"] = True
+        self.assertFalse(award["return_objective"]["probability"])
+
+    def test_return_selector_keep_cannot_fall_back_to_daily_apply_candidate(self):
+        from backend.learning_policy import policy_id
+        award = {"status": "keep", "reason": "no_supported_return_improvement",
+                 "eligible_candidates": 0, "return_objective": {}, "outcomes": []}
+        evaluate = Mock(return_value={"decision": "apply", "metrics": {"selection_return_pct": 100}})
+        with patch("backend.policy_award.select_award_record", return_value=(None, award)):
+            _, result = select_daily_candidate(policy(), changed(), frames(3), LIMITS,
+                evaluator=evaluate, award_context={"competition_context": {}})
+        self.assertEqual(result["decision"], "keep")
+        self.assertIn("현행 유지", result["reason"])
+        self.assertTrue(result["metrics"]["selection"]["incumbent_selected"])
+        self.assertEqual(result["metrics"]["selection"]["selected_candidate_id"], policy_id(policy()))
 
     def test_recent_relative_reversal_is_a_diagnostic_not_an_extra_gate(self):
         result = self.evaluate(evidence([.002] * 6), evidence([.004] * 4 + [.001] * 2))

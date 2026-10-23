@@ -67,18 +67,24 @@ within the same signal quality, costs, account limits and risk protection. Gross
 amount means executed buy plus sell notionals, excluding fees and unexecuted
 liquidation marks. Do not shorten holding periods solely to create turnover,
 relax signal quality, repeat meaningless trades or treat turnover as profit.
-Trading activity is a qualification constraint, not profit or a reward beyond
-the target. Joint qualification and final NAV at least the original capital come
-before relative development return. All-path and core joint qualification are
-the strongest tiers. Partial joint challenges preserve and add incumbent core
-witnesses, never worsen any gross shortfall or worst final NAV, and improve the
-worst shortfall by a predeclared required session amount. Supported progress
-uses the same relative risk and non-turnover activity checks; it does not impose
-an all-hypothetical-path principal floor. Actual final principal qualification
-still applies. Relative return is an
-opportunity-cost diagnostic, not a zero-sacrifice veto of qualifying policies.
-No qualifying or supported progress plan means unresolved qualification risk;
-keep does not establish that the incumbent is good or can qualify.
+The final selector pursues official KIS places 1-5 using J: the equal-weight
+mean final NAV of the 12 fixed normal/cost-stress core paths, after costs and
+current-book transition. J is a development diagnostic, not expected live return
+or a rank probability. Actual rank and the fifth-place return are unknown; never
+infer rank entry or switch automatically to a defensive objective.
+Eligibility requires all 24 complete paired paths, valid comparison/transition,
+each core path's gross-amount/trading-day/symbol/API deficit no worse than the
+incumbent, and preservation of every incumbent jointly qualifying core path ID.
+Unknown inputs fail these checks. Preserve the incumbent's worst final NAV veto
+and the independent 15% accumulated protection. Require strict J improvement
+under the existing numeric tolerance; ties keep the incumbent, then use fixed
+candidate ID order. Qualification classes, progress and risk reduction are
+diagnostics, not promotion requirements or substitutes for J improvement.
+If both policies have zero jointly qualifying paths, an eligible J gain may be
+a return_challenge with award_plan_supported=false and qualification risk explicit.
+Neither positive modeled return nor additional deficit improvement is required;
+actual final award qualification still applies. Turnover above its target earns
+no reward. Keep does not establish that the incumbent is good or can qualify.
 A scenario pass rate is not a win probability. Missing
 or stale progress is unknown, never zero. transition_context describes the
 CURRENT frozen holdings: never insert it into older historical evaluations.
@@ -92,8 +98,9 @@ The generator separately supplies predeclared allocation/holding 2x2 controls.
 The LLM must still propose one change family; it cannot authorize an arbitrary
 compound change. Capacity experiments preserve signal tests, weights, reserves,
 stops, takes and global limits. Shorter future holding periods must pass costs
-and joint capital/qualification checks; historical packet controls may repeat.
-For a rules incumbent with a reliable current-book contest context, a separate
+and the same return/qualification/risk gates; historical packet controls may repeat.
+For a rules incumbent with reliable behind or on_track progress and an observed
+current-book contest context, a separate
 deterministic packet fixes four signal templates and future holding ages 1/2/4,
 plus the incumbent and common capacity/age controls, before any candidate score.
 It is not a full factorial. Your proposal remains a separate LLM observation;
@@ -763,6 +770,22 @@ def _public_award_outcome(item):
     identity = item.get("candidate_id")
     if isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity):
         result["candidate_id"] = identity
+    for key in ('objective_value', 'objective_improvement'):
+        result[key] = _number(item.get(key))
+    if isinstance(item.get('diagnostic_reason'), str):
+        result['diagnostic_reason'] = item['diagnostic_reason'][:120]
+    for key in ('award_plan_supported', 'qualification_risk'):
+        result[key] = item.get(key) if type(item.get(key)) is bool else None
+    for key in ('activity_preservation', 'core_witness_preservation'):
+        gate = item.get(key)
+        if isinstance(gate, dict):
+            clean = {'supported': gate.get('supported') if type(gate.get('supported')) is bool else None}
+            if isinstance(gate.get('reason'), str):
+                clean['reason'] = gate['reason'][:120]
+            for field in ('worsened', 'unknown', 'lost'):
+                if isinstance(gate.get(field), list):
+                    clean[field + '_count'] = len(gate[field])
+            result[key] = clean
     result["coverage"] = {key: qualification[key] for key in
         ("scenario_count", "evaluated_scenarios", "qualifying_scenarios")
         if type(qualification.get(key)) is int and qualification[key] >= 0}
@@ -832,6 +855,28 @@ def _public_daily_evaluation(value):
     if isinstance(award, dict):
         summary["award_selection"] = {key: deepcopy(award.get(key)) for key in
             ("version", "contest_id", "status", "reason", "return_tolerance_pp", "selected_qualification")}
+        clean = summary['award_selection']
+        for key in ('objective', 'activity_gate', 'core_witness_gate', 'relative_risk_gate', 'legacy_promotion_role'):
+            if isinstance(award.get(key), str):
+                clean[key] = award[key][:160]
+        for key in ('incumbent_objective_value', 'selected_objective_value', 'objective_improvement',
+                    'fifth_place_return_pct'):
+            clean[key] = _number(award.get(key))
+        for key in ('target_rank_max', 'actual_rank'):
+            clean[key] = award.get(key) if type(award.get(key)) is int and award[key] > 0 else None
+        for key in ('automatic_rank_defense', 'award_plan_supported', 'qualification_risk'):
+            clean[key] = award.get(key) if type(award.get(key)) is bool else None
+        objective = award.get('return_objective')
+        if isinstance(objective, dict):
+            clean['return_objective'] = {key: objective[key][:160] for key in
+                ('weights', 'aggregation', 'meaning', 'incumbent_tie', 'candidate_tie')
+                if isinstance(objective.get(key), str)}
+            clean['return_objective']['minimum_improvement'] = _number(objective.get('minimum_improvement'))
+            clean['return_objective']['path_count'] = (objective.get('path_count')
+                if type(objective.get('path_count')) is int and 0 < objective['path_count'] <= 24 else None)
+            clean['return_objective']['environments'] = [value for value in objective.get('environments', [])
+                if isinstance(value, str) and value in {'normal', 'cost_stress'}
+                ] if isinstance(objective.get('environments'), list) else []
         summary["award_selection"]["outcomes"] = [_public_award_outcome(item)
             for item in award.get("outcomes", [])[:MAX_CANDIDATES] if isinstance(item, dict)]
     if type(metrics.get("loss_reduction_only")) is bool:
@@ -935,7 +980,10 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         # different candidate. Storage failures must remain visible to research.
         if llm_state == "valid" and on_llm_proposal is not None:
             on_llm_proposal(deepcopy(candidates[0][0]))
-    capacity_research = bool(behind and transition and transition.get("status") == "observed")
+    on_track_rules = bool(champion['kind'] == 'rules' and competition and competition['reliable']
+                          and competition['pace']['status'] == 'on_track')
+    capacity_research = bool((behind or on_track_rules) and transition
+                             and transition.get('status') == 'observed')
     packet_metadata, proposal_sources, search_plan = {}, {}, None
     if capacity_research:
         from datetime import date
@@ -946,6 +994,10 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         search_plan = {"version": "balanced-capacity-search-v2", "max_candidates": MAX_CANDIDATES,
                        "selection_before_performance": True, "packets": [],
                        "controls_may_repeat_prior_research": True,
+                       "trigger": "reliable_behind_observed" if behind else "rules_reliable_on_track_observed",
+                       "trigger_basis": "frozen_contest_progress_and_observed_book_before_candidate_performance",
+                       "allowed_pace_statuses": ['behind', 'on_track'] if champion['kind'] == 'rules' else ['behind'],
+                       "on_track_rules_only": True,
                        "existing_lot_rules_changed": False, "global_limits_changed": False}
 
         def add_packet(base, method, top_n=8):
@@ -1090,7 +1142,7 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
     if policy_id(policy) in proposal_sources:
         result['proposal_source'] = deepcopy(proposal_sources[policy_id(policy)])
         result['hypothesis'] = '현재 정책과 공통 배분·진입 기준, 신규 보유 1/2/4세션 및 고정 네 신호군을 같은 자료로 비교합니다.'
-        result['hypothesis_test'] = {'metric': 'registered_signal_hold_comparison', 'direction': 'joint_qualification',
+        result['hypothesis_test'] = {'metric': 'registered_signal_hold_comparison', 'direction': 'return_first_under_frozen_gates',
                                      'packet_hash': proposal_sources[policy_id(policy)]['packet_hash']}
     by_id = {policy_id(item[1]): (item[0], item[5]) for item in evaluations}
     pool = []
@@ -1116,7 +1168,7 @@ def propose_candidate(champion, frames, limits, history, llm=None, *, on_llm_pro
         if identity in proposal_sources:
             pool[-1]['proposal_source'] = deepcopy(proposal_sources[identity])
             pool[-1]['hypothesis'] = '현재 정책과 공통 배분·진입 기준, 신규 보유 1/2/4세션 및 고정 네 신호군을 같은 자료로 비교합니다.'
-            pool[-1]['hypothesis_test'] = {'metric': 'registered_signal_hold_comparison', 'direction': 'joint_qualification',
+            pool[-1]['hypothesis_test'] = {'metric': 'registered_signal_hold_comparison', 'direction': 'return_first_under_frozen_gates',
                                            'packet_hash': proposal_sources[identity]['packet_hash']}
         if search_plan is not None:
             pool[-1]["search_plan"] = deepcopy(search_plan)

@@ -5,7 +5,7 @@ import unittest
 
 from backend.learning_policy import FEE, TAX
 from backend.policy_award import CONTESTS, selection_contract, separate_contest_status
-from backend.source_version import DAILY_SOURCES, source_version
+from backend.source_version import DAILY_SOURCES, LEARNING_SOURCES, source_version
 
 
 class ContestObjectiveTests(unittest.TestCase):
@@ -20,9 +20,19 @@ class ContestObjectiveTests(unittest.TestCase):
         self.assertEqual(rules['sell_tax_rate'], float(TAX))
         self.assertIsNone(contract['return_tolerance_pp'])
         self.assertEqual(contract['risk_reduction_return_tolerance_pp'], 0)
-        self.assertEqual(contract['relative_return_role'], 'opportunity_cost_audit_except_risk_reduction')
+        self.assertEqual(contract['relative_return_role'], 'paired_validity_and_opportunity_cost_audit')
         self.assertEqual(contract['turnover_above_target_reward'], 0)
         self.assertIsNone(contract['win_probability'])
+        self.assertEqual(contract['target_rank_max'], 5)
+        self.assertIsNone(contract['actual_rank'])
+        self.assertIsNone(contract['fifth_place_return_pct'])
+        self.assertFalse(contract['automatic_rank_defense'])
+        self.assertEqual(contract['objective'], 'core_equal_weight_mean_final_nav')
+        self.assertEqual(contract['return_objective']['path_count'], 12)
+        self.assertEqual(contract['legacy_promotion_role'], 'diagnostic_only_not_eligibility_or_ranking')
+        self.assertNotIn('partial_joint_gate', contract)
+        self.assertEqual(contract['diagnostic_partial_joint_gate'],
+                         'preserve_and_add_core_joint_witnesses_with_qualified_progress')
 
     def test_timefolio_needs_its_own_weekly_nav_cost_and_destination_limits(self):
         value = separate_contest_status()
@@ -67,6 +77,20 @@ class ContestObjectiveTests(unittest.TestCase):
                     (root / name).write_bytes(source + b'\n# changed selection evidence\n')
                     self.assertNotEqual(source_version(DAILY_SOURCES, root=root), original)
                     (root / name).write_bytes(source)
+
+    def test_selector_change_does_not_change_learning_engine_identity(self):
+        backend = Path(__file__).resolve().parents[1] / 'backend'
+        self.assertNotIn('policy_award.py', LEARNING_SOURCES)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in set(DAILY_SOURCES) | set(LEARNING_SOURCES):
+                (root / name).write_bytes((backend / name).read_bytes())
+            before = source_version(LEARNING_SOURCES, root=root)
+            daily = source_version(DAILY_SOURCES, root=root)
+            with (root / 'policy_award.py').open('ab') as stream:
+                stream.write(b'\n# selector-only change\n')
+            self.assertEqual(source_version(LEARNING_SOURCES, root=root), before)
+            self.assertNotEqual(source_version(DAILY_SOURCES, root=root), daily)
 
 
 if __name__ == '__main__':

@@ -189,6 +189,9 @@ class SignalHoldPacketTests(unittest.TestCase):
 
 
 class SignalHoldResearchTests(unittest.TestCase):
+    def setUp(self):
+        self.parent = rule()
+
     def test_future_frame_or_observation_cannot_supply_thresholds_for_an_earlier_decision(self):
         parent, source = rule(), frames(3)
         context = {**account_context(), 'signal_day': source[-2]['as_of']}
@@ -224,6 +227,87 @@ class SignalHoldResearchTests(unittest.TestCase):
                 validate_capacity_member(parent, item, result['candidate_pool'], frames=source, limits=LIMITS)
         self.assertEqual(outputs[0]['search_plan'], outputs[1]['search_plan'])
         self.assertEqual(source, source_copy)
+
+    def test_on_track_has_same_complete_ordered_bank_as_behind(self):
+        source = frames(1)
+        behind = account_context()
+        on_track = deepcopy(behind)
+        on_track['competition_context']['pace']['status'] = 'on_track'
+        before = deepcopy((self.parent, source, on_track))
+        old = propose_candidate(self.parent, source, LIMITS, [], award_context=behind)
+        result = propose_candidate(self.parent, source, LIMITS, [], award_context=on_track)
+        ids = lambda value: [policy_id(item['policy']) for item in value['candidate_pool']]
+        self.assertEqual(ids(result), ids(old))
+        self.assertEqual(ids(result), signal_hold_packet(self.parent, source)['candidate_ids'])
+        self.assertLessEqual(len(ids(result)), 16)
+        self.assertEqual(len(ids(result)), len(set(ids(result))))
+        self.assertEqual(result['search_plan']['trigger'], 'rules_reliable_on_track_observed')
+        self.assertEqual(old['search_plan']['trigger'], 'reliable_behind_observed')
+        self.assertEqual(result['search_plan']['allowed_pace_statuses'], ['behind', 'on_track'])
+        for item in result['candidate_pool']:
+            validate_capacity_member(self.parent, item, result['candidate_pool'], frames=source, limits=LIMITS)
+        self.assertEqual((self.parent, source, on_track), before)
+
+    def test_on_track_extension_does_not_expand_legacy_stale_unknown_or_unobserved(self):
+        source = frames(1)
+        for variant in ('legacy', 'stale', 'unknown', 'missing_book', 'missing_positions', 'met'):
+            with self.subTest(variant=variant):
+                context = account_context()
+                context['competition_context']['pace']['status'] = 'on_track'
+                parent = self.parent
+                if variant == 'legacy':
+                    parent = BASELINE_POLICY
+                elif variant == 'stale':
+                    context['competition_context']['stale'] = True
+                elif variant == 'unknown':
+                    context['competition_context'] = {'status': 'unavailable'}
+                elif variant == 'missing_book':
+                    context.pop('initial_state')
+                elif variant == 'missing_positions':
+                    context['initial_state'].pop('positions')
+                else:
+                    context['competition_context']['pace']['status'] = 'met'
+                result = propose_candidate(parent, source, LIMITS, [], award_context=context)
+                self.assertNotIn('search_plan', result)
+                self.assertFalse(any(item.get('capacity_packets') for item in result['candidate_pool']))
+
+    def test_on_track_retains_timestamp_rejections_and_seen_controls(self):
+        context = account_context()
+        context['competition_context']['pace']['status'] = 'on_track'
+        source = frames(3)
+        for changed in ({'signal_day': source[-2]['as_of']}, {'observed_at': source[-2]['observed_at']}):
+            with self.assertRaisesRegex(ValueError, 'signal_hold_input_after_decision'):
+                propose_candidate(self.parent, source, LIMITS, [], award_context={**context, **changed})
+        source = frames(1)
+        packet, pool = packet_pool(self.parent, source)
+        history = [{'policy': item['policy'], 'candidate_id': policy_id(item['policy'])} for item in pool]
+        result = propose_candidate(self.parent, source, LIMITS, history, award_context=context)
+        self.assertEqual([policy_id(item['policy']) for item in result['candidate_pool']], packet['candidate_ids'])
+
+    def test_on_track_bank_does_not_select_members_using_performance_or_llm(self):
+        parent, source = self.parent, frames(3)
+        context = account_context()
+        context['competition_context']['pace']['status'] = 'on_track'
+        packet = signal_hold_packet(parent, source)
+        expected = packet['candidate_ids']
+        proposed = deepcopy(parent)
+        proposed['strategies'][0]['conditions'] = [{'feature': 'volume_ratio', 'op': 'gt', 'value': .75}]
+        provider, captured = Mock(), []
+        provider.generate.return_value = proposed
+        results = []
+        for reverse in (False, True):
+            def evaluate(policy, *_):
+                rank = sorted([*expected, policy_id(parent)]).index(policy_id(policy))
+                return metrics(net=-rank if reverse else rank)
+            with patch('backend.learning_research.portfolio_metrics', side_effect=evaluate):
+                result = propose_candidate(parent, source, LIMITS, [], provider, award_context=context,
+                                           on_llm_proposal=captured.append)
+            self.assertEqual([policy_id(item['policy']) for item in result['candidate_pool']], expected)
+            self.assertFalse(result['search_plan']['llm_packet_used'])
+            self.assertTrue(result['search_plan']['llm_observation_callback_completed'])
+            results.append(result)
+        self.assertEqual(results[0]['search_plan'], results[1]['search_plan'])
+        self.assertEqual(captured, [validate_policy(proposed)] * 2)
 
     def test_llm_observation_is_preserved_but_never_claimed_as_template_source(self):
         parent, source = rule(), frames(1)

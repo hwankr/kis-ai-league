@@ -57,7 +57,16 @@ def _write(path, value):
             json.dump(value, stream, ensure_ascii=False, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.replace(path)
+        # Windows readers can briefly deny deletion of the destination. Retry
+        # only atomic replacement, with at most 0.75 seconds of total waiting.
+        for attempt in range(5):
+            try:
+                temporary.replace(path)
+                break
+            except OSError as error:
+                if os.name != 'nt' or getattr(error, 'winerror', None) not in {5, 32, 33} or attempt == 4:
+                    raise
+                time.sleep(0.05 * 2 ** attempt)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -358,7 +367,13 @@ def main(argv=None):
         print("이 프로젝트의 감시자가 이미 실행 중입니다.", file=sys.stderr)
         return 1
     except (SupervisorError, OSError) as error:
-        print(str(error) if isinstance(error, SupervisorError) else "감시자 파일·프로세스 작업에 실패했습니다.", file=sys.stderr)
+        if isinstance(error, SupervisorError):
+            message = str(error)
+        else:
+            codes = [f'{name}={value}' for name in ('errno', 'winerror')
+                     if type(value := getattr(error, name, None)) is int]
+            message = "감시자 파일·프로세스 작업에 실패했습니다." + (" (" + ", ".join(codes) + ")" if codes else "")
+        print(message, file=sys.stderr)
         return 1
 
 

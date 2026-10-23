@@ -11,16 +11,16 @@ from backend.daily_inputs import validate_award_context
 from backend.policy_transition import transition_preview
 
 
-VERSION = "award-selection-v3"
-# Relative backtest return is an opportunity-cost audit, not an award gate.
-# The separate safety-only exception still cannot worsen matched returns.
+VERSION = "award-selection-v4-return-first"
+# Relative backtest return and the former promotion classes are diagnostics.
 RISK_RETURN_TOLERANCE_PP = 0.0
+NAV_EPSILON = 1e-6
 CONTESTS = {
     "kis_ai_2026": {"rules_version": "kis-2026-reviewed-2026-10-10",
         "start_date": "2026-10-12", "end_date": "2026-11-20",
         "targets": {"gross_amount": 500000000, "trading_days": 5, "symbols": 5, "api_orders": 5},
         "fee_rate": .000140527, "sell_tax_rate": .002,
-        "objective": "qualification_and_nonnegative_final_return_then_return_rank"},
+        "objective": "official_top_five_return_pursuit_with_preserved_qualification_and_protection"},
     "timefolio_rfm_13": {"rules_version": "timefolio-13-reviewed-2026-10-10",
         "start_date": "2026-10-01", "end_date": "2026-11-30",
         "weekly_turnover_pct": 5., "excluded_after_missed_weeks": 4,
@@ -36,13 +36,25 @@ def selection_contract():
             "rules": deepcopy(CONTESTS["kis_ai_2026"]),
             "calendar_basis": "weekday_estimate_with_two_session_shortening",
             "risk_limit_pct": 15., "existing_lot_rules": "preserved",
-            "relative_return_role": "opportunity_cost_audit_except_risk_reduction",
+            "relative_return_role": "paired_validity_and_opportunity_cost_audit",
             "risk_reduction_return_tolerance_pp": RISK_RETURN_TOLERANCE_PP,
             "core_environments": ["normal", "cost_stress"],
             "reserve_environments": ["partial_delayed", "partial_delayed_cost_stress"],
-            "promotion_order": ["joint_qualification_robust", "joint_qualification_conditional", "partial_joint_challenge", "qualified_progress", "risk_reduction"],
+            "objective": "core_equal_weight_mean_final_nav",
+            "return_objective": {"environments": ["normal", "cost_stress"],
+                "path_count": 12, "weights": "equal", "aggregation": "math_fsum_canonical_path_ids",
+                "meaning": "fixed_scenario_diagnostic_not_probability_or_expected_live_return",
+                "minimum_improvement": NAV_EPSILON, "incumbent_tie": "keep",
+                "candidate_tie": "lexicographically_smallest_id_within_nav_epsilon"},
+            "target_rank_max": 5, "actual_rank": None, "fifth_place_return_pct": None,
+            "automatic_rank_defense": False,
+            "promotion_order": ["core_equal_weight_mean_final_nav"],
+            "diagnostic_classes": ["joint_qualification_robust", "joint_qualification_conditional", "partial_joint_challenge", "qualified_progress", "risk_reduction"],
             "relative_risk_gate": "worst_final_equity_not_below_frozen_incumbent",
-            "partial_joint_gate": "preserve_and_add_core_joint_witnesses_with_qualified_progress",
+            "diagnostic_partial_joint_gate": "preserve_and_add_core_joint_witnesses_with_qualified_progress",
+            "activity_gate": "each_core_path_each_activity_deficit_not_worse_than_incumbent",
+            "core_witness_gate": "preserve_incumbent_joint_core_path_ids",
+            "legacy_promotion_role": "diagnostic_only_not_eligibility_or_ranking",
             "hypothetical_all_path_principal_floor": False,
             "progress_threshold": "ceil_remaining_gross_shortfall_divided_by_remaining_sessions",
             "turnover_above_target_reward": 0, "win_probability": None}
@@ -173,6 +185,13 @@ def _returns(metrics, side):
 def _return_profiles(metrics, side):
     comparisons = metrics.get("scenario_comparisons") or {"paired": metrics}
     return {identity: deepcopy(value[side]) for identity, value in comparisons.items()}
+
+
+def _valid_paired_outcome(outcome):
+    metrics = outcome.get('metrics')
+    return (outcome.get('decision') in {'apply', 'keep'} and isinstance(metrics, dict)
+            and 'error' not in metrics and _returns(metrics, 'candidate') is not None
+            and _returns(metrics, 'champion') is not None)
 
 
 def _within_return_budget(candidate, reference, tolerance):
@@ -312,22 +331,44 @@ def _progress_evidence(candidate, parent, candidate_paths, parent_paths, *, cand
     return result
 
 
-def _plan_rank(item):
-    rows = item['paths'].get('scenarios') or []
-    equities = [_number(row.get('final_equity')) for row in rows]
-    normal = [_number(row.get('final_equity')) for row in rows if row.get('environment') == 'normal']
-    drawdowns = [_number(row.get('max_drawdown_pct')) for row in rows]
-    worst = min(equities) if equities and all(value is not None for value in equities) else -math.inf
-    ordinary = min(normal) if normal and all(value is not None for value in normal) else -math.inf
-    risk = max(drawdowns) if drawdowns and all(value is not None for value in drawdowns) else item['return']['stress_drawdown_pct']
-    coverage = len({'_'.join(identity.split('_')[:2]) for identity in _core_witnesses(item['qualification'])})
-    shortfall = item['qualification'].get('gross_shortfall_amount')
-    progress_rank = -shortfall if shortfall is not None else -math.inf
-    return item['class'], coverage, progress_rank, worst, ordinary, -risk, item['index'] is None, item['id']
+def _return_objective(paths, family):
+    if family != 'ready':
+        return None
+    core = sorted((row for row in paths['scenarios']
+                   if row['environment'] in {'normal', 'cost_stress'}), key=lambda row: row['id'])
+    values = [_number(row.get('final_equity')) for row in core]
+    if len(values) != 12 or any(value is None for value in values):
+        return None
+    return math.fsum(values) / 12
+
+
+def _activity_preservation(candidate, parent):
+    """Preserve every core path's four activity deficits, never average them."""
+    left = {row['id']: row for row in candidate['scenarios'] if row['group'] == 'core'}
+    right = {row['id']: row for row in parent['scenarios'] if row['group'] == 'core'}
+    result = {'supported': False, 'reason': 'core_activity_evidence_unavailable', 'worsened': [], 'unknown': []}
+    if len(left) != 12 or left.keys() != right.keys():
+        return result
+    for identity in sorted(left):
+        for field in ('gross_amount', 'trading_days', 'symbols', 'api_orders'):
+            proposed = _number(left[identity]['deficits'].get(field))
+            incumbent = _number(right[identity]['deficits'].get(field))
+            if proposed is None or incumbent is None or min(proposed, incumbent) < 0:
+                result['unknown'].append({'id': identity, 'requirement': field})
+            elif proposed > incumbent + NAV_EPSILON:
+                result['worsened'].append({'id': identity, 'requirement': field,
+                                          'candidate_deficit': proposed, 'incumbent_deficit': incumbent})
+    if result['unknown']:
+        return result
+    if result['worsened']:
+        result['reason'] = 'core_activity_shortfall_worsened'
+        return result
+    result.update(supported=True, reason='core_activity_shortfall_preserved')
+    return result
 
 
 def _select_award_record(champion, records, frames, limits, context, *, evidence=None):
-    """Promote absolute joint qualification, with separately named exceptions."""
+    """Maximize the fixed core NAV mean within paired qualification/risk gates."""
     from backend.policy_award_scenarios import award_scenarios, scenario_plan
     context_validator, previewer = validate_award_context, transition_preview
     context_day = context.get('signal_day') if isinstance(context, dict) else None
@@ -380,25 +421,32 @@ def _select_award_record(champion, records, frames, limits, context, *, evidence
     parent_class, parent_reason = _absolute_class(parent_qualification, parent_family)
     audit.update(incumbent_scenarios=parent_paths, incumbent_qualification=parent_qualification,
                  incumbent_plan_class=parent_reason, incumbent_scenario_status=parent_family)
+    parent_objective = _return_objective(parent_paths, parent_family)
+    audit['incumbent_objective_value'] = parent_objective
     parent_return = parent_profiles = None
+    # Anchor paired comparisons by fixed identity, never caller-provided order.
+    for _, _, outcome in sorted(records, key=lambda record: record[1]):
+        metrics = outcome.get('metrics') or {}
+        if _valid_paired_outcome(outcome):
+            parent_profiles = _return_profiles(metrics, 'champion')
+            parent_return = _returns(metrics, 'champion')
+            break
     assessable = []
     for index, (proposal, identity, outcome) in enumerate(records):
-        metrics = outcome.get('metrics') or {}
+        metrics = outcome.get('metrics') if isinstance(outcome.get('metrics'), dict) else {}
         candidate_return, comparison_parent = _returns(metrics, 'candidate'), _returns(metrics, 'champion')
         preview = previewer(proposal['policy'], frame, limits, context)
         paths = replay(proposal['policy'])
         qualification = joint_qualification(paths, progress, limits['budget'])
         detail = {'candidate_id': identity, 'return_gate_decision': outcome.get('decision'),
             'transition': preview, 'scenario_evidence': paths, 'qualification': qualification,
-            'promotion_reason': 'evidence_unavailable', 'eligible': False, 'award_plan_supported': False}
+            'promotion_reason': 'evidence_unavailable', 'eligible': False, 'award_plan_supported': False,
+            'qualification_risk': True}
         audit['outcomes'].append(detail)
-        if (outcome.get('decision') == 'blocked' or candidate_return is None or comparison_parent is None
-                or preview['status'] != 'ready'):
+        if not _valid_paired_outcome(outcome) or preview['status'] != 'ready':
             continue
         profiles, current_parent_profiles = _return_profiles(metrics, 'candidate'), _return_profiles(metrics, 'champion')
-        if parent_profiles is None:
-            parent_profiles, parent_return = current_parent_profiles, comparison_parent
-        if parent_profiles != current_parent_profiles:
+        if parent_profiles != current_parent_profiles or profiles.keys() != parent_profiles.keys():
             detail['promotion_reason'] = 'unpaired_parent_evidence'
             continue
         detail['relative_return_audit'] = {key: {field: profiles[key][field] - parent_profiles[key][field]
@@ -410,6 +458,7 @@ def _select_award_record(champion, records, frames, limits, context, *, evidence
             detail['promotion_reason'] = 'drawdown_limit'
             continue
         family = _family_status(paths, qualification, plan, cap)
+        objective = _return_objective(paths, family)
         category, reason = _absolute_class(qualification, family)
         progress_proof = _progress_evidence(qualification, parent_qualification, paths, parent_paths,
             candidate_family=family, parent_family=parent_family, threshold=threshold)
@@ -427,40 +476,60 @@ def _select_award_record(champion, records, frames, limits, context, *, evidence
                     and any(item['candidate'][key] < item['champion'][key] - 1e-9
                             for key in ('max_drawdown_pct', 'stress_drawdown_pct')) for item in comparisons))
         immediate = preview['entry_count'] > 0
-        natural = (category >= 2 and family == 'ready'
+        natural = (family == 'ready'
                    and any(item.get('first_buy_session') is not None for item in paths.get('scenarios', [])))
         if not immediate and not natural:
             category, reason = 0, 'no_current_or_supported_later_improvement'
         if not category and reduced_risk:
             category, reason = 1, 'risk_reduction'
+        activity = _activity_preservation(qualification, parent_qualification)
+        lost_witnesses = sorted(_core_witnesses(parent_qualification) - _core_witnesses(qualification))
+        witnesses = {'supported': not lost_witnesses, 'lost': lost_witnesses}
+        supported = False
         if not relative_risk['supported']:
-            category, reason = 0, relative_risk['reason']
+            promotion = relative_risk['reason']
+        elif not activity['supported']:
+            promotion = activity['reason']
+        elif not witnesses['supported']:
+            promotion = 'incumbent_core_joint_witness_lost'
+        elif objective is None or parent_objective is None:
+            promotion = 'return_objective_unavailable'
+        elif objective <= parent_objective + NAV_EPSILON:
+            promotion = 'return_objective_not_improved'
+        else:
+            supported = True
+            promotion = 'return_improvement' if qualification['groups']['core']['status'] == 'all_met' else 'return_challenge'
         detail.update(scenario_status=family, progress_evidence=progress_proof,
             relative_risk_evidence=relative_risk,
             transition_class='immediate_entry' if immediate else 'after_natural_exits' if natural else 'no_entry_evidence',
-            risk_reduction_evidence=reduced_risk, promotion_reason=reason, eligible=bool(category),
-            award_plan_supported=category >= 4, plan_class=category)
-        if category:
+            risk_reduction_evidence=reduced_risk, diagnostic_reason=reason,
+            promotion_reason=promotion, eligible=supported,
+            activity_preservation=activity, core_witness_preservation=witnesses,
+            objective_value=objective,
+            objective_improvement=objective - parent_objective if objective is not None and parent_objective is not None else None,
+            award_plan_supported=family == 'ready' and qualification['groups']['core']['status'] == 'all_met',
+            qualification_risk=family != 'ready' or qualification['groups']['core']['status'] != 'all_met',
+            plan_class=category)
+        if supported:
             assessable.append({'index': index, 'id': identity, 'class': category, 'return': candidate_return,
-                'qualification': qualification, 'paths': paths})
+                'qualification': qualification, 'paths': paths, 'objective': objective})
     if parent_return is None:
         audit['reason'] = 'paired_return_evidence_unavailable'
         return None, audit
-    audit.update(status='keep', reason='no_supported_plan', eligible_candidates=len(assessable),
+    audit.update(status='keep', reason='no_supported_return_improvement', eligible_candidates=len(assessable),
                  qualification_risk=parent_class < 4, decision_needed=not assessable and parent_class < 4,
                  incumbent_has_supported_qualification_plan=parent_class >= 4)
     if not assessable:
         return None, audit
-    incumbent = {'index': None, 'id': '', 'class': parent_class, 'return': parent_return,
-                 'qualification': parent_qualification, 'paths': parent_paths}
-    chosen = max([incumbent, *assessable], key=_plan_rank)
-    if chosen['index'] is None:
-        audit['reason'] = 'incumbent_tie_or_qualification_preference'
-        return None, audit
+    best_objective = max(item['objective'] for item in assessable)
+    chosen = min((item for item in assessable if best_objective - item['objective'] <= NAV_EPSILON),
+                 key=lambda item: item['id'])
+    supported_plan = chosen['qualification']['groups']['core']['status'] == 'all_met'
     audit.update(status='apply', reason=audit['outcomes'][chosen['index']]['promotion_reason'],
                  selected_qualification=chosen['qualification']['status'], selected_plan_class=chosen['class'],
-                 award_plan_supported=chosen['class'] >= 4,
-                 qualification_risk=chosen['class'] < 4, decision_needed=False)
+                 award_plan_supported=supported_plan, selected_objective_value=chosen['objective'],
+                 objective_improvement=chosen['objective'] - parent_objective,
+                 qualification_risk=not supported_plan, decision_needed=False)
     return chosen['index'], audit
 
 

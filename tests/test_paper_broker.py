@@ -18,7 +18,17 @@ def order(**changes):
             "orgn_odno": "0000000000", "pdno": "005930", "sll_buy_dvsn_cd": "02",
             "ord_qty": "5", "tot_ccld_qty": "0", "rmn_qty": "5", "cncl_cfrm_qty": "0",
             "rjct_qty": "0", "ord_unpr": "70000", "avg_prvs": "0", "tot_ccld_amt": "0",
-            "ord_tmd": "095900", "cncl_yn": "N", **changes}
+            "ord_tmd": "095900", "cncl_yn": "N", "excg_id_dvsn_cd": "KRX", **changes}
+
+
+def cancel_event(**changes):
+    return order(**{"odno": "0000000456", "orgn_odno": "0000000123", "sll_buy_dvsn_cd_name": "매수취소",
+                    "ord_qty": "3", "rmn_qty": "0", "ord_unpr": "0", "ord_tmd": "100000", "cncl_yn": "Y", **changes})
+
+
+def cancelled_parent(**changes):
+    return order(**{"tot_ccld_qty": "2", "rmn_qty": "0", "cncl_cfrm_qty": "3", "avg_prvs": "70000",
+                    "tot_ccld_amt": "140000", **changes})
 
 
 def page(rows, *, summary=None, continuation="", cursor=("", "")):
@@ -266,6 +276,176 @@ class PaperBrokerTests(unittest.TestCase):
                 avg_prvs="69900", tot_ccld_amt="139800")])
             with self.subTest(cancelled=cancelled), self.assertRaises(KisError):
                 self.broker.orders("2026-10-05", "2026-10-05")
+
+    def test_explicit_cancel_events_return_original_fills_without_synthetic_order(self):
+        for side, label in (("01", "매도취소"), ("02", "매수취소")):
+            with self.subTest(side=side):
+                parent = order(odno="0000005270", pdno="010950", sll_buy_dvsn_cd=side,
+                    ord_qty="26", ord_unpr="153800", ord_tmd="090514", tot_ccld_qty="4",
+                    avg_prvs="153800", tot_ccld_amt="615200", cncl_cfrm_qty="22", rmn_qty="0")
+                event = order(odno="0000009311", orgn_odno="0000005270", pdno="010950",
+                    sll_buy_dvsn_cd=side, sll_buy_dvsn_cd_name=label, ord_qty="22", ord_unpr="0",
+                    ord_tmd="091617", cncl_yn="Y", rmn_qty="0")
+                self.client._get.return_value = page([event, parent])
+                result = self.broker.orders("2026-10-05", "2026-10-05")
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]["order_id"], "0000005270")
+                self.assertEqual(result[0]["status"], "cancelled")
+                self.assertEqual((result[0]["quantity"], result[0]["filled_quantity"], result[0]["cancelled_quantity"],
+                                  result[0]["remaining_quantity"], result[0]["filled_amount"]), (26, 4, 22, 0, "615200"))
+        self.client._request.assert_not_called()
+
+    def test_partial_cancel_preserves_remaining_and_ordinary_order_status(self):
+        parent = order(tot_ccld_qty="1", rmn_qty="2", cncl_cfrm_qty="2", avg_prvs="70000", tot_ccld_amt="70000")
+        event = cancel_event()
+        event["ord_qty"] = "2"
+        self.client._get.return_value = page([event, parent])
+        result = self.broker.orders("2026-10-05", "2026-10-05")
+        self.assertEqual(len(result), 1)
+        self.assertEqual((result[0]["status"], result[0]["filled_quantity"], result[0]["remaining_quantity"],
+                          result[0]["cancelled_quantity"]), ("partial", 1, 2, 2))
+
+    def test_cancel_event_waits_for_parent_and_final_cumulative_values_on_all_pages(self):
+        self.client._get.side_effect = [page([cancel_event(), order()], continuation="M", cursor=("a", "b")),
+                                       page([cancelled_parent()])]
+        result = self.broker.orders("2026-10-05", "2026-10-05")
+        self.assertEqual(self.client._get.call_count, 2)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["cancelled_quantity"], 3)
+
+    def test_unique_multiple_cancel_events_sum_without_double_counting_exact_duplicates(self):
+        first, second = cancel_event(), cancel_event()
+        first["ord_qty"] = "1"
+        second.update(odno="0000000457", ord_qty="2", ord_tmd="100001")
+        self.client._get.side_effect = [page([first, second], continuation="M", cursor=("a", "b")),
+                                       page([deepcopy(first), deepcopy(second), cancelled_parent()])]
+        result = self.broker.orders("2026-10-05", "2026-10-05")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["cancelled_quantity"], 3)
+
+    def test_cancel_event_with_missing_parent_or_later_page_failure_returns_no_partial_orders(self):
+        for responses in ([page([cancel_event()])],
+                          [page([cancel_event()], continuation="M", cursor=("a", "b")), KisError("second page failed")]):
+            with self.subTest(pages=len(responses)):
+                self.client._get.side_effect = responses
+                with self.assertRaises(KisError):
+                    self.broker.orders("2026-10-05", "2026-10-05")
+        self.client._request.assert_not_called()
+
+    def test_cancel_event_parent_identity_time_and_direct_link_must_match(self):
+        cases = ({"pdno": "000660"}, {"ord_gno_brno": "99999"}, {"orgn_odno": "0000009999"},
+                 {"ord_tmd": "095859"}, {"ord_dt": "20261004"},
+                 {"sll_buy_dvsn_cd": "01", "sll_buy_dvsn_cd_name": "매도취소"})
+        for changes in cases:
+            event = {**cancel_event(), **changes}
+            self.client._get.return_value = page([event, cancelled_parent()])
+            with self.subTest(changes=changes), self.assertRaises(KisError):
+                self.broker.orders("2026-10-04", "2026-10-05")
+        self.client._get.return_value = page([cancel_event(), cancelled_parent(orgn_odno="0000000111")])
+        with self.assertRaises(KisError):
+            self.broker.orders("2026-10-05", "2026-10-05")
+
+    def test_cancel_event_invalid_markers_quantities_amounts_dates_and_ids_fail_closed(self):
+        cases = ({"cncl_yn": "N"}, {"sll_buy_dvsn_cd": "01"}, {"orgn_odno": "0000000000"},
+                 {"orgn_odno": None}, {"odno": "0000000000"}, {"odno": "123"},
+                 {"ord_dt": "20261006"}, {"ord_dt": "invalid"}, {"ord_tmd": "250000"},
+                 {"pdno": "bad"}, {"ord_qty": "0"}, {"ord_qty": "-1"}, {"ord_qty": "1.5"},
+                 *[{field: "1"} for field in ("tot_ccld_qty", "rmn_qty", "cncl_cfrm_qty", "rjct_qty", "ord_unpr", "avg_prvs", "tot_ccld_amt")],
+                 {"cncl_cfrm_qty": None}, {"sll_buy_dvsn_cd_name": "매수"},
+                 {"excg_id_dvsn_cd": "NXT"}, {"excg_id_dvsn_cd": None})
+        for changes in cases:
+            self.client._get.return_value = page([{**cancel_event(), **changes}, cancelled_parent()])
+            with self.subTest(changes=changes), self.assertRaises(KisError):
+                self.broker.orders("2026-10-05", "2026-10-05")
+
+    def test_cancel_event_requires_confirmed_same_krx_parent(self):
+        for exchange in (None, "", "NXT"):
+            self.client._get.return_value = page([cancel_event(), cancelled_parent(excg_id_dvsn_cd=exchange)])
+            with self.subTest(exchange=exchange), self.assertRaises(KisError):
+                self.broker.orders("2026-10-05", "2026-10-05")
+        self.client._get.return_value = page([order(excg_id_dvsn_cd="NXT"), cancelled_parent(), cancel_event()])
+        with self.assertRaises(KisError):
+            self.broker.orders("2026-10-05", "2026-10-05")
+
+    def test_cancel_event_total_must_equal_fully_accounted_parent_cancel_quantity(self):
+        for requested in ("2", "4"):
+            self.client._get.return_value = page([{**cancel_event(), "ord_qty": requested}, cancelled_parent()])
+            with self.subTest(requested=requested), self.assertRaises(KisError):
+                self.broker.orders("2026-10-05", "2026-10-05")
+        # Ordinary positive remaining rows keep their existing guard. Such a
+        # row cannot serve as proof for discarding a separate cancel event.
+        incomplete = order(rmn_qty="1", cncl_cfrm_qty="3")
+        self.client._get.return_value = page([cancel_event(), incomplete])
+        with self.assertRaises(KisError):
+            self.broker.orders("2026-10-05", "2026-10-05")
+
+    def test_conflicting_cancel_duplicates_and_order_event_id_collisions_fail_closed(self):
+        for changes in ({"ord_qty": "2"}, {"ord_tmd": "100001"}, {"orgn_odno": "0000009999"}):
+            self.client._get.return_value = page([cancel_event(), {**cancel_event(), **changes}, cancelled_parent()])
+            with self.subTest(changes=changes), self.assertRaises(KisError):
+                self.broker.orders("2026-10-05", "2026-10-05")
+        collision = order(odno="0000000456")
+        for rows in ([collision, cancel_event(), cancelled_parent()], [cancel_event(), collision, cancelled_parent()]):
+            self.client._get.return_value = page(rows)
+            with self.subTest(event_first=rows[0] is not collision), self.assertRaises(KisError):
+                self.broker.orders("2026-10-05", "2026-10-05")
+
+    def test_confirmed_cancel_and_cancel_event_never_trigger_cancel_resubmission(self):
+        self.client._get.return_value = page([cancel_event(), cancelled_parent()])
+        for identity in ("0000000123", "0000000456"):
+            with self.subTest(identity=identity), self.assertRaises(BrokerRejected):
+                self.broker.cancel(identity, "01234", "005930", 5)
+        self.client.token.assert_not_called()
+        self.client._request.assert_not_called()
+
+    def test_cancel_event_reconciles_pending_original_without_new_fill_or_resend(self):
+        from backend.experiments import ExperimentService
+
+        self.client._get.side_effect = [page([cancel_event()], continuation="M", cursor=("a", "b")),
+                                        page([cancelled_parent()])]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            config.write_text("", encoding="utf-8")
+            service = ExperimentService(config, directory=root / "state", now=lambda: NOW,
+                                        broker_factory=lambda _: self.broker)
+            try:
+                policy = {"account_id": "paper", "fingerprint": "offline-cancel-fixture"}
+                service.store.save_setting("policy", policy)
+                prior_fill = "2026-10-05T00:59:30+00:00"
+                local = {"id": "local-original", "created_at": "2026-10-05T00:59:00+00:00",
+                         "fingerprint": policy["fingerprint"], "strategy_id": "trend-breakout-v1",
+                         "order_date": "2026-10-05", "order_id": "0000000123", "branch_id": "01234",
+                         "symbol": "005930", "name": "fixture", "side": "buy", "quantity": 5,
+                         "limit_price": "70000", "status": "cancel_pending", "filled_quantity": 2,
+                         "filled_amount": "140000", "average_price": "70000", "remaining_quantity": 3,
+                         "error": None, "reconciled_at": prior_fill, "first_fill_observed_at": prior_fill,
+                         "last_fill_observed_at": prior_fill, "cancel_requested_at": "2026-10-05T01:00:00+00:00"}
+                self.assertTrue(service.store.reserve_order(local, "offline-cancel-fixture"))
+                service._order_issue(local)
+                service._reconcile(policy, self.broker)
+                saved, = service.store.orders()
+                self.assertEqual(saved["status"], "cancelled")
+                self.assertEqual(saved["remaining_quantity"], 0)
+                self.assertEqual((saved["filled_quantity"], saved["filled_amount"], saved["average_price"]),
+                                 (2, "140000", "70000"))
+                self.assertEqual(saved["first_fill_observed_at"], prior_fill)
+                self.assertEqual(saved["last_fill_observed_at"], prior_fill)
+                self.assertEqual(saved["terminal_observed_at"], service._timestamp())
+                self.assertEqual(service.store.mirror_snapshot()["events"], [])
+                self.assertEqual(service.store.mirror_snapshot()["owned_quantities"], {"005930": 2})
+                self.assertFalse(service._blocked())
+                self.assertEqual(self.client._get.call_count, 2)
+                service._reconcile(policy, self.broker)
+                self.assertEqual(self.client._get.call_count, 2)
+                self.assertEqual(service.store.orders(), [saved])
+                with self.assertRaises(KisError):
+                    service._cancel(local["id"], self.broker)
+                self.assertEqual(service.store.mirror_snapshot()["events"], [])
+                self.client.token.assert_not_called()
+                self.client._request.assert_not_called()
+            finally:
+                service.close()
         self.client._request.assert_not_called()
 
     def test_snapshot_preserves_cash_holdings_and_actual_sellable_quantity(self):

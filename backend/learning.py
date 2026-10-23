@@ -189,7 +189,16 @@ class LearningService:
                 data, baseline, limits, self.attempted, context = work
             try:
                 with file_lock(self.store.path.parent / "learning.lock", blocking=False):
-                    self.process(data, baseline, limits, context=context)
+                    result = self.process(data, baseline, limits, context=context)
+                    from backend.research_readiness import WAITING
+                    if result == WAITING:
+                        from datetime import timedelta
+                        with self.lock:
+                            # Missing inputs are preparation, not a completed
+                            # proposal attempt. Retry the normal source path.
+                            self.attempted = None
+                            self.retry_after = self.now() + timedelta(seconds=60)
+                            self.pending = None
             except BlockingIOError:
                 with self.lock:
                     self.attempted = None
@@ -515,11 +524,34 @@ class LearningService:
         current = self.now().astimezone(KST)
         if str(data['as_of']) != current.date().isoformat() or current.time() < time(16):
             return
+        fingerprint = limits.get('fingerprint') or (self.store.setting('policy') or {}).get('fingerprint')
+        with self.store.connect() as db:
+            decision_row = db.execute('SELECT payload FROM daily_policy_decisions WHERE fingerprint=? AND day=?',
+                                      (fingerprint, str(data['as_of']))).fetchone()
+        decision = json.loads(decision_row[0]) if decision_row else None
+        # A deployment cannot retrofit today's completed research with a new
+        # observation contract or recompute its followup using another engine.
+        if (decision and decision.get('decision') != 'error'
+                and decision.get('engine_version') != self.daily.engine_version):
+            return
+        if decision is None:
+            from backend.research_readiness import input_readiness, record_preparation, WAITING
+            readiness = input_readiness(context, str(data['as_of']), self.now())
+            if any(key in (context or {}) for key in
+                   ('competition_context', 'competition_observation', 'research_observation')):
+                record_preparation(self.store, fingerprint, str(data['as_of']), context,
+                                   readiness, self._timestamp())
+            if readiness['status'] != 'ready':
+                self.daily.note('waiting', '연구 입력 수집 대기: ' + ', '.join(readiness['reasons']),
+                                fingerprint=fingerprint)
+                return WAITING
         frame = build_frame(data, baseline_signals)
         frame['captured_at'] = self._timestamp()
         frame['execution_quotes'] = deepcopy((context or {}).get('execution_quotes', {}))
         if 'protection_quotes' in (context or {}):
             frame['protection_quotes'] = deepcopy(context['protection_quotes'])
+        if 'research_observation' in (context or {}):
+            frame['research_observation'] = deepcopy(context['research_observation'])
         with self.store.connect() as db:
             prior = db.execute('SELECT payload FROM learning_frames WHERE day=?', (frame['as_of'],)).fetchone()
             if prior is None:
@@ -541,6 +573,8 @@ class LearningService:
                              signal_inputs=deepcopy(frozen['signal_inputs']))
                 if 'protection_quotes' in (context or {}):
                     frame['protection_quotes'] = deepcopy(context['protection_quotes'])
+                if 'research_observation' in (context or {}):
+                    frame['research_observation'] = deepcopy(context['research_observation'])
             ignored = {'observed_at', 'captured_at', 'benchmark_prices'}
             comparable = enrich_selection(frozen, frame)
             if ({key: value for key, value in comparable.items() if key not in ignored}
@@ -585,6 +619,11 @@ class LearningService:
         anchor = evaluation_context(self.store, fingerprint, frames, limits, self.daily.engine_version)
         if anchor:
             context['daily_evaluation'] = anchor
+        elif context.get('research_observation') is not None:
+            # The first new-contract book is a future anchor, not a license to
+            # replace the old protected book with cash_daily_open evaluation.
+            self.daily.note('waiting', '새 연구 관측과 호환되는 동결 보유 기준일 대기', fingerprint=fingerprint)
+            return
         update_followups(self.store, fingerprint, frames, self.daily.engine_version)
         self.daily.process(data, development, limits, self._research_history(), context=context,
                            proposer=self.proposer or propose_candidate,

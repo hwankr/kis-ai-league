@@ -29,7 +29,7 @@ GRID_DOM = """table => {
    headers: direct('thead tr:last-child th').filter(e=>e.id).map(e=>({id:e.id,
      text:Array.from((e.querySelector('button') || e).childNodes)
        .filter(n=>n.nodeType===3).map(n=>n.textContent).join('').trim()})),
-   rows: direct('tbody tr[data-rowidx]').map(r=>({cells:Object.fromEntries(
+   rows: direct('tbody tr[data-rowidx]').map(r=>({index:Number(r.getAttribute('data-rowidx')),cells:Object.fromEntries(
      Array.from(r.children).filter(e=>e.matches('td[data-colid]')).map(c=>[
        c.getAttribute('data-colid'), {text:c.innerText.trim(),id:c.id,title:c.title,
        errors:Array.from(c.querySelectorAll('span')).filter(e=>
@@ -251,7 +251,7 @@ class TimefolioBrowser:
                     and url.path in {path, "/api" + path} and response.request.method == "GET")
         self._ui_response(matches, action, "destination_read_failed")
 
-    def _ui_response(self, matches, action, error):
+    def _ui_response(self, matches, action, error, *, allow_http_statuses=()):
         selected = None
 
         def select(response):
@@ -266,9 +266,10 @@ class TimefolioBrowser:
         with self.page.expect_request_finished(lambda request: request is selected, timeout=15000):
             with self.page.expect_response(select, timeout=15000) as event:
                 action()
-            if not event.value.ok:
+            if not event.value.ok and getattr(event.value, "status", None) not in allow_http_statuses:
                 raise MirrorBlocked(error)
         self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        return event.value
 
     def _open_order(self):
         self._ui_query("/Portfolio/Session", lambda: self.page.get_by_role(
@@ -303,19 +304,41 @@ class TimefolioBrowser:
         info = table.evaluate(scroll, None)
         if not info:
             return state
-        original, seen, ordered = info["top"], {}, []
+        original, seen, ordered, trace = info["top"], {}, [], []
         try:
-            top, bottom_reads = 0, 0
+            top, bottom_reads, previous_top = 0, 0, None
             for step in range(500):
                 position = table.evaluate(scroll, top)
                 if not position:
                     raise MirrorBlocked("destination_grid_scroll_changed")
                 self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
-                part = table.evaluate(GRID_DOM)
+                # A moved scrollbar can still expose the previous virtual window
+                # after two animation frames. Do not accumulate those stale rows.
+                for render_read in range(5):
+                    part = table.evaluate(GRID_DOM)
+                    rows = part["rows"]
+                    indexed = any("index" in row for row in rows)
+                    row_indices = [row.get("index") for row in rows]
+                    valid_indices = (bool(rows) and all(type(index) is int and 0 <= index < expected
+                                                      for index in row_indices)
+                                     and row_indices == list(range(row_indices[0], row_indices[0] + len(rows))))
+                    advancing = len(ordered) < expected and (previous_top is None or position["top"] > previous_top)
+                    ready = (valid_indices and row_indices[0] <= len(ordered)
+                             and (not advancing or row_indices[-1] >= len(ordered)))
+                    if not indexed or ready:
+                        break
+                    if render_read == 4:
+                        raise MirrorBlocked("destination_grid_render_unsettled")
+                    self.sleep(.05)
+                    self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
                 if part["headers"] != state["headers"] or part["filtered"] != state["filtered"]:
                     raise MirrorBlocked("destination_grid_changed_during_scroll")
                 identities = [_row_identity(row) for row in part["rows"]]
                 keys = [identity[0] for identity in identities]
+                trace = (trace + [{"step": step, "requested_top": top, "top": position["top"],
+                    "max": position["max"], "height": position["height"], "expected": expected,
+                    "known": len(ordered), "row_indices": [row.get("index", -1) for row in part["rows"]],
+                    "seen_indices": [seen[key][0] if key in seen else -1 for key in keys]}])[-4:]
                 if len(set(keys)) != len(keys):
                     raise MirrorBlocked("destination_grid_changed_during_scroll")
                 indices = [seen[key][0] for key in keys if key in seen]
@@ -342,6 +365,7 @@ class TimefolioBrowser:
                 position = table.evaluate(scroll, None)
                 if not position:
                     raise MirrorBlocked("destination_grid_scroll_changed")
+                previous_top = position["top"]
                 if position["top"] >= position["max"] - 1:
                     bottom_reads += 1
                     if len(ordered) >= expected or bottom_reads >= 5:
@@ -355,6 +379,10 @@ class TimefolioBrowser:
                 top = min(position["max"], position["top"] + max(1, position["height"] * .75))
             state["rows"] = ordered
             return state
+        except MirrorBlocked as error:
+            # Structural numbers only. Never attach row IDs, symbols or cell text.
+            error.collection_grid = trace
+            raise
         finally:
             table.evaluate(scroll, original)
             self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
@@ -404,8 +432,25 @@ class TimefolioBrowser:
           .filter(n=>getComputedStyle(n).color==='rgb(255, 0, 0)' && n.innerText.trim())
           .map(n=>n.innerText.trim())""")
 
+    @staticmethod
+    def _validation_form(dialog):
+        return dialog.evaluate("""e=>{
+          const value=selector=>{const inputs=e.querySelectorAll(selector);
+            return inputs.length===1 ? inputs[0].value : null;};
+          const validationErrors=Array.from(e.querySelectorAll('fieldset div')).filter(n=>{
+            const style=getComputedStyle(n);
+            return n.getClientRects().length && style.visibility==='visible'
+              && style.color==='rgb(255, 0, 0)' && n.innerText.trim();
+          }).map(n=>n.innerText.trim());
+          return {symbol:value('input[placeholder]'),date:value('input[name=d]'),
+            side:value('[name="매수도"]:checked'),errors:validationErrors};}""")
+
     def _select_validated(self, dialog, suggestion, symbol, *, side="buy"):
-        day = dialog.locator('input[name="d"]').input_value()
+        initial = self._validation_form(dialog)
+        day = initial["date"]
+        if (day != self.now().astimezone(KST).date().isoformat()
+                or initial.get("side") != ("true" if side == "buy" else "false")):
+            raise MirrorBlocked("destination_form_changed")
         def matches(response):
             url = urlsplit(response.url)
             query = parse_qs(url.query)
@@ -416,7 +461,22 @@ class TimefolioBrowser:
                     and query.get("entry") == ["true" if side == "buy" else "false"])
         # Observe completion of the request caused by the UI, never send it or
         # read its response body. Validation results are read from the form.
-        self._ui_response(matches, suggestion.click, "destination_stock_validation_failed")
+        response = self._ui_response(matches, suggestion.click, "destination_stock_validation_failed",
+                                     allow_http_statuses=(400,) if side == "buy" else ())
+        if response.ok:
+            return
+        # This buy refusal also switches the site's form to sell. Bind the
+        # refusal to the original buy request; never prepare the changed side.
+        self._binding()
+        fields = self._validation_form(dialog)
+        if (fields.get("symbol") != "A" + symbol or fields.get("date") != day
+                or fields.get("side") not in {"true", "false"}):
+            raise MirrorBlocked("destination_form_changed")
+        errors = fields["errors"]
+        if (not initial["errors"] and {" ".join(message.split()) for message in errors}
+                == {"5일 평균거래대금 부족 (거래대금 30억 미만)"}):
+            raise MirrorRejected(self._reason(errors))
+        raise MirrorBlocked("destination_stock_validation_failed")
 
     def _date(self):
         values = self.page.locator("input[name=d]").evaluate_all("es=>es.map(e=>e.value)")

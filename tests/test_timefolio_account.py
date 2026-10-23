@@ -150,6 +150,7 @@ class TimefolioAccountTests(unittest.TestCase):
     def test_collection_failure_retains_last_good_and_sanitizes_auth_and_other_errors(self):
         self.collector.tick()
         previous = self.read()
+        ledger = self.db.read_bytes()
         for message, expected in (("timefolio_login_required", "로그인"),
                                   ("password=private-account https://private.example", "갱신")):
             with self.subTest(message=message):
@@ -162,6 +163,83 @@ class TimefolioAccountTests(unittest.TestCase):
                 self.assertEqual(result["updated_at"], previous["updated_at"])
                 self.assertIn(expected, result["error"])
                 self.assertNotIn("password", (self.root / ".local" / "timefolio-account.json").read_text(encoding="utf-8"))
+                saved = json.loads((self.root / ".local" / "timefolio-account.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["diagnostic"]["stage"], "browser_snapshot")
+                self.assertEqual(saved["diagnostic"]["type"], "RuntimeError")
+                self.assertNotIn("diagnostic", result)
+                self.assertEqual(self.db.read_bytes(), ledger)
+
+    def test_diagnostic_distinguishes_context_binding_and_public_validation_then_clears(self):
+        self.collector.tick()
+        path = self.root / ".local" / "timefolio-account.json"
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        ledger = self.db.read_bytes()
+        for stage in ("context", "binding_validation", "public_validation"):
+            with self.subTest(stage=stage):
+                self.elapsed += 60
+                value = parsed()
+                if stage == "binding_validation":
+                    value["account_key"] = "other"
+                elif stage == "public_validation":
+                    value["summary"]["nav"] = "private-token"
+                self.browser.account_snapshot.return_value = value
+                if stage == "context":
+                    with patch("backend.timefolio_account._context", side_effect=OSError("private-path")):
+                        self.collector.tick()
+                else:
+                    self.collector.tick()
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["diagnostic"]["stage"], stage)
+                self.assertEqual(saved["snapshot"], previous["snapshot"])
+                self.assertEqual(saved["updated_at"], previous["updated_at"])
+                self.assertNotIn("private-token", json.dumps(saved))
+                self.assertNotIn("private-path", json.dumps(saved))
+                self.assertEqual(self.db.read_bytes(), ledger)
+        self.elapsed += 60
+        self.browser.account_snapshot.return_value = parsed()
+        self.collector.tick()
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("diagnostic", saved)
+        self.assertIsNone(saved["error_code"])
+        self.assertGreater(saved["updated_at"], previous["updated_at"])
+
+    def test_diagnostic_keeps_only_allowed_code_coordinates_and_exception_types(self):
+        value = observation()
+        value["nav"] = []
+        self.browser.account_snapshot.side_effect = lambda: parse_account_snapshot(
+            value, BINDING["account_key"], BINDING["contest"])
+        self.collector.tick()
+        path = self.root / ".local" / "timefolio-account.json"
+        diagnostic = json.loads(path.read_text(encoding="utf-8"))["diagnostic"]
+        self.assertEqual(set(diagnostic), {"stage", "type", "stack"})
+        self.assertEqual(diagnostic["type"], "ValueError")
+        self.assertGreaterEqual(len(diagnostic["stack"]), 2)
+        for location in diagnostic["stack"]:
+            self.assertEqual(set(location), {"file", "line"})
+            self.assertEqual(location["file"], "backend/timefolio_account.py")
+            self.assertGreater(location["line"], 0)
+        self.elapsed += 60
+        self.browser.account_snapshot.side_effect = type("private_exception_type", (Exception,), {})(
+            "private-token", {"private": "locals"})
+        self.collector.tick()
+        diagnostic = json.loads(path.read_text(encoding="utf-8"))["diagnostic"]
+        self.assertEqual(diagnostic["type"], "Exception")
+        self.assertNotIn("private", json.dumps(diagnostic))
+
+    def test_collection_grid_diagnostic_accepts_only_bounded_numeric_metadata(self):
+        error = RuntimeError("private-message")
+        error.collection_grid = [{"step": 2, "top": 75, "expected": 55, "known": 21,
+                                  "row_indices": [0, 1, "private-id", 10**20],
+                                  "seen_indices": [-1, 3], "max": "private-url",
+                                  "height": float("inf"), "token": "private-token"}] * 8
+        self.browser.account_snapshot.side_effect = error
+        self.collector.tick()
+        saved = json.loads((self.root / ".local" / "timefolio-account.json").read_text(encoding="utf-8"))
+        diagnostic = saved["diagnostic"]
+        self.assertEqual(len(diagnostic["grid"]), 4)
+        self.assertEqual(diagnostic["grid"][0], {"step": 2, "top": 75, "expected": 55, "known": 21,
+                                                "row_indices": [0, 1, -1, -1], "seen_indices": [-1, 3]})
+        self.assertNotIn("private", json.dumps(diagnostic))
 
     def test_staleness_boundary_and_stopped_collector(self):
         self.collector.tick()

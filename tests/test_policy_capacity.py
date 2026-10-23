@@ -379,7 +379,7 @@ class CapacityPacketTests(unittest.TestCase):
                 if failed_role and identity == packets[1]['member_ids'][failed_role]:
                     raise ValueError('control_computation_missing')
                 # Even the winning AE loses in historical return comparison;
-                # the separate same-path award proof supplies the promotion.
+                # the separate same-path core NAV gain supplies the promotion.
                 return daily_metrics([0. if identity == policy_id(self.parent) else -.001] * 2,
                                      first_day='2026-10-12')
             def scenarios(value, *args, **kwargs):
@@ -391,7 +391,9 @@ class CapacityPacketTests(unittest.TestCase):
                 selected, result = select_daily_candidate(self.parent, proposal, history, BOOK_LIMITS, award_context=context)
             audit = result['metrics']['award_selection']
             if failed_role is None:
-                self.assertEqual((result['decision'], audit['reason']), ('apply', 'joint_qualification_robust'))
+                self.assertEqual((result['decision'], audit['reason']), ('apply', 'return_improvement'))
+                self.assertGreater(audit['selected_objective_value'], audit['incumbent_objective_value'])
+                self.assertTrue(audit['award_plan_supported'])
                 self.assertEqual(policy_id(selected['policy']), joint_id)
                 controls = next(packet for packet in result['metrics']['capacity_controls']
                                 if packet['base_id'] == packets[1]['base_id'])['controls']

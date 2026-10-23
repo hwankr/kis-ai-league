@@ -85,7 +85,7 @@ def _order_time(value):
         raise KisError("모의계좌 응답의 주문시각이 올바르지 않습니다.") from None
 
 
-def _order_row(raw, start, end):
+def _order_identity(raw, start, end):
     if not isinstance(raw, dict):
         raise KisError("모의 주문 내역 형식이 올바르지 않습니다.")
     try:
@@ -101,6 +101,18 @@ def _order_row(raw, start, end):
     side = {"01": "sell", "02": "buy"}.get(raw.get("sll_buy_dvsn_cd"))
     if side is None or raw.get("cncl_yn") not in ("Y", "N"):
         raise KisError("모의 주문 내역의 매매·취소 구분이 올바르지 않습니다.")
+    original = raw.get("orgn_odno")
+    original = None if original in (None, "") else _identity(original, 20)
+    if original and int(original) == 0:
+        original = None
+    return {"order_date": day.isoformat(), "order_id": _identity(raw.get("odno"), 20),
+            "branch_id": _identity(raw.get("ord_gno_brno"), 10), "original_order_id": original,
+            "symbol": symbol, "side": side, "cancelled": raw["cncl_yn"] == "Y",
+            "order_time": _order_time(raw.get("ord_tmd"))}
+
+
+def _order_row(raw, start, end):
+    identity = _order_identity(raw, start, end)
     quantity = _number(raw.get("ord_qty"), integer=True, positive=True)
     filled = _number(raw.get("tot_ccld_qty"), integer=True)
     remaining = _number(raw.get("rmn_qty"), integer=True)
@@ -114,19 +126,47 @@ def _order_row(raw, start, end):
     amount = _number(raw.get("tot_ccld_amt"), positive=filled > 0)
     if filled == 0 and (Decimal(average) != 0 or Decimal(amount) != 0):
         raise KisError("미체결 주문의 체결금액이 0이 아닙니다.")
-    original = raw.get("orgn_odno")
-    original = None if original in (None, "") else _identity(original, 20)
-    if original and int(original) == 0:
-        original = None
     status = ("filled" if filled == quantity else "partial" if filled and remaining else
               "open" if remaining else "cancelled" if cancelled else "rejected")
-    return {"order_date": day.isoformat(), "order_id": _identity(raw.get("odno"), 20),
-            "branch_id": _identity(raw.get("ord_gno_brno"), 10), "original_order_id": original,
-            "symbol": symbol, "side": side, "quantity": quantity, "filled_quantity": filled,
+    return {**identity, "quantity": quantity, "filled_quantity": filled,
             "remaining_quantity": remaining, "cancelled_quantity": cancelled,
             "rejected_quantity": rejected, "limit_price": _number(raw.get("ord_unpr")),
-            "average_price": average, "filled_amount": amount, "status": status,
-            "cancelled": raw["cncl_yn"] == "Y", "order_time": _order_time(raw.get("ord_tmd"))}
+            "average_price": average, "filled_amount": amount, "status": status}
+
+
+def _cancel_event(raw, start, end):
+    """Recognize explicit zero-execution cancel requests, not executable orders."""
+    labels = {"매수취소": "buy", "매도취소": "sell"}
+    if not isinstance(raw, dict) or raw.get("sll_buy_dvsn_cd_name") not in labels:
+        return None
+    identity = _order_identity(raw, start, end)
+    quantity = _number(raw.get("ord_qty"), integer=True, positive=True)
+    quantities = [_number(raw.get(key), integer=True) for key in
+                  ("tot_ccld_qty", "rmn_qty", "cncl_cfrm_qty", "rjct_qty")]
+    amounts = [_number(raw.get(key)) for key in ("ord_unpr", "avg_prvs", "tot_ccld_amt")]
+    if (not identity["cancelled"] or labels[raw["sll_buy_dvsn_cd_name"]] != identity["side"]
+            or not identity["original_order_id"] or int(identity["order_id"]) == 0
+            or int(identity["original_order_id"]) == int(identity["order_id"])
+            or raw.get("excg_id_dvsn_cd") != "KRX"
+            or any(quantities) or any(Decimal(value) != 0 for value in amounts)):
+        raise KisError("모의 취소 접수 내역의 구분·수량을 확인할 수 없습니다.")
+    return {**identity, "quantity": quantity}
+
+
+def _verify_cancel_events(events, orders, exchanges):
+    """Only full-response parent evidence can account for these request rows."""
+    totals = {}
+    for event in events.values():
+        key = (event["order_date"], event["branch_id"], event["original_order_id"])
+        parent = orders.get(key)
+        if (parent is None or parent["original_order_id"] is not None or exchanges.get(key) != "KRX"
+                or parent["symbol"] != event["symbol"] or parent["side"] != event["side"]
+                or parent["order_time"] > event["order_time"]
+                or sum(parent[field] for field in ("filled_quantity", "remaining_quantity", "cancelled_quantity", "rejected_quantity")) != parent["quantity"]):
+            raise KisError("모의 취소 접수와 원주문 연결을 확인할 수 없습니다.")
+        totals[key] = totals.get(key, 0) + event["quantity"]
+    if any(quantity != orders[key]["cancelled_quantity"] for key, quantity in totals.items()):
+        raise KisError("모의 취소 접수와 원주문의 취소확인수량이 일치하지 않습니다.")
 
 
 class PaperBroker:
@@ -342,7 +382,7 @@ class PaperBroker:
             periods.append((start_date, min(end_date, cutoff - timedelta(days=1)), "VTSC9215R"))
         if end_date >= cutoff:
             periods.append((max(start_date, cutoff), end_date, "VTTC0081R"))
-        orders = {}
+        orders, cancel_events, exchanges = {}, {}, {}
         for period_start, period_end, tr_id in periods:
             params = {**self._account(), "INQR_STRT_DT": period_start.strftime("%Y%m%d"),
                       "INQR_END_DT": period_end.strftime("%Y%m%d"), "SLL_BUY_DVSN_CD": "00",
@@ -353,18 +393,30 @@ class PaperBroker:
                 if not isinstance(summary, dict):
                     raise KisError("모의 주문 요약 응답이 올바르지 않습니다.")
                 for raw in rows:
+                    event = _cancel_event(raw, period_start, period_end)
+                    if event is not None:
+                        key = (event["order_date"], event["branch_id"], event["order_id"])
+                        if key in orders or key in cancel_events and cancel_events[key] != event:
+                            raise KisError("모의 취소 접수 누적 응답이 서로 일치하지 않습니다.")
+                        cancel_events[key] = event
+                        continue
                     row = _order_row(raw, period_start, period_end)
                     key = (row["order_date"], row["branch_id"], row["order_id"])
+                    if key in cancel_events:
+                        raise KisError("모의 주문과 취소 접수 식별값이 충돌합니다.")
                     previous = orders.get(key)
                     if previous is not None:
                         stable = ("symbol", "side", "quantity", "limit_price", "original_order_id", "order_time")
                         cumulative = ("filled_quantity", "cancelled_quantity", "rejected_quantity")
-                        if (any(previous[field] != row[field] for field in stable)
+                        if (exchanges[key] != raw.get("excg_id_dvsn_cd")
+                                or any(previous[field] != row[field] for field in stable)
                                 or any(previous[field] > row[field] for field in cumulative)
                                 or previous["remaining_quantity"] < row["remaining_quantity"]
                                 or Decimal(previous["filled_amount"]) > Decimal(row["filled_amount"])):
                             raise KisError("모의 주문 누적 응답이 서로 일치하지 않습니다.")
                     orders[key] = row
+                    exchanges[key] = raw.get("excg_id_dvsn_cd")
+        _verify_cancel_events(cancel_events, orders, exchanges)
         return sorted(orders.values(), key=lambda row: (row["order_date"], row["order_time"], row["order_id"]))
 
     def _mutate(self, path, tr_id, body, *, before_send=None, send_guard=None):

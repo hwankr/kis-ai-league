@@ -181,6 +181,56 @@ class AwardResearchTests(unittest.TestCase):
         self.assertIsNone(outcome["scenarios"][0]["checks"]["symbols"])
         self.assertNotIn("DO_NOT_SEND", json.dumps(amount))
 
+    def test_return_objective_and_unproven_challenge_survive_public_feedback(self):
+        from backend.policy_award import selection_contract
+        audit = {**selection_contract(), 'status': 'apply', 'reason': 'return_challenge',
+                 'incumbent_objective_value': 99_000_000., 'selected_objective_value': 99_100_000.,
+                 'objective_improvement': 100_000., 'award_plan_supported': False,
+                 'qualification_risk': True, 'secret': 'DO_NOT_SEND', 'outcomes': [{
+                     'candidate_id': 'a' * 64, 'promotion_reason': 'return_challenge',
+                     'eligible': True, 'objective_value': 99_100_000., 'objective_improvement': 100_000.,
+                     'award_plan_supported': False, 'diagnostic_reason': 'qualification_shortfall',
+                     'activity_preservation': {'supported': True, 'reason': 'core_activity_preserved',
+                                               'worsened': [], 'unknown': [], 'secret': 'DO_NOT_SEND'},
+                     'core_witness_preservation': {'supported': True, 'lost': []},
+                     'qualification': {'status': 'none_met', 'qualifying_scenarios': 0}}]}
+        clean = _public_daily_evaluation({'decision': 'apply', 'metrics': {'award_selection': audit}})
+        public = clean['metrics']['award_selection']
+        self.assertEqual(public['return_objective']['path_count'], 12)
+        self.assertEqual(public['return_objective']['environments'], ['normal', 'cost_stress'])
+        self.assertEqual(public['objective'], 'core_equal_weight_mean_final_nav')
+        self.assertEqual(public['selected_objective_value'], 99_100_000.)
+        self.assertEqual(public['target_rank_max'], 5)
+        self.assertIsNone(public['actual_rank'])
+        self.assertIsNone(public['fifth_place_return_pct'])
+        self.assertFalse(public['automatic_rank_defense'])
+        self.assertFalse(public['award_plan_supported'])
+        self.assertTrue(public['qualification_risk'])
+        outcome = public['outcomes'][0]
+        self.assertEqual(outcome['objective_improvement'], 100_000.)
+        self.assertEqual(outcome['diagnostic_reason'], 'qualification_shortfall')
+        self.assertEqual(outcome['activity_preservation']['unknown_count'], 0)
+        self.assertTrue(outcome['core_witness_preservation']['supported'])
+        self.assertNotIn('DO_NOT_SEND', json.dumps(clean))
+
+    def test_public_return_objective_does_not_turn_invalid_values_into_success(self):
+        audit = {'objective_improvement': float('nan'), 'actual_rank': True,
+                 'award_plan_supported': 'true', 'return_objective': {
+                     'path_count': True, 'minimum_improvement': float('inf'),
+                     'environments': ['normal', {'secret': 'DO_NOT_SEND'}, 'invented']},
+                 'outcomes': [{'objective_value': float('inf'),
+                               'activity_preservation': {'supported': 'true', 'unknown': ['missing']}}]}
+        public = _public_daily_evaluation({'metrics': {'award_selection': audit}})['metrics']['award_selection']
+        self.assertIsNone(public['objective_improvement'])
+        self.assertIsNone(public['actual_rank'])
+        self.assertIsNone(public['award_plan_supported'])
+        self.assertIsNone(public['return_objective']['path_count'])
+        self.assertIsNone(public['return_objective']['minimum_improvement'])
+        self.assertEqual(public['return_objective']['environments'], ['normal'])
+        self.assertIsNone(public['outcomes'][0]['objective_value'])
+        self.assertIsNone(public['outcomes'][0]['activity_preservation']['supported'])
+        self.assertEqual(public['outcomes'][0]['activity_preservation']['unknown_count'], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -550,6 +550,27 @@ class MirrorRuntimeTests(unittest.TestCase):
         self.assertEqual(self.destination.calls.count("prepare"), 1)
         self.assertEqual(self.destination.submissions, [])
 
+    def test_first_form_rejection_continues_next_symbol_without_reject_retry(self):
+        self.initialize()
+        self.source.fill(2, symbol="000660")
+        self.source.fill(2, symbol="005930")
+        original_prepare = self.destination.prepare
+        prepared_symbols = []
+        def prepare(proposal):
+            prepared_symbols.append(proposal["symbol"])
+            if proposal["symbol"] == "000660":
+                raise MirrorRejected("destination_rejected: 5일 평균거래대금 부족 (거래대금 30억 미만)")
+            return original_prepare(proposal)
+        self.destination.prepare = prepare
+        self.assertEqual(self.runtime.tick()["status"], "working")
+        self.assertEqual(self.runtime.tick()["status"], "working")
+        self.assertEqual(prepared_symbols, ["000660", "005930"])
+        self.assertEqual([item["symbol"] for item in self.destination.submissions], ["005930"])
+        rejected = next(job for job in self.runtime.snapshot()["jobs"] if job["symbol"] == "000660")
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertNotIn("submitted_at", rejected)
+        self.assertFalse(rejected.get("receipt"))
+
     def test_preclick_session_end_is_blocked_but_bad_receipt_is_unknown(self):
         self.initialize()
         self.source.fill(2)

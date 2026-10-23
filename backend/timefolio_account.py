@@ -22,6 +22,46 @@ ERRORS = {"login_required": "타임폴리오 로그인을 확인하세요.",
           "invalid_snapshot": "저장된 타임폴리오 계좌 현황을 확인하지 못했습니다."}
 
 
+def _collection_diagnostic(error, stage):
+    """Bounded code coordinates only; never exception text, arguments or locals."""
+    types = {"Exception", "Error", "TimeoutError", "ValueError", "TypeError", "KeyError",
+             "IndexError", "AttributeError", "RuntimeError", "OSError", "FileNotFoundError",
+             "PermissionError", "UnicodeDecodeError", "JSONDecodeError", "InvalidOperation",
+             "DatabaseError", "OperationalError", "IntegrityError", "MirrorBlocked", "MirrorUnknown"}
+    name = type(error).__name__
+    result = {"stage": stage, "type": name if name in types else "Exception", "stack": []}
+    directory = Path(__file__).resolve().parent
+    allowed = {"timefolio_account.py", "timefolio_browser.py", "timefolio_dom.py"}
+    frame = error.__traceback__
+    while frame is not None:
+        try:
+            relative = Path(frame.tb_frame.f_code.co_filename).resolve().relative_to(directory).as_posix()
+        except (OSError, ValueError):
+            pass
+        else:
+            if relative in allowed:
+                result["stack"] = (result["stack"] + [
+                    {"file": "backend/" + relative, "line": frame.tb_lineno}])[-8:]
+        frame = frame.tb_next
+    grid = getattr(error, "collection_grid", None)
+    if isinstance(grid, list):
+        clean = []
+        for row in grid[-4:]:
+            if not isinstance(row, dict):
+                continue
+            item = {key: value for key in ("step", "requested_top", "top", "max", "height", "expected", "known")
+                    if isinstance(value := row.get(key), (int, float)) and not isinstance(value, bool)
+                    and -1 <= value <= 10**7}
+            for key in ("row_indices", "seen_indices"):
+                values = row.get(key)
+                if isinstance(values, list):
+                    item[key] = [value if type(value) is int and -1 <= value <= 10**7 else -1
+                                 for value in values[:128]]
+            clean.append(item)
+        result["grid"] = clean
+    return result
+
+
 def _number(value, *, optional=False, nonnegative=False):
     if optional and (value is None or value == ""):
         return None
@@ -298,17 +338,21 @@ class AccountCollector:
             previous = _saved(self.root)
         except (OSError, ValueError, TypeError):
             pass
+        stage = "context"
         try:
             context = _context(self.root)
             if context is None:
                 raise ValueError("binding_changed")
             if any(job.get("status") in {"submitting", "unknown", "working"} for job in context["jobs"]):
                 return  # Reconciliation and uncertain submissions take priority over account display.
+            stage = "browser_snapshot"
             snapshot = self.browser.account_snapshot()
+            stage = "binding_validation"
             if (snapshot.get("account_key") != context["binding"]["account_key"]
                     or snapshot.get("contest") != context["binding"]["contest"]
                     or (_context(self.root) or {}).get("binding") != context["binding"]):
                 raise ValueError("binding_changed")
+            stage = "public_validation"
             _public_data(snapshot, context["jobs"], now=self.now())
             saved = {"version": 1, "binding": context["binding"], "snapshot": snapshot,
                      "updated_at": self.now().astimezone(timezone.utc).isoformat(),
@@ -319,7 +363,8 @@ class AccountCollector:
             code = "login_required" if str(error) == "timefolio_login_required" else (
                 "binding_changed" if str(error) == "binding_changed" else "collection_failed")
             saved = {"version": 1, "binding": binding, "snapshot": keep.get("snapshot"),
-                     "updated_at": keep.get("updated_at"), "last_attempt_at": attempted, "error_code": code}
+                     "updated_at": keep.get("updated_at"), "last_attempt_at": attempted, "error_code": code,
+                     "diagnostic": _collection_diagnostic(error, stage)}
         try:
             _write(self.root / ".local" / "timefolio-account.json", saved)
         except (OSError, ValueError, TypeError):

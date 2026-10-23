@@ -108,6 +108,8 @@ class FakeLocator:
     def evaluate(self, expression):
         if expression == GRID_DOM:
             return deepcopy(self.page.grid_states.pop(0))
+        if "validationErrors" in expression:
+            return {**deepcopy(self.page.fields), "errors": deepcopy(self.page.validation_errors)}
         if "fieldset div" in expression:
             return deepcopy(self.page.validation_errors)
         return deepcopy(self.page.fields)
@@ -146,7 +148,9 @@ class FakePage:
         self.dialog_handler = None
         self.last_dialog = None
         self.validation_ok = True
+        self.validation_status = 200
         self.validation_errors = []
+        self.validation_render = None
         self.alert_messages = []
         self.contest, self.portfolio_id = CONTEST, "pf13"
         self.responses = []
@@ -167,6 +171,9 @@ class FakePage:
 
     def evaluate(self, expression):
         self.evaluations.append(expression)
+        if ("requestAnimationFrame" in expression and self.validation_render
+                and self.selected_response and "ValidateProduct" in self.selected_response.url):
+            self.validation_render()
         return None
 
     def expect_response(self, predicate, **kwargs):
@@ -174,7 +181,8 @@ class FakePage:
                 + "&prodId=A" + self.search + "&entry=" + self.fields["side"]]
         urls += [ORIGIN + "/Portfolio/" + name for name in ("Session", "Orders", "Universe")]
         candidates = [SimpleNamespace(url=url, request=SimpleNamespace(method="GET"),
-                      ok=self.validation_ok if "ValidateProduct" in url else True, finished=lambda: None) for url in urls]
+                      ok=self.validation_ok if "ValidateProduct" in url else True,
+                      status=self.validation_status if "ValidateProduct" in url else 200, finished=lambda: None) for url in urls]
         if self.response_candidates is not None:
             candidates = self.response_candidates
         response = next((candidate for candidate in candidates if predicate(candidate)), None)
@@ -331,6 +339,7 @@ class TimefolioBrowserTests(unittest.TestCase):
         for prefix in ("", "/api"):
             for side, entry in (("buy", "true"), ("sell", "false")):
                 with self.subTest(prefix=prefix, side=side):
+                    self.page.fields["side"] = entry
                     url = ORIGIN + prefix + "/Portfolio/ValidateProduct?d=2026-10-12&prodId=A005930&entry=" + entry
                     self.page.response_candidates = [SimpleNamespace(
                         url=url, request=SimpleNamespace(method="GET"), ok=True)]
@@ -344,6 +353,7 @@ class TimefolioBrowserTests(unittest.TestCase):
         for prefix in ("", "/api"):
             path = prefix + "/Portfolio/ValidateProduct"
             for side, entry, wrong_entry in (("buy", "true", "false"), ("sell", "false", "true")):
+                self.page.fields["side"] = entry
                 query = "?d=2026-10-12&prodId=A005930&entry=" + entry
                 for url, method in (
                     ("https://example.invalid" + path + query, "GET"),
@@ -634,6 +644,133 @@ class TimefolioBrowserTests(unittest.TestCase):
         self.assertIsNone(self.browser._prepared)
         self.assertEqual(self.submit_clicks(), 0)
 
+    def _business_validation(self, *, errors=None, changes=None):
+        self.page.validation_ok, self.page.validation_status = False, 400
+        messages = ["5일 평균거래대금 부족 (거래대금 30억 미만)"] if errors is None else errors
+        def render():
+            self.assertTrue(any(request is self.page.selected_response.request for request in self.page.finished_requests))
+            self.page.validation_errors = list(messages)
+            self.page.fields.update(changes or {})
+        self.page.validation_render = render
+
+    def test_buy_business_400_rejects_after_completion_even_when_site_switches_to_sell(self):
+        for final_side in ("true", "false"):
+            with self.subTest(final_side=final_side):
+                self.page.validation_errors = []
+                self._business_validation(changes={"side": final_side})
+                with self.assertRaisesRegex(MirrorRejected, "5일 평균거래대금 부족"):
+                    self.browser.prepare(proposal())
+                self.assertIsNone(self.browser._prepared)
+                self.assertEqual(self.submit_clicks(), 0)
+                self.assertIn("entry=true", self.page.responses[-1])
+
+    def test_buy_400_unrecognized_or_mixed_error_stays_blocked(self):
+        for errors in ([], ["종목 거래 제한"], ["요청 횟수 제한"], ["인증 권한 부족"], ["허용 종목입니다"],
+                       ["5일 평균거래대금 부족 (거래대금 30억 미만)", "서버 오류"]):
+            with self.subTest(errors=errors):
+                self.page.validation_errors = []
+                self._business_validation(errors=errors)
+                with self.assertRaisesRegex(MirrorBlocked, "stock_validation_failed"):
+                    self.browser.prepare(proposal())
+                self.assertIsNone(self.browser._prepared)
+                self.assertEqual(self.submit_clicks(), 0)
+
+    def test_buy_400_stale_business_error_cannot_reject_current_request(self):
+        self.page.validation_errors = ["5일 평균거래대금 부족 (거래대금 30억 미만)"]
+        self._business_validation()
+        with self.assertRaisesRegex(MirrorBlocked, "stock_validation_failed"):
+            self.browser.prepare(proposal())
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_buy_400_changed_or_ambiguous_form_identity_stays_blocked(self):
+        for field, value in (("symbol", "A000660"), ("date", "2026-10-13"), ("symbol", None),
+                             ("date", None), ("side", None), ("side", ""), ("side", "invalid")):
+            with self.subTest(field=field, value=value):
+                self.page.fields.update(symbol="A005930", date="2026-10-12", side="true")
+                self.page.validation_errors = []
+                self._business_validation(changes={field: value})
+                with self.assertRaisesRegex(MirrorBlocked, "form_changed"):
+                    self.browser.prepare(proposal())
+                self.assertIsNone(self.browser._prepared)
+                self.assertEqual(self.submit_clicks(), 0)
+
+    def test_buy_400_changed_binding_is_not_a_business_rejection(self):
+        self._business_validation()
+        render = self.page.validation_render
+        def changed():
+            render()
+            self.page.contest = "Training"
+        self.page.validation_render = changed
+        with self.assertRaisesRegex(MirrorBlocked, "binding_changed"):
+            self.browser.prepare(proposal())
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_product_nonbusiness_http_failure_never_waits_or_rejects(self):
+        self.page.validation_ok = False
+        self.page.validation_errors = ["5일 평균거래대금 부족 (거래대금 30억 미만)"]
+        self.page.finish_error = AssertionError("nonbusiness HTTP failure must not wait")
+        for status in (None, 200, 401, 403, 404, 409, 422, 429, 500, 503):
+            with self.subTest(status=status):
+                self.page.validation_status = status
+                with self.assertRaisesRegex(MirrorBlocked, "stock_validation_failed"):
+                    self.browser._select_validated(FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930")
+        self.assertEqual(self.page.finished_requests, [])
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_buy_business_400_completion_timeout_remains_retryable_blocker(self):
+        self._business_validation()
+        self.page.finish_error = TimeoutError("exact validation request body did not finish")
+        with self.assertRaises(TimeoutError):
+            self.browser._select_validated(FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930")
+        self.assertEqual(self.page.validation_errors, [])
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_buy400_matches_original_request_not_concurrent_sell200(self):
+        buy = SimpleNamespace(url=ORIGIN + "/api/Portfolio/ValidateProduct?d=2026-10-12&prodId=A005930&entry=true",
+                              request=SimpleNamespace(method="GET"), ok=False, status=400)
+        sell = SimpleNamespace(url=ORIGIN + "/api/Portfolio/ValidateProduct?d=2026-10-12&prodId=A005930&entry=false",
+                               request=SimpleNamespace(method="GET"), ok=True, status=200)
+        self.page.response_candidates = [sell, buy]
+        self.page.finished_candidates = [sell.request, buy.request]
+        self._business_validation(changes={"side": "false"})
+        with self.assertRaises(MirrorRejected):
+            self.browser._select_validated(FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930")
+        self.assertIs(self.page.selected_response, buy)
+        self.assertIs(self.page.finished_requests[-1], buy.request)
+        self.page.fields["side"], self.page.validation_errors = "true", []
+        self.page.finished_candidates = [sell.request]
+        with self.assertRaises(TimeoutError):
+            self.browser._select_validated(FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930")
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_preselection_wrong_side_and_sell400_stay_blocked(self):
+        self.page.fields["side"] = "false"
+        with self.assertRaisesRegex(MirrorBlocked, "form_changed"):
+            self.browser._select_validated(FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930")
+        self.assertEqual(self.page.responses, [])
+        self._business_validation()
+        with self.assertRaisesRegex(MirrorBlocked, "stock_validation_failed"):
+            self.browser._select_validated(FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930", side="sell")
+        self.assertEqual(self.page.finished_requests, [])
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_preselection_stale_missing_or_invalid_day_never_selects_or_rejects(self):
+        self._business_validation()
+        for day in (None, "", "2026-10-11", "2026-10-13", "20261012"):
+            with self.subTest(day=day):
+                self.page.fields["date"] = day
+                with self.assertRaisesRegex(MirrorBlocked, "form_changed"):
+                    self.browser._select_validated(FakeLocator(self.page, "dialog"), FakeLocator(self.page, "li"), "005930")
+        self.assertEqual(self.page.responses, [])
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_successful_validation_side_switch_cannot_prepare_an_order(self):
+        self.page.validation_render = lambda: self.page.fields.update(side="false")
+        with self.assertRaisesRegex(MirrorBlocked, "form_changed"):
+            self.browser.prepare(proposal())
+        self.assertIsNone(self.browser._prepared)
+        self.assertEqual(self.submit_clicks(), 0)
+
     def test_receipt_matching_rejects_unverified_old_or_wrong_weight(self):
         for rows in ([receipt("old")], [receipt(verified=False)], [receipt(weight=2.01)], [receipt(side="sell")]):
             with self.subTest(rows=rows), self.assertRaises(MirrorUnknown):
@@ -674,8 +811,12 @@ class TimefolioBrowserTests(unittest.TestCase):
                     return {"top": position["top"], "original": original, "max": 100, "height": 100}
                 table = SimpleNamespace(evaluate=evaluate)
                 if reordered:
-                    with self.assertRaisesRegex(MirrorBlocked, "changed_during_scroll"):
+                    with self.assertRaisesRegex(MirrorBlocked, "changed_during_scroll") as caught:
                         self.browser._grid_dom(table, expected=3)
+                    trace = caught.exception.collection_grid
+                    self.assertEqual(trace[-1]["seen_indices"], [1, 0, -1])
+                    self.assertEqual(trace[-1]["known"], 2)
+                    self.assertNotIn("005930", str(trace))
                 else:
                     result = self.browser._grid_dom(table, expected=3)
                     self.assertEqual(len(result["rows"]), 3)
@@ -873,6 +1014,86 @@ class DelayedTail(FakeLocator):
         return result
 
 
+class LaggedOrderWindow(FakeLocator):
+    """Observed 55-row geometry: top 0 can still render the previous tail 36..54."""
+    def __init__(self, page, *, delay=2, corruption=None):
+        super().__init__(page, "table")
+        self.top, self.original, self.reads = 769, 769, 0
+        self.delay, self.corruption = delay, corruption
+        columns = _VIRTUAL_TAIL_COLUMNS
+        self.values = [["2026-10-21 09:00", f"A{i:06d}", "1", "1", "0"] for i in range(55)]
+        self.full = {"headers": [{"id": key, "text": key} for key in columns],
+                     "rows": [{"index": i, "cells": {key: {"id": f"cell{i}_{key}", "text": value}
+                                                        for key, value in zip(columns, values)}}
+                              for i, values in enumerate(self.values)],
+                     "filtered": False, "count_text": "전체 55"}
+        self.csv = "\n".join([",".join(columns)] + [",".join(values) for values in self.values])
+
+    def evaluate(self, script, *args):
+        if script != GRID_DOM:
+            original = self.top
+            if args[0] is not None and int(args[0]) != self.top:
+                self.top, self.reads = min(int(args[0]), 769), 0
+            return {"top": self.top, "original": original, "max": 769, "height": 399}
+        self.reads += 1
+        result = deepcopy(self.full)
+        if self.reads <= self.delay:
+            start, end = (36, 55) if self.top == 0 else ((27, 51) if self.top == 769 else (0, 21))
+        else:
+            start, end = ((0, 21) if self.top == 0 else (12, 36) if self.top < 598
+                          else (27, 51) if self.top < 769 else (36, 55))
+        result["rows"] = result["rows"][start:end]
+        if self.reads > self.delay and self.top == 299:
+            if self.corruption == "reorder":
+                result["rows"][0]["cells"], result["rows"][1]["cells"] = (
+                    result["rows"][1]["cells"], result["rows"][0]["cells"])
+            elif self.corruption == "fixed":
+                result["rows"][0]["cells"]["prodId"]["text"] = "A999999"
+            elif self.corruption == "gap":
+                result["rows"] = result["rows"][13:]
+        return result
+
+
+class VirtualWindowLagTests(unittest.TestCase):
+    def make(self, **kwargs):
+        waits = []
+        browser = TimefolioBrowser("unused-offline-profile", sleep=waits.append)
+        browser.page = FakePage()
+        browser.page.dialog_handler = browser._dialog
+        return browser, LaggedOrderWindow(browser.page, **kwargs), waits
+
+    def test_observed_stale_tail_and_delayed_middle_wait_before_accumulating_rows(self):
+        browser, table, waits = self.make()
+        result = browser._grid_dom(table, 55)
+        self.assertEqual(result["rows"], table.full["rows"])
+        self.assertTrue(waits)
+        self.assertEqual(table.top, table.original)
+        self.assertNotIn('button[type="submit"]', browser.page.clicks)
+
+    def test_lagged_complete_grid_still_joins_csv_in_original_order(self):
+        browser, table, _ = self.make()
+        with patch.object(Path, "read_text", return_value=table.csv):
+            grid = browser._grid(table, "orders")
+        self.assertTrue(grid["complete"])
+        self.assertEqual(grid["rows"], table.full["rows"])
+        self.assertEqual(table.top, table.original)
+
+    def test_head_must_settle_within_five_reads_without_accepting_permanent_tail(self):
+        browser, table, waits = self.make(delay=5)
+        with self.assertRaisesRegex(MirrorBlocked, "render_unsettled"):
+            browser._grid_dom(table, 55)
+        self.assertEqual(waits, [.05] * 4)
+        self.assertEqual(table.top, table.original)
+
+    def test_real_order_change_fixed_field_change_or_missing_middle_stays_blocked(self):
+        for corruption in ("reorder", "fixed", "gap"):
+            with self.subTest(corruption=corruption):
+                browser, table, _ = self.make(corruption=corruption)
+                with self.assertRaises(MirrorBlocked):
+                    browser._grid_dom(table, 55)
+                self.assertEqual(table.top, table.original)
+
+
 class VirtualTailTests(unittest.TestCase):
     def make(self, browser_class=TimefolioBrowser, **kwargs):
         waits = []
@@ -999,6 +1220,19 @@ class TimefolioGridDOMBrowserTests(unittest.TestCase):
         result = adapter._verify_form(proposal(symbol="006400"))
         self.assertTrue(result["verified"])
         self.assertEqual(result["symbol"], "006400")
+
+    def test_validation_form_reads_identity_and_only_visible_red_errors_together(self):
+        adapter = self._selected_order_form()
+        self.page.locator('[role="dialog"]').evaluate("""e=>e.insertAdjacentHTML('beforeend', `<fieldset>
+          <div style="color:red">5일 평균거래대금 부족 (거래대금 30억 미만)</div>
+          <div style="color:red;display:none">hidden-display</div>
+          <div style="color:red;visibility:hidden">hidden-visibility</div>
+          <div style="color:green">not-error</div></fieldset>`)""")
+        dialog = self.page.get_by_role("dialog", name="신규 주문")
+        self.assertEqual(adapter._validation_form(dialog), {"symbol": "A006400", "date": "2026-10-12", "side": "true",
+            "errors": ["5일 평균거래대금 부족 (거래대금 30억 미만)"]})
+        self.page.locator('[role="dialog"]').evaluate("e=>e.insertAdjacentHTML('beforeend','<input placeholder=other value=A005930>')")
+        self.assertIsNone(adapter._validation_form(dialog)["symbol"])
 
     def test_account_snapshot_reads_nav_and_full_positions_without_receipt_only_fallback(self):
         from tests.test_timefolio_account import observation

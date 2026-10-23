@@ -1211,7 +1211,14 @@ class ExperimentsTests(unittest.TestCase):
         self.assertEqual(restarted.store.setting("autonomy_status")["last_error_operation"], "cycle")
         with patch.object(restarted, "_launch") as launch:
             restarted.tick()
-            launch.assert_not_called()
+            launch.assert_called_once_with("automatic")
+        # The cycle keeps its technical retry even while independent stages run.
+        with patch.object(restarted, "_cycle") as cycle, patch.object(restarted, "_analyze") as analysis:
+            restarted._work("automatic", {})
+            cycle.assert_not_called()
+            analysis.assert_called_once_with(automatic_retry=True)
+        self.assertEqual(restarted.store.setting("autonomy_status")["operation_failures"]["cycle"],
+                         first["operation_failures"]["cycle"])
         self.current += timedelta(seconds=31)
         self.broker.snapshot = original
         restarted._work("cycle", {})
@@ -1335,6 +1342,12 @@ class ExperimentsTests(unittest.TestCase):
             restarted._work("analyze", {})
         self.assertEqual(restarted.snapshot()["error"], "과거 요청 실패")
         restarted.store.save_setting("enabled", True)
+        with patch.object(restarted, "_cycle") as cycle, patch.object(restarted, "_analyze") as analysis:
+            restarted._work("automatic", {})
+            cycle.assert_not_called()
+            analysis.assert_not_called()
+        self.assertEqual(restarted.snapshot()["error"], "과거 요청 실패")
+        self.current += timedelta(seconds=61)
         with patch.object(restarted, "_cycle"), patch.object(restarted, "_analyze"):
             restarted._work("automatic", {})
         self.assertIsNone(restarted.snapshot()["error"])

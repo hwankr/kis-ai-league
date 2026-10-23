@@ -14,7 +14,7 @@ from backend.learning_policy import KST, LEGACY_IDS, _day, _instant, portfolio_m
 from backend.learning_research import _behavior_id, _policy_changes, _public_activity
 
 
-VERSION = "daily-award-development-v5"
+VERSION = "daily-award-development-v6"
 EPSILON = 1e-9
 MAXIMUM_DRAWDOWN_PCT = 15.
 METRICS = ("net_return_pct", "stress_return_pct", "max_drawdown_pct", "stress_drawdown_pct")
@@ -402,7 +402,10 @@ def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None
     result = deepcopy(selected[2])
     if award is not None:
         result["decision"] = award["status"]
-        reason = {"return_improvement_with_capacity": "현재 보유 전이와 비용 후 수익 개선을 확인한 잠정 적용",
+        reason = {"return_improvement": "공통 개발 경로의 비용 후 평균 최종자산 개선과 보호 조건을 확인한 잠정 적용",
+                  "return_challenge": "비용 후 평균 최종자산 개선을 확인한 잠정 도전: 수상요건 미달 위험은 남아 있음",
+                  "no_supported_return_improvement": "수익 우선·수상 활동요건·보호 조건을 함께 통과한 대안이 없어 현행 유지",
+                  "return_improvement_with_capacity": "현재 보유 전이와 비용 후 수익 개선을 확인한 잠정 적용",
                   "qualification_tradeoff": "허용 수익 범위에서 동일 경로의 수상요건 개선을 확인한 잠정 적용",
                   "joint_qualification_robust": "공통 기본·예비 경로의 공동 수상요건과 위험 한도를 충족한 잠정 적용",
                   "joint_qualification_conditional": "기본 경로의 공동 요건 충족·현행 대비 최악 자산 비악화를 확인한 조건부 적용",
@@ -465,7 +468,8 @@ def select_daily_candidate(champion, proposal, frames, limits, *, evaluator=None
                           "stress_return_pct": (outcome.get("metrics") or {}).get("selection_stress_return_pct")}
                          for _, identity, outcome in records]}
         if award is not None:
-            metrics["selection"].update(objective="joint_award_qualification_with_incumbent_relative_equity_and_risk_gates",
+            metrics["selection"].update(objective="core_mean_final_equity_with_qualification_preservation_and_risk_gates",
+                return_objective=deepcopy(award.get("return_objective")),
                 eligible_candidates=award.get("eligible_candidates", 0),
                 selected_candidate_id=selected[1] if award_index is not None else policy_id(champion),
                 incumbent_selected=award_index is None,

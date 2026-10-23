@@ -51,7 +51,7 @@ class LearningQuoteEntryContextTests(unittest.TestCase):
             _save_learning_quote=lambda symbol, price=None, **kwargs: saved.append(symbol))
         original = deepcopy(state)
         with patch('backend.daily_comparison.observation_books', return_value=deepcopy(frozen)):
-            ExperimentService._observe_learning_quotes(service, control)
+            ExperimentService._observe_legacy_learning_quotes(service, control)
         self.assertEqual(state, original)
         service.saved_marks = marks
         return saved, service
