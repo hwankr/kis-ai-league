@@ -17,7 +17,7 @@ from backend import policy_award_scenarios as daily
 
 VERSION = 'intraday-award-context-v1'
 BASIS = 'remaining_intraday_observed_quote_prefix'
-PLAN_VERSION = 'intraday-quality-only-common-windows-v1'
+PLAN_VERSION = 'intraday-quality-only-common-windows-v2'
 _hash = daily._hash
 
 
@@ -107,7 +107,7 @@ def _validate(value):
         raise ValueError('intraday_contest_ledger_changed')
     future = _future_days(day, _day(progress['period']['end_date']))
     remaining = progress.get('pace', {}).get('remaining_sessions')
-    if (type(remaining) is not int or remaining != len(future) or remaining < 3
+    if (type(remaining) is not int or remaining != len(future) or remaining < 1
             or _day(calendar.get('next_session')) != future[0]):
         raise ValueError('intraday_forward_horizon_mismatch')
     if (any(type(value[key]) is not int or value[key] != 0 for key in ('today_order_count', 'today_fill_count'))
@@ -368,6 +368,27 @@ def _combined_outcome(prefix_metric, future_metric, *, stress):
     return result
 
 
+def _terminal_prefix_outcome(prefix_metric, anchor, initial, limits, *, stress):
+    """Keep the observed-quote prefix once, with no following simulated session."""
+    key = 'stress_' if stress else ''
+    book = prefix_metric[key + 'final_state']
+    diagnostics = prefix_metric['diagnostics']['cost_stress' if stress else 'normal']
+    terminal = daily._terminal_outcome(book, anchor, limits,
+        protection_fee=diagnostics['fee_rate'], protection_tax=diagnostics['tax_rate'])
+    before = daily._outcome(prefix_metric, stress=stress)
+    if before['final_equity'] != terminal['final_equity'] or before['final_state_hash'] != terminal['final_state_hash']:
+        raise ValueError('terminal_prefix_state_mismatch')
+    slip = Decimal(str(diagnostics['slippage_bps'])) / 10000
+    protected_curve = [Decimal(str(point['cash'])) + Decimal(str(point['position_value'])) / (1-slip)
+                       for point in prefix_metric[key + 'equity_curve']]
+    result = deepcopy(before)
+    result.update(first_buy_session=0 if before['gross_buy_amount'] else None,
+        intraday_prefix=before, post_prefix_book_hash=_hash(book),
+        intraday_modelled_fills_are_actual=False, future_activity=terminal['future_activity'],
+        **daily._cumulative_protection(initial, protected_curve))
+    return result
+
+
 def award_scenarios(policy, frames, limits, context, *, plan=None):
     result = daily._base()
     result.update(version=VERSION, basis=BASIS)
@@ -407,6 +428,22 @@ def award_scenarios(policy, frames, limits, context, *, plan=None):
                 try:
                     if record['status'] != 'ready':
                         raise ValueError(record['reason'])
+                    if not length:
+                        for environment, stress, partial in variants:
+                            prefix_metric, anchor, initial = prefixes[partial]
+                            item = daily._unavailable(f"{window}_{schedule['schedule']}_{environment}",
+                                window, 0, environment, None)
+                            item.update(_terminal_prefix_outcome(prefix_metric, anchor, initial, limits, stress=stress),
+                                schedule=schedule['schedule'], source_start=None, source_end=None,
+                                assumed_start=None, assumed_end=context['activation_day'],
+                                intraday_assumed_start=context['activation_day'],
+                                basis=daily.TERMINAL_BASIS, alias_of=f'first_shortened_{environment}',
+                                path_hash=_hash({'basis': daily.TERMINAL_BASIS,
+                                    'prefix_source_frame': source['latest_frame'], 'prefix_frame': anchor}),
+                                source_start_index=None, source_intervals=0,
+                                start_book_hash=result['start_book_hash'], scenario_plan_hash=plan['hash'])
+                            result['scenarios'].append(item)
+                        continue
                     historical = frames[start:start + length + 1]
                     metrics = {}
                     for environment, stress, partial in variants:

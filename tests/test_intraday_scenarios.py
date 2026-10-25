@@ -30,7 +30,11 @@ def fixture(*, held=False, horizon=4):
     original['latest_frame']['session_days'] = calendar
     frames[-1] = deepcopy(original['latest_frame'])
     contest = progress()
-    contest['period']['end_date'] = '2026-10-21' if horizon == 4 else '2026-11-20'
+    end, remaining = date(2026, 10, 15), horizon
+    while remaining:
+        end += timedelta(days=1)
+        remaining -= end.weekday() < 5
+    contest['period']['end_date'] = end.isoformat()
     contest['pace']['remaining_sessions'] = horizon + 1
     source = freeze_award_context(signal_day='2026-10-14', observed_at='2026-10-14T16:05:00+09:00',
         latest_frame=frames[-1], initial_state=original['initial_state'],

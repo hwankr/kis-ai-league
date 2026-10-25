@@ -11,7 +11,7 @@ from backend.daily_inputs import validate_award_context
 from backend.policy_transition import transition_preview
 
 
-VERSION = "award-selection-v4-return-first"
+VERSION = "award-selection-v5-terminal-mark"
 # Relative backtest return and the former promotion classes are diagnostics.
 RISK_RETURN_TOLERANCE_PP = 0.0
 NAV_EPSILON = 1e-6
@@ -35,6 +35,8 @@ def selection_contract():
     return {"version": VERSION, "contest_id": "kis_ai_2026", "return_tolerance_pp": None,
             "rules": deepcopy(CONTESTS["kis_ai_2026"]),
             "calendar_basis": "weekday_estimate_with_two_session_shortening",
+            "zero_session_shortening": "terminal_mark_with_three_aliases_original_weights",
+            "full_worst_final_equity_role": "diagnostic_only_original_risk_gate_unchanged",
             "risk_limit_pct": 15., "existing_lot_rules": "preserved",
             "relative_return_role": "paired_validity_and_opportunity_cost_audit",
             "risk_reduction_return_tolerance_pp": RISK_RETURN_TOLERANCE_PP,
@@ -208,6 +210,7 @@ def _strict_return_improvement(candidate, reference):
 
 def _family_status(paths, qualification, plan, cap):
     """All candidates need the same complete 24-path contract, never a subset."""
+    from backend.policy_award_scenarios import TERMINAL_BASIS, ZERO_ACTIVITY
     expected = {f'{window}_{schedule}_{environment}'
         for window in ('first', 'middle', 'recent') for schedule in ('full', 'shortened')
         for environment in ('normal', 'cost_stress', 'partial_delayed', 'partial_delayed_cost_stress')}
@@ -224,6 +227,7 @@ def _family_status(paths, qualification, plan, cap):
             or qualification.get('groups', {}).get('core', {}).get('scenario_count') != 12
             or qualification.get('groups', {}).get('reserve', {}).get('scenario_count') != 12):
         return 'scenario_coverage_unknown'
+    terminal_aliases = {}
     for record in plan.get('schedules', []):
         for source in record['selected']:
             prefix = source['window'] + '_' + record['schedule']
@@ -235,6 +239,43 @@ def _family_status(paths, qualification, plan, cap):
                     or not group[0].get('path_hash')
                     or len({item.get('path_hash') for item in group}) != 1):
                 return 'scenario_coverage_unknown'
+            if record.get('horizon') == 0:
+                if (plan.get('version') not in {'quality-only-common-windows-v2', 'intraday-quality-only-common-windows-v2'}
+                        or type(record.get('horizon')) is not int
+                        or type(plan.get('remaining_sessions')) is not int or plan['remaining_sessions'] not in (1, 2)
+                        or record['schedule'] != 'shortened'
+                        or record.get('basis') != TERMINAL_BASIS or record.get('unique_path_count') != 1
+                        or source.get('basis') != TERMINAL_BASIS or source.get('alias_of') != 'first_shortened'
+                        or source.get('source_start_index') is not None or type(source.get('source_intervals')) is not int
+                        or source['source_intervals'] != 0):
+                    return 'scenario_coverage_unknown'
+                for item in group:
+                    if (item.get('basis') != TERMINAL_BASIS or type(item.get('horizon')) is not int or item['horizon'] != 0
+                            or type(item.get('source_intervals')) is not int or item['source_intervals'] != 0 or item.get('source_start') is not None
+                            or item.get('source_end') is not None
+                            or item.get('alias_of') != 'first_shortened_' + item['environment']
+                            or any(_number((item.get('future_activity') or {}).get(key)) != 0 for key in ZERO_ACTIVITY)):
+                        return 'scenario_coverage_unknown'
+                    signature = {key: value for key, value in item.items() if key not in {'id', 'window'}}
+                    previous = terminal_aliases.setdefault(item['environment'], signature)
+                    if signature != previous:
+                        return 'scenario_coverage_unknown'
+                    if plan['version'] == 'quality-only-common-windows-v2' and (
+                            any(_number(item.get(key)) != 0 for key in ZERO_ACTIVITY)
+                            or item.get('first_buy_session') is not None or item.get('max_drawdown_pct') != 0):
+                        return 'scenario_coverage_unknown'
+                    if plan['version'] == 'intraday-quality-only-common-windows-v2':
+                        prefix = item.get('intraday_prefix')
+                        preserved = ('final_equity', 'max_drawdown_pct', 'gross_amount', 'gross_buy_amount',
+                            'gross_sell_amount', 'trading_days', 'symbols', 'api_orders', 'fees_paid', 'taxes_paid',
+                            'buy_fill_events', 'sell_fill_events', 'final_holding_count', 'final_state_hash',
+                            'final_protection', 'execution_diagnostics')
+                        if (not isinstance(prefix, dict) or prefix.get('status') != 'ready'
+                                or any(key not in prefix or item.get(key) != prefix[key] for key in preserved)
+                                or item.get('post_prefix_book_hash') != prefix['final_state_hash']
+                                or item.get('intraday_modelled_fills_are_actual') is not False
+                                or item.get('first_buy_session') != (0 if prefix['gross_buy_amount'] else None)):
+                            return 'scenario_coverage_unknown'
     for item in supplied:
         if (item.get('status', 'ready') != 'ready'
                 or not item['id'].endswith('_' + str(item.get('environment')))
@@ -243,7 +284,7 @@ def _family_status(paths, qualification, plan, cap):
                        ('gross_amount', 'trading_days', 'symbols', 'final_equity', 'max_drawdown_pct'))):
             return 'scenario_coverage_unknown'
         first_buy = item['first_buy_session']
-        prefix_buy = (plan.get('version') == 'intraday-quality-only-common-windows-v1'
+        prefix_buy = (plan.get('version') == 'intraday-quality-only-common-windows-v2'
             and item.get('intraday_modelled_fills_are_actual') is False
             and (_number((item.get('intraday_prefix') or {}).get('gross_buy_amount')) or 0) > 0)
         if first_buy is not None and (type(first_buy) is not int or first_buy < (0 if prefix_buy else 1)
@@ -253,6 +294,18 @@ def _family_status(paths, qualification, plan, cap):
             return 'scenario_coverage_unknown'
         if not 0 <= float(item['max_drawdown_pct']) <= cap + 1e-9:
             return 'scenario_risk_limit'
+        if item.get('basis') == TERMINAL_BASIS:
+            drawdown = _number(item.get('cumulative_protection_drawdown_pct'))
+            limit = _number(item.get('cumulative_protection_limit_pct'))
+            active = item.get('cumulative_protection_active')
+            final = item.get('final_protection') or {}
+            if (drawdown is None or drawdown < 0 or limit != 15.
+                    or type(active) is not bool or type(final.get('active')) is not bool
+                    or _number(final.get('limit_pct')) != limit
+                    or active != (final['active'] or drawdown >= limit)):
+                return 'scenario_coverage_unknown'
+            if active or drawdown >= min(cap, limit):
+                return 'scenario_risk_limit'
     return 'ready'
 
 
@@ -342,6 +395,15 @@ def _return_objective(paths, family):
     return math.fsum(values) / 12
 
 
+def _full_worst_final_equity(paths):
+    """Expose full-horizon downside without changing the original family veto."""
+    full = [row for row in paths.get('scenarios', []) if row.get('schedule') == 'full']
+    values = [_number(row.get('final_equity')) for row in full]
+    if len(full) != 12 or any(row.get('status', 'ready') != 'ready' for row in full) or None in values:
+        return None
+    return min(values)
+
+
 def _activity_preservation(candidate, parent):
     """Preserve every core path's four activity deficits, never average them."""
     left = {row['id']: row for row in candidate['scenarios'] if row['group'] == 'core'}
@@ -423,6 +485,7 @@ def _select_award_record(champion, records, frames, limits, context, *, evidence
                  incumbent_plan_class=parent_reason, incumbent_scenario_status=parent_family)
     parent_objective = _return_objective(parent_paths, parent_family)
     audit['incumbent_objective_value'] = parent_objective
+    audit['incumbent_full_worst_final_equity'] = _full_worst_final_equity(parent_paths)
     parent_return = parent_profiles = None
     # Anchor paired comparisons by fixed identity, never caller-provided order.
     for _, _, outcome in sorted(records, key=lambda record: record[1]):
@@ -506,6 +569,7 @@ def _select_award_record(champion, records, frames, limits, context, *, evidence
             promotion_reason=promotion, eligible=supported,
             activity_preservation=activity, core_witness_preservation=witnesses,
             objective_value=objective,
+            full_worst_final_equity=_full_worst_final_equity(paths),
             objective_improvement=objective - parent_objective if objective is not None and parent_objective is not None else None,
             award_plan_supported=family == 'ready' and qualification['groups']['core']['status'] == 'all_met',
             qualification_risk=family != 'ready' or qualification['groups']['core']['status'] != 'all_met',

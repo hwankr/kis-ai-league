@@ -153,7 +153,7 @@ class JointQualificationTests(unittest.TestCase):
         supplied, plan = paths(first_buy=0), common_plan()
         qualification = joint_qualification(supplied, progress(), LIMITS['budget'])
         self.assertEqual(_family_status(supplied, qualification, plan, 15), 'scenario_coverage_unknown')
-        plan['version'] = 'intraday-quality-only-common-windows-v1'
+        plan['version'] = 'intraday-quality-only-common-windows-v2'
         for row in supplied['scenarios']:
             row.update(intraday_modelled_fills_are_actual=False, intraday_prefix={'gross_buy_amount': 100})
         self.assertEqual(_family_status(supplied, qualification, plan, 15), 'ready')

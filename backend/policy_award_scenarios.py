@@ -7,13 +7,16 @@ import json
 import re
 
 from backend.learning_policy import (FEE, TAX, KST, LEGACY_IDS, _bar, _execution_model,
-                                     portfolio_metrics, validate_policy)
+                                     _initial_state, _state_decimal, portfolio_metrics, validate_policy)
 from backend.policy_transition import transition_preview
 
 
-VERSION = 'policy-award-scenarios-v2'
-PLAN_VERSION = 'quality-only-common-windows-v1'
+VERSION = 'policy-award-scenarios-v3'
+PLAN_VERSION = 'quality-only-common-windows-v2'
 BASIS = 'historical_analogue_scenario'
+TERMINAL_BASIS = 'zero_interval_terminal_mark'
+ZERO_ACTIVITY = ('gross_amount', 'gross_buy_amount', 'gross_sell_amount', 'trading_days',
+                 'symbols', 'api_orders', 'buy_fill_events', 'sell_fill_events', 'fees_paid', 'taxes_paid')
 
 
 def _hash(value):
@@ -32,7 +35,8 @@ def _base():
                 'Future weekday labels are assumed sessions, not a verified exchange calendar.',
                 'Gross amounts and trading days are additional modelled fills only; actual totals are not added here.',
                 'Final equity marks unsold holdings at close without forced terminal sales.',
-                'Fill events do not prove distinct accepted API orders; api_orders remains unknown.',
+                'A zero-session shortened schedule is one terminal snapshot with three explicit window aliases; its original weights remain unchanged.',
+                'Fill events do not prove accepted API orders; api_orders is unknown for modelled fills and zero for no additional intervals.',
                 'Daily-open fills cannot establish future broker, quote or destination-contest eligibility.']}
 
 
@@ -176,6 +180,16 @@ def scenario_plan(frames, context):
                 'reason': quality[-1]})
         selected_windows = []
         for label, length in [('full', horizon), ('shortened', max(0, horizon - 2))]:
+            if not length:
+                result['schedules'].append({'schedule': label, 'horizon': 0,
+                    'basis': TERMINAL_BASIS, 'unique_path_count': 1,
+                    'available_window_count': 0, 'tested_window_count': 0,
+                    'excluded_reason_counts': {}, 'source_windows': [],
+                    'selected': [{'window': window, 'status': 'ready', 'basis': TERMINAL_BASIS,
+                        'alias_of': 'first_shortened', 'source_start_index': None,
+                        'source_start': None, 'source_end': None, 'source_intervals': 0}
+                        for window in ('first', 'middle', 'recent')]})
+                continue
             records = []
             for start in range(max(0, len(history) - length)) if length else []:
                 source = history[start:start + length + 1]
@@ -325,6 +339,58 @@ def _outcome(metric, *, stress):
             'fees_paid': diagnostics['fees_paid'], 'taxes_paid': diagnostics['taxes_paid']}
 
 
+def _cumulative_protection(book, marked_equities):
+    """Observe existing protection capital and peak without resetting either."""
+    protection = book.get('account_protection')
+    if (not isinstance(protection, dict) or set(protection) != {'units', 'peak', 'active', 'limit_pct'}
+            or type(protection['active']) is not bool):
+        raise ValueError('invalid_terminal_protection')
+    units, peak, limit = (_state_decimal(protection[key]) for key in ('units', 'peak', 'limit_pct'))
+    if not units or not peak or not 0 < limit <= 100 or not marked_equities:
+        raise ValueError('invalid_terminal_protection')
+    drawdown = Decimal(0)
+    for equity in marked_equities:
+        unit = _state_decimal(equity) / units
+        peak = max(peak, unit)
+        drawdown = max(drawdown, (1 - unit / peak) * 100)
+    return {'cumulative_protection_drawdown_pct': float(drawdown),
+            'cumulative_protection_active': protection['active'] or drawdown >= limit,
+            'cumulative_protection_limit_pct': float(limit)}
+
+
+def _terminal_outcome(book, frame, limits, *, protection_fee=FEE, protection_tax=TAX):
+    """Mark a validated book once; no time, fills, fees or lot state advance."""
+    rows = _rows(frame)
+    budget = _state_decimal(limits['budget'])
+    if (book.get('as_of') != frame['as_of'] or not budget
+            or 'budget' in book and _state_decimal(book['budget']) != budget
+            or any(book.get(key, 0) != 0 for key in ('pending_orders', 'unresolved_orders'))):
+        raise ValueError('invalid_terminal_book')
+    cash, reserved, positions, _ = _initial_state(book, budget, frame['as_of'])
+    if reserved:
+        raise ValueError('unsettled_terminal_reservations')
+    for symbol, position in positions.items():
+        if symbol not in rows or position['last_close'] != _state_decimal(rows[symbol]['close']):
+            raise ValueError('terminal_position_price_mismatch')
+    fee, tax = _state_decimal(protection_fee), _state_decimal(protection_tax)
+    if fee + tax >= 1:
+        raise ValueError('invalid_terminal_protection_costs')
+    holdings = sum((position['last_close'] * position['quantity'] for position in positions.values()), Decimal(0))
+    protected_equity = cash + holdings * (1 - fee - tax)
+    if 'equity' in book and abs(_state_decimal(book['equity']) - protected_equity) > Decimal('.000001'):
+        raise ValueError('terminal_book_equity_mismatch')
+    diagnostics = {key: 0 for key in ('buy_attempts', 'sell_attempts', 'partial_orders', 'unfilled_orders',
+        'limit_blocked', 'untradeable_bars', 'ineligible_quotes', 'fees_paid', 'taxes_paid')}
+    diagnostics.update(slippage_bps=0, final_holding_count=len(positions))
+    return {'status': 'ready', 'reason': None, **dict.fromkeys(ZERO_ACTIVITY, 0),
+        'final_equity': float(cash + holdings), 'max_drawdown_pct': 0., 'first_buy_session': None,
+        'final_holding_count': len(positions), 'final_protection': deepcopy(book['account_protection']),
+        'valuation_basis': 'cash_plus_close_marked_unsold_holdings', 'fill_basis': 'no_additional_intervals',
+        'final_state_hash': _hash(book), 'execution_diagnostics': diagnostics,
+        'future_activity': dict.fromkeys(ZERO_ACTIVITY, 0),
+        **_cumulative_protection(book, [protected_equity])}
+
+
 def award_scenarios(policy, frames, limits, context, *, cost_profile=None, plan=None):
     """Return fixed historical paths with incremental activity and common book.
 
@@ -369,6 +435,18 @@ def award_scenarios(policy, frames, limits, context, *, cost_profile=None, plan=
                 try:
                     if source_record['status'] != 'ready':
                         raise ValueError(source_record['reason'])
+                    if not length:
+                        terminal = _terminal_outcome(book, latest, limits)
+                        for environment, _, _ in variants:
+                            current = _unavailable(f'{prefix}_{environment}', window, 0, environment, None)
+                            current.update(terminal, schedule=schedule, source_start=None, source_end=None,
+                                assumed_start=None, assumed_end=latest['as_of'],
+                                path_hash=_hash({'basis': TERMINAL_BASIS, 'frame': latest}),
+                                source_start_index=None, source_intervals=0, basis=TERMINAL_BASIS,
+                                alias_of=f'first_shortened_{environment}',
+                                start_book_hash=result['start_book_hash'], scenario_plan_hash=plan['hash'])
+                            result['scenarios'].append(deepcopy(current))
+                        continue
                     source = history[start:start + length + 1]
                     path = _path(policy, source, latest, book)
                     metrics = {}
