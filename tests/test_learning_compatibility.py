@@ -138,6 +138,7 @@ class FrozenAnalysisReuseTests(unittest.TestCase):
         # Avoid constructor/service startup entirely. Only _analyze and the real
         # temporary store execute; no app, broker or research worker can start.
         service = self.service = ExperimentService.__new__(ExperimentService)
+        service.directory = self.root
         service.store = ExperimentStore(self.root / 'experiments.sqlite3')
         service.config_path = self.root / 'unused.toml'
         service.now = lambda: self.now
