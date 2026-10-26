@@ -277,6 +277,28 @@ class LLMTests(unittest.TestCase):
             path.write_text('[experiments.llm]\nprovider="unknown"\n', encoding="utf-8")
             self.assertEqual(llm_metadata(path)["status"], "error")
 
+    def test_project_effort_pins_version_and_command_despite_global_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preferences = Path(directory, 'config.toml')
+            settings = {'model': 'gpt-6-astra', 'reasoning_effort': 'ultra'}
+            versions = []
+            for effort in ('max', 'high'):
+                preferences.write_text(f'model="other-model"\nmodel_reasoning_effort="{effort}"\n', encoding='utf-8')
+                provider = CodexLLM(settings, executable='codex.exe', environ={'CODEX_HOME': directory})
+                self.assertEqual(provider.status()['status'], 'ready')
+                self.assertEqual(provider.public_config()['reasoning_effort'], 'ultra')
+                command = provider._command(Path(directory), 'schema.json', 'answer.json')
+                self.assertIn('model_reasoning_effort="ultra"', command)
+                self.assertNotIn(f'model_reasoning_effort="{effort}"', command)
+                self.assertEqual(command[command.index('--model') + 1], 'gpt-6-astra')
+                from backend.experiment_analysis import _analysis_version
+                versions.append(_analysis_version(['llm-evidence-v1'], provider.public_config()))
+            self.assertEqual(versions[0], versions[1])
+
+    def test_invalid_project_reasoning_effort_fails_closed(self):
+        for effort in ('', 'ULTRA', 'ultra;anything', 1, [], {}):
+            self.assertEqual(CodexLLM({'reasoning_effort': effort}, environ={}).status()['status'], 'error')
+
 
 if __name__ == "__main__":
     unittest.main()

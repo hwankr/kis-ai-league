@@ -134,6 +134,11 @@ def parse_receipts(dom_payload, account_key, contest):
     return parse_snapshot(dom_payload, (), account_key, contest, receipts_only=True)
 
 
+def bonus_position(row):
+    """Recognize only the site's visible bonus-share label, never a zero cost alone."""
+    return "무증" in _text(row.get("_cells", {}).get("prodNm", {})).split()
+
+
 def parse_snapshot(dom_payload, symbols, account_key, contest, *, receipts_only=False):
     """Return normalized evidence, failing closed on missing or ambiguous data.
 
@@ -242,18 +247,43 @@ def parse_snapshot(dom_payload, symbols, account_key, contest, *, receipts_only=
         return result
 
     try:
-        positions, target_map = {}, {}
+        positions, target_map, bonus = {}, {}, {}
+        for kind in ('positions', 'targets'):
+            identities = [row['_id'] for row in tables.get(kind, [])]
+            if len(identities) != len(set(identities)):
+                raise SnapshotError('중복 보유·목표 행 ID')
         for row in tables.get("positions", []):
             symbol = _symbol(row.get("prodId"))
             weight = _number(row.get("wei"))
+            if bonus_position(row):
+                quantity, cost = _number(row.get("pos")), _number(row.get("avgPrc"))
+                if (quantity is None or quantity <= 0 or quantity != int(quantity)
+                        or cost != 0 or weight is None or weight < 0):
+                    raise SnapshotError("무상증자 행 확인 실패")
+                bonus.setdefault(symbol, []).append(row)
+                continue
             if symbol in positions or weight is None or weight < 0:
                 raise SnapshotError("보유 비중 또는 중복 종목 확인 실패")
             positions[symbol] = weight
+        bonus_targets = set()
         for row in tables.get("targets", []):
             symbol = _symbol(row.get("prodId"))
+            if bonus_position(row):
+                if not any(p['_id'] == row['_id'] for p in bonus.get(symbol, [])):
+                    raise SnapshotError("무상증자 보유·목표 행 불일치")
+                target = _number(row.get('tgtWei'))
+                if target is None or target < 0 or _number(row.get('w2o'), blank=0) is None:
+                    raise SnapshotError('무상증자 목표 비중 확인 실패')
+                bonus_targets.add(row['_id'])
+                continue
             if symbol in target_map:
                 raise SnapshotError("중복 주문 타겟 종목")
             target_map[symbol] = row
+        for symbol, rows in bonus.items():
+            if (symbol not in positions or symbol not in target_map
+                    or any(row['_id'] not in bonus_targets for row in rows)):
+                raise SnapshotError("무상증자 보유·목표 행 불일치")
+            positions[symbol] += sum(_number(row['wei']) for row in rows)
         active = {}
         for order in result["orders"]:
             current_unknown = order["status"] == "unknown" and (
@@ -261,7 +291,9 @@ def parse_snapshot(dom_payload, symbols, account_key, contest, *, receipts_only=
                 or str(order.get("created_at") or "").startswith(result["session_date"]))
             if order["status"] == "working" or current_unknown:
                 active.setdefault(order["symbol"], []).append(order)
-        unresolved = set(active) - target_map.keys()
+        # Display the full economic holding, but do not infer that bonus shares
+        # are listed, sellable, or attributable to an execution receipt.
+        unresolved = (set(active) - target_map.keys()) | bonus.keys()
         for symbol, row in target_map.items():
             remaining = _number(row.get("w2o"), blank=0)
             orders = active.get(symbol, [])
@@ -286,7 +318,7 @@ def parse_snapshot(dom_payload, symbols, account_key, contest, *, receipts_only=
         for symbol in set(positions) | requested:
             weight = positions.get(symbol, 0)
             result["positions"][symbol] = {"weight": weight,
-                                            "sellable_weight": weight}
+                                            "sellable_weight": 0 if symbol in bonus else weight}
     except (SnapshotError, TypeError, KeyError) as exc:
         errors.append(str(exc))
     result["verified"] = not errors

@@ -77,6 +77,9 @@ class FakeLocator:
         return self
 
     def wait_for(self, **kwargs):
+        self.page.wait_calls.append(self.key)
+        if self.key in self.page.wait_errors:
+            raise self.page.wait_errors[self.key]
         return None
 
     def click(self):
@@ -140,6 +143,7 @@ class FakePage:
         self.fields = {"symbol": "A005930", "date": "2026-10-12", "weight": "2.00",
                        "side": "true", "kind": "Opp", "slice": "false", "level": "5", "exitAll": False, "valid": True}
         self.clicks, self.fills, self.grid_states = [], [], []
+        self.wait_calls, self.wait_errors = [], {}
         self.counts = {"role:dialog:": 0, 'table:has(> thead th[id="avgPx"])': 0,
                        'input[type="password"]:visible': 0}
         self.search = "005930"
@@ -613,10 +617,33 @@ class TimefolioBrowserTests(unittest.TestCase):
             self.assertIsNone(self.browser._account_key)
             self.assertIsNone(self.browser._portfolio_id)
 
+    def test_root_english_login_is_reported_before_account_reads_or_orders(self):
+        from playwright.sync_api import TimeoutError as BrowserTimeout
+        self.page.wait_errors['role:link:설정'] = BrowserTimeout('account navigation unavailable')
+        self.page.url = ORIGIN + "/"
+        self.page.counts['input[type="password"]:visible'] = 1
+        self.page.counts['role:button:로그인'] = 0
+        self.browser._account_key, self.browser._portfolio_id = "account", "pf13"
+        with self.assertRaisesRegex(MirrorBlocked, "timefolio_login_required"):
+            self.browser.account_snapshot()
+        self.assertIsNone(self.browser._account_key)
+        self.assertIsNone(self.browser._portfolio_id)
+        self.assertIsNone(self.browser._prepared)
+        self.assertEqual(self.submit_clicks(), 0)
+
     def test_changed_contest_blocks_submit_before_click(self):
         self.page.contest = "Training"
         with self.assertRaisesRegex(MirrorBlocked, "binding_changed"):
             self.browser.submit(proposal())
+        self.assertEqual(self.submit_clicks(), 0)
+
+    def test_session_restoration_form_waits_for_account_navigation(self):
+        self.page.url = ORIGIN + '/'
+        self.page.counts['input[type="password"]:visible'] = 1
+        self.browser._account_key, self.browser._portfolio_id = 'account', 'pf13'
+        self.assertEqual(self.browser.identity(), 'account')
+        self.assertIn('role:link:설정', self.page.wait_calls)
+        self.assertEqual(self.browser._portfolio_id, 'pf13')
         self.assertEqual(self.submit_clicks(), 0)
 
     def test_submit_visible_business_rejection_keeps_reason_without_private_values(self):

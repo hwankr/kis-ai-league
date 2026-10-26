@@ -162,9 +162,16 @@ class TimefolioBrowser:
     def _origin(self):
         url = urlsplit(self.page.url)
         login = url.path.casefold().startswith("/auth/") or url.path.casefold() == "/logout"
-        if not login:
-            login = bool(self.page.locator('input[type="password"]:visible').count()
-                         and self.page.get_by_role("button", name="로그인", exact=True).count())
+        if not login and url.scheme == 'https' and url.netloc == 'contest.timefolio.net':
+            # The root briefly renders its login form while restoring a valid
+            # session. Use the existing account-navigation wait before calling
+            # that a logout; identity and complete grids still verify the account.
+            if self.page.locator('input[type="password"]:visible').count():
+                from playwright.sync_api import TimeoutError as BrowserTimeout
+                try:
+                    self.page.get_by_role('link', name='설정', exact=True).wait_for(state='visible')
+                except BrowserTimeout:
+                    login = True
         if url.scheme != "https" or url.netloc != "contest.timefolio.net" or login:
             self._account_key = self._portfolio_id = self._prepared = None
             raise MirrorBlocked("timefolio_login_required")

@@ -35,6 +35,46 @@ def parsed():
 
 
 class TimefolioAccountTests(unittest.TestCase):
+    def test_bonus_lots_aggregate_exact_economic_value_without_order_fill_changes(self):
+        value = observation()
+        value['tables'][0] = grid('positions', ['prodId', 'prodNm', 'close', 'chPct', 'pos', 'wei', 'avgPrc'], [
+            ('pos1', ['005930', '삼성전자', '50', '0', '3', '1.25', '100']),
+            ('bonus1', ['005930', '삼성전자', '50', '0', '3', '1.25', '0'])])
+        value['tables'][1] = grid('targets', ['prodId', 'prodNm', 'w2o', 'tgtWei'], [
+            ('pos1', ['005930', '삼성전자', '0', '1.25']),
+            ('bonus1', ['005930', '삼성전자', '0', '1.25'])])
+        for table in value['tables'][:2]:
+            table['rows'][1]['cells']['prodNm']['text'] = '삼성전자 무증'
+        result = parse_account_snapshot(value, BINDING['account_key'], BINDING['contest'])
+        self.assertEqual(len(result['holdings']), 1)
+        holding = result['holdings'][0]
+        self.assertEqual(holding['quantity'], 6)
+        self.assertEqual(holding['corporate_action_quantity'], 3)
+        for field, expected in {'avg_price': '50', 'market_value': '300', 'purchase_amount': '300', 'pnl': '0', 'weight_pct': '2.50'}.items():
+            self.assertEqual(Decimal(holding[field]), Decimal(expected))
+        self.assertEqual(result['orders'][0]['filled_quantity'], 2)
+        self.browser.account_snapshot.return_value = result
+        self.collector.tick()
+        self.assertEqual(self.read()['holdings'][0]['corporate_action_quantity'], 3)
+        self.elapsed = 60
+        self.collector = AccountCollector(self.root, self.browser,
+            now=lambda: NOW + timedelta(seconds=self.elapsed), monotonic=lambda: self.elapsed)
+        self.collector.tick()
+        self.assertEqual(self.read()['holdings'][0]['quantity'], 6)
+        # The site may later merge the entitlement into its ordinary row.
+        # Replace observations; never add the previous bonus quantity again.
+        value['tables'][0] = grid('positions', ['prodId', 'prodNm', 'close', 'chPct', 'pos', 'wei', 'avgPrc'], [
+            ('pos1', ['005930', '삼성전자', '50', '0', '6', '2.5', '50'])])
+        value['tables'][1] = grid('targets', ['prodId', 'prodNm', 'w2o', 'tgtWei'], [
+            ('pos1', ['005930', '삼성전자', '0', '2.5'])])
+        merged = parse_account_snapshot(value, BINDING['account_key'], BINDING['contest'])
+        self.assertEqual(merged['orders'], result['orders'])
+        self.browser.account_snapshot.return_value = merged
+        self.elapsed = 120
+        self.collector.tick()
+        self.assertEqual(self.read()['holdings'][0]['quantity'], 6)
+        self.assertNotIn('corporate_action_quantity', self.read()['holdings'][0])
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

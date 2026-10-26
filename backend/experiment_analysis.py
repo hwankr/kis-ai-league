@@ -472,16 +472,19 @@ class CodexLLM:
         self.preferences = _codex_preferences(self.environ)
         self.error = None
         values = self.settings
-        if not isinstance(values, dict) or any(key not in {"provider", "enabled", "model", "timeout_seconds", "max_response_bytes"} for key in values):
+        if not isinstance(values, dict) or any(key not in {"provider", "enabled", "model", "reasoning_effort", "timeout_seconds", "max_response_bytes"} for key in values):
             self.error = "Codex 분석 설정 항목이 올바르지 않습니다."
             values = {}
         self.enabled = values.get("enabled", True)
         self.model = values.get("model", self.preferences.get("model"))
+        self.reasoning_effort = values.get("reasoning_effort", self.preferences.get("model_reasoning_effort"))
         self.timeout = values.get("timeout_seconds", 180)
         self.limit = values.get("max_response_bytes", 131072)
         if (type(self.enabled) is not bool or type(self.timeout) is not int or not 10 <= self.timeout <= 600
                 or type(self.limit) is not int or not 1024 <= self.limit <= 262144
-                or self.model is not None and (not isinstance(self.model, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,100}", self.model))):
+                or self.model is not None and (not isinstance(self.model, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,100}", self.model))
+                or self.reasoning_effort is not None and (not isinstance(self.reasoning_effort, str)
+                    or self.reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})):
             self.error = "Codex 분석 모델·시간·응답 한도 설정이 올바르지 않습니다."
 
     def status(self):
@@ -497,7 +500,7 @@ class CodexLLM:
 
     def public_config(self):
         return {"provider": "codex", "model": self.model, "enabled": self.enabled,
-                "reasoning_effort": self.preferences.get("model_reasoning_effort"),
+                "reasoning_effort": self.reasoning_effort,
                 "timeout_seconds": self.timeout, "max_response_bytes": self.limit}
 
     def _command(self, directory, schema_path, answer_path, system_prompt=SYSTEM_PROMPT):
@@ -513,8 +516,8 @@ class CodexLLM:
             command.extend(["-c", value])
         if self.model:
             command.extend(["--model", self.model])
-        if self.preferences.get("model_reasoning_effort"):
-            command.extend(["-c", "model_reasoning_effort=" + _json(self.preferences["model_reasoning_effort"])])
+        if self.reasoning_effort:
+            command.extend(["-c", "model_reasoning_effort=" + _json(self.reasoning_effort)])
         command.append("-")
         return command
 

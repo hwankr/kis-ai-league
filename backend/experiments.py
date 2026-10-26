@@ -15,6 +15,7 @@ from backend.candidate_history import HistoryCache
 from backend.competition_deadline import KIS_LAST_DAY, KIS_ENDED_MESSAGE, ended
 from backend.eligibility import EligibilityService, assess_master
 from backend.experiment_store import ExperimentStore, encode
+from backend import entry_recovery
 from backend.history import series_for_profile
 from backend.kis import KST, ROOT, KisError, KisRequestError, load_profiles
 from backend.request_gate import file_lock
@@ -291,14 +292,19 @@ class ExperimentService:
             'issue': next((item for item in self.store.setting('issues', [])
                            if item['id'] == 'entry_selection'), None)})
 
-    def _resolve_validated_entry_selection(self, operation, token, run):
+    def _resolve_validated_entry_selection(self, operation, token, run, *, recovery=None):
         """Commit only the same owner's validated error generation and policy."""
+        run_matches = token and token['entry_failure'].get('entry_run_id') in {None, run['id']}
+        if not run_matches and token and recovery is not None:
+            run_matches = (self._execution_recovery(run_id=run['id'], token=recovery['token']) == recovery
+                and token['entry_failure'].get('entry_run_id') in recovery['rejected_run_ids']
+                and recovery['failure_owners'].get(operation) == entry_recovery.digest(encode(token['entry_failure'])))
         if (not token or run.get('learning_policy') != token['adopted']
                 or self.learning.daily.active() != token['active']
                 or self._adopted_policy() != token['adopted']
                 or token['entry_failure'].get('entry_policy', token['adopted']) != token['adopted']
                 or token['entry_failure'].get('entry_active', token['active']) != token['active']
-                or token['entry_failure'].get('entry_run_id') not in {None, run['id']}):
+                or not run_matches):
             return False
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -911,7 +917,14 @@ class ExperimentService:
         except (KeyError, TypeError, ValueError):
             raise OperationalBlock('장후 동결 입력 원본이 일치하지 않아 분석을 보류합니다.', 'entry_selection') from None
 
-    def _validate_frozen_entry_run(self, run, data, frame, adopted, *, session_days=None):
+    def _execution_recovery(self, *, run_id=None, token=None):
+        try:
+            return entry_recovery.resolve(self, run_id=run_id, token=token)
+        except entry_recovery.RecoveryError:
+            raise OperationalBlock('검토한 진입 복구 원본·정책·배포가 일치하지 않아 신규 진입을 보류합니다.',
+                                   'entry_selection') from None
+
+    def _validate_frozen_entry_run(self, run, data, frame, adopted, *, session_days=None, recovery=None):
         from backend.daily_inputs import validate_entry_selection
         from backend.experiment_analysis import analysis_version, build_snapshot
         from backend.learning_compatibility import scoped_live_entry_version_matches
@@ -919,6 +932,10 @@ class ExperimentService:
         try:
             normalized = build_snapshot(**data)
             version = analysis_version(self.config_path)
+            if recovery is not None:
+                if self._execution_recovery(run_id=run['id'], token=recovery['token']) != recovery:
+                    raise ValueError('expired_recovery')
+                version = run['version_id']
             digestable = {key: value for key, value in normalized.items() if key != 'observed_at'}
             digestable['analysis_version'] = version
             base_key = hashlib.sha256(encode(digestable).encode()).hexdigest()
@@ -949,8 +966,8 @@ class ExperimentService:
                     or run.get('version_id') != version or run.get('status') != 'ready'
                     or run.get('as_of') != str(data['as_of']) or run.get('learning_policy') != adopted
                     or stamp(run['created_at']) >= datetime.combine(current.date(), daytime(9), KST)
-                    or not scoped_live_entry_version_matches(run, self.learning.version,
-                        execution_day=current.date().isoformat(), active=self.learning.daily.active())
+                    or (recovery is None and not scoped_live_entry_version_matches(run, self.learning.version,
+                        execution_day=current.date().isoformat(), active=self.learning.daily.active()))
                     or [item for item in run['signals'] if not item.get('policy_id')] != frame['baseline_signals']
                     or not validate_entry_selection(run, adopted, frame=learned)):
                 raise ValueError('frozen_run_mismatch')
@@ -975,6 +992,14 @@ class ExperimentService:
         data = self.input_reader()
         validation_token = self._entry_validation_token('analyze')
         adopted = self._adopted_policy()
+        recovery = self._execution_recovery()
+        if recovery is not None:
+            data, frame = self._frozen_entry_input(data)
+            original = recovery['run']
+            self._validate_frozen_entry_run(original, data, frame, adopted, recovery=recovery)
+            self._resolve_validated_entry_selection('analyze', validation_token, original, recovery=recovery)
+            # The permission is execution-only: no research/prepare/activation alias.
+            return original
         frozen_frame = None
         # Do not reroll LLM recommendations from the same frozen daily input.
         normalized = build_snapshot(**data)
@@ -1743,14 +1768,21 @@ class ExperimentService:
             self._issue("analysis_missing", "직전 거래일의 장전 완료 분석이 없어 신규 진입을 기다립니다.", blocking=False)
             return
         self._resolve_issue("analysis_missing")
-        run = runs[0]
-        if adopted:
+        recovery = self._execution_recovery()
+        run = recovery['run'] if recovery is not None else runs[0]
+        if recovery is not None:
+            validation_token = self._entry_validation_token('cycle')
+            data, frozen_frame = self._frozen_entry_input(self.input_reader())
+            self._validate_frozen_entry_run(run, data, frozen_frame, adopted, session_days=days, recovery=recovery)
+            self._entry_plan(policy, run, today)
+            self._resolve_validated_entry_selection('cycle', validation_token, run, recovery=recovery)
+        if adopted and recovery is None:
             from backend.learning_compatibility import scoped_live_entry_version_matches
             if adopted["kind"] == "rules" and not scoped_live_entry_version_matches(run, self.learning.version,
                     execution_day=today.isoformat(), active=active):
                 return
         cycle_failure = self._operation_failures().get('cycle', {})
-        if ((cycle_failure.get('issue_code') == 'entry_selection' or cycle_failure.get('entry_selection_failure'))
+        if (recovery is None and (cycle_failure.get('issue_code') == 'entry_selection' or cycle_failure.get('entry_selection_failure'))
                 and (not cycle_failure.get('next_retry_at') or self.now() >= stamp(cycle_failure['next_retry_at']))
                 and adopted and adopted.get('held_before_top_n')):
             validation_token = self._entry_validation_token('cycle')
@@ -1763,7 +1795,7 @@ class ExperimentService:
         execution = run.get("learning_policy") if policy["execution_strategy"] == ALL_STRATEGIES else None
         learned = execution and execution["kind"] == "rules" and self.learning.enabled
         from backend.experiment_analysis import analysis_version
-        if run.get("version_id") != analysis_version(self.config_path):
+        if recovery is None and run.get("version_id") != analysis_version(self.config_path):
             self._issue("analysis_version", "새 분석 버전의 완료 결과를 기다립니다.", blocking=False)
             return
         self._resolve_issue("analysis_version")
@@ -1775,6 +1807,8 @@ class ExperimentService:
         if master.get("status") != "ok" or master.get("stale"):
             raise KisError("현재 종목 상태 목록 확인 필요")
         decisions, caps = self._entry_plan(policy, run, today)
+        if recovery is not None:
+            decisions = [dict(item, entry_recovery_token=recovery['token']) for item in decisions]
         if learned and execution.get("allocation_mode", "legacy") != "legacy":
             self._allocated_entries(policy, execution, run, decisions, broker, today, allowed, master)
             return
@@ -2084,6 +2118,13 @@ class ExperimentService:
         self._profile(policy)
         if side != 'buy':
             return  # Existing lot exits are independent of a new entry policy.
+        if decision.get('entry_recovery_token'):
+            try:
+                recovered = self._execution_recovery(run_id=run_id, token=decision['entry_recovery_token'])
+            except Exception:
+                raise BrokerStopped('전송 직전 진입 복구 근거가 달라져 매수하지 않았습니다.') from None
+            if recovered is None:
+                raise BrokerStopped('검토한 진입 복구 허용 기간이 끝나 매수하지 않았습니다.')
         current_pin = self._active_submission_pin(policy)
         today = self.now().astimezone(KST).date().isoformat()
         if current_pin != active_pin or (current_pin[3] == today and current_pin[2] != run_id):

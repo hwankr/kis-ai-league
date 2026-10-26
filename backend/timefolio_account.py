@@ -10,7 +10,7 @@ import time
 
 from backend.kis import KST
 from backend.supervisor import _read, _write
-from backend.timefolio_dom import _symbol, _table, parse_snapshot
+from backend.timefolio_dom import _symbol, _table, bonus_position, parse_snapshot
 
 
 INTERVAL = 60
@@ -213,7 +213,28 @@ def parse_account_snapshot(payload, account_key, contest):
                          "market_value": _string(market), "purchase_amount": _string(purchase), "pnl": _string(pnl),
                          "return_pct": _string(pnl / purchase * 100) if purchase else None,
                          "weight_pct": _string(_number(row.get("wei"), nonnegative=True)),
-                         "change_pct": _string(_number(row.get("chPct"), optional=True))})
+                         "change_pct": _string(_number(row.get("chPct"), optional=True)),
+                         **({"corporate_action_quantity": quantity} if bonus_position(row) else {})})
+    grouped = {}
+    for row in holdings:
+        previous = grouped.get(row['symbol'])
+        if previous is None:
+            grouped[row['symbol']] = row
+            continue
+        if (row['price'] != previous['price'] or row['name'] != previous['name']
+                or row['change_pct'] != previous['change_pct']):
+            raise ValueError('account_position_lots_inconsistent')
+        quantity = previous['quantity'] + row['quantity']
+        purchase = (Decimal(previous['purchase_amount']) + Decimal(row['purchase_amount'])
+                    if previous['purchase_amount'] is not None and row['purchase_amount'] is not None else None)
+        market = Decimal(previous['market_value']) + Decimal(row['market_value'])
+        pnl = market - purchase if purchase is not None else None
+        previous.update(quantity=quantity, avg_price=_string(purchase / quantity) if purchase is not None and quantity else None,
+            market_value=_string(market), purchase_amount=_string(purchase), pnl=_string(pnl),
+            return_pct=_string(pnl / purchase * 100) if purchase else None,
+            weight_pct=_string(Decimal(previous['weight_pct']) + Decimal(row['weight_pct'])),
+            corporate_action_quantity=previous.get('corporate_action_quantity', 0) + row.get('corporate_action_quantity', 0))
+    holdings = list(grouped.values())
     holdings.sort(key=lambda row: (-Decimal(row["market_value"]), row["symbol"]))
     market = sum((Decimal(row["market_value"]) for row in holdings), Decimal(0))
     complete_cost = all(row["purchase_amount"] is not None for row in holdings)
@@ -290,6 +311,11 @@ def _public_data(snapshot, jobs, *, now=None):
         clean = {key: _string(_number(row.get(key), optional=key in {"avg_price", "purchase_amount", "pnl", "return_pct", "change_pct"}))
                  for key in ("avg_price", "price", "market_value", "purchase_amount", "pnl", "return_pct", "weight_pct", "change_pct")}
         clean.update(symbol=_symbol(row.get("symbol")), name=_name(row.get("name")), quantity=_integer(row.get("quantity")))
+        if 'corporate_action_quantity' in row:
+            extra = _integer(row['corporate_action_quantity'])
+            if not 0 < extra <= clean['quantity']:
+                raise ValueError('account_corporate_action_quantity_invalid')
+            clean['corporate_action_quantity'] = extra
         holdings.append(clean)
     owned = {(receipt.get("order_id"), receipt.get("symbol"), receipt.get("side"))
              for job in jobs if isinstance(receipt := job.get("receipt"), dict) and receipt.get("verified") is True}

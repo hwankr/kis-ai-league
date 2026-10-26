@@ -315,6 +315,31 @@ class MirrorRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.tick()["reason"], "initial_destination_must_be_empty")
         self.assertIsNone(self.runtime.snapshot()["binding"])
 
+    def test_bonus_symbol_blocks_buy_and_sell_without_redistribution(self):
+        for side in ('buy', 'sell'):
+            with self.subTest(side=side):
+                self.setUp()
+                self.initialize()
+                if side == 'sell':
+                    self.source.fill(2)
+                    self.runtime.tick()
+                    self.destination.fill('1', '2')
+                sent = len(self.destination.submissions)
+                snapshot = self.destination.snapshot
+                def with_bonus(symbols):
+                    value = snapshot(symbols)
+                    value['positions'][SYMBOL] = {'weight': '4', 'sellable_weight': '0'}
+                    return {**value, 'unresolved_symbols': [SYMBOL]}
+                self.destination.snapshot = with_bonus
+                self.source.fill(1, side=side)
+                self.source.fill(3, symbol='000660')
+                self.runtime.tick()
+                new = self.destination.submissions[sent:]
+                self.assertEqual([(row['symbol'], row['weight']) for row in new], [('000660', '3.00')])
+                self.runtime = self.make_runtime()
+                self.runtime.tick()
+                self.assertEqual(self.destination.submissions[sent:], new)
+
     def test_binding_changes_stale_inputs_and_form_mismatch_block(self):
         self.initialize()
         self.source.fill(2)

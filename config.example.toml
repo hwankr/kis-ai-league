@@ -35,3 +35,4 @@ provider = 'codex'  # 설치된 Codex CLI와 기존 ChatGPT 로그인 사용
 enabled = true
 timeout_seconds = 180
 # model = '...'  # 생략하면 기존 Codex 모델 설정 사용
+# reasoning_effort = 'high'  # model과 함께 고정하면 개인 Codex 설정 변경의 영향을 받지 않음

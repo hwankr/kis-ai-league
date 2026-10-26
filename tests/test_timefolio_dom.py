@@ -38,7 +38,50 @@ def parse(value):
     return parse_snapshot(value, ["005930"], "portfolio-13", "RFM13")
 
 
+def bonus_snapshot():
+    value = snapshot()
+    value['tables'][0] = grid('positions', ['prodId', 'prodNm', 'wei', 'pos', 'avgPrc'], [
+        ('p1', ['005930', '삼성전자', '1.23', '3', '100']),
+        ('p2', ['005930', '삼성전자', '1.23', '3', '0'])])
+    value['tables'][1] = grid('targets', ['prodId', 'prodNm', 'w2o', 'tgtWei'], [
+        ('p1', ['005930', '삼성전자', '0', '1.23']),
+        ('p2', ['005930', '삼성전자', '0', '1.23'])])
+    for table in value['tables'][:2]:
+        table['rows'][1]['cells']['prodNm']['text'] = '삼성전자\u00a0무증\u00a0S'
+    return value
+
+
 class TimefolioDomTests(unittest.TestCase):
+    def test_visible_bonus_lot_is_valued_but_not_eligible_for_mirror_orders(self):
+        result = parse(bonus_snapshot())
+        self.assertTrue(result['verified'], result['errors'])
+        self.assertAlmostEqual(result['positions']['005930']['weight'], 2.46)
+        self.assertEqual(result['positions']['005930']['sellable_weight'], 0)
+        self.assertIn('005930', result['unresolved_symbols'])
+        self.assertEqual(len(result['orders']), 1)
+
+    def test_unlabelled_duplicate_or_inconsistent_bonus_lot_fails_closed(self):
+        for change in ('label', 'substring', 'cost', 'quantity', 'target_id', 'ordinary', 'nan', 'duplicate_grid'):
+            value = bonus_snapshot()
+            if change in ('label', 'substring'):
+                for table in value['tables'][:2]:
+                    table['rows'][1]['cells']['prodNm']['text'] = '삼성전자' if change == 'label' else '삼성전자 무증아님'
+            elif change == 'cost':
+                value['tables'][0]['csv_text'] = value['tables'][0]['csv_text'].replace('1.23,3,0', '1.23,3,100')
+            elif change == 'quantity':
+                value['tables'][0]['csv_text'] = value['tables'][0]['csv_text'].replace('1.23,3,0', '1.23,-3,0')
+            elif change == 'target_id':
+                for column, cell in value['tables'][1]['rows'][1]['cells'].items():
+                    cell['id'] = 'cellother_' + column
+            elif change == 'nan':
+                value['tables'][1]['csv_text'] = value['tables'][1]['csv_text'].replace(',0,1.23', ',NaN,1.23')
+            elif change == 'duplicate_grid':
+                value['tables'].append(copy.deepcopy(value['tables'][0]))
+            else:
+                value['tables'][0]['rows'][0]['cells']['prodNm']['text'] = '삼성전자 무증'
+            with self.subTest(change=change):
+                self.assertFalse(parse(value)['verified'])
+
     def test_raw_csv_precision_and_real_id_preserved(self):
         data = snapshot()
         # Display formatting loses precision, while UI CSV preserves primitives.
