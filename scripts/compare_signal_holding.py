@@ -1,13 +1,13 @@
 """Read-only comparison of frozen signal/holding hypotheses on saved prices.
 
 The current-book lane is a historical analogue, never actual future returns.
-The observed lane is a retrospective one-interval replay, not a promotion gate.
+The observed lane is a retrospective continuous replay, not a promotion gate.
 Run ``prepare`` before inspecting outcomes, then ``run`` after source is frozen.
 """
 import argparse
 from collections import Counter
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from decimal import Decimal
 import gzip
 import hashlib
@@ -22,6 +22,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.daily_inputs import freeze_award_context
+from backend.daily_comparison import _observed_session_suffix
+from backend.kis import KST
 from backend.learning_policy import policy_id, validate_policy
 from backend.policy_capacity import SIGNAL_FAMILIES, signal_hold_packet
 from backend.learning_research import _behavior_id
@@ -30,7 +32,7 @@ from backend import learning_policy, policy_award_scenarios as scenarios
 from backend.source_version import DAILY_SOURCES, source_version
 
 
-VERSION = 'offline-signal-holding-comparison-v1'
+VERSION = 'offline-signal-holding-comparison-v2'
 
 
 def canonical(value):
@@ -93,6 +95,22 @@ def coverage(frames):
             'frame_hashes': [{'day': f['as_of'], 'hash': digest(f)} for f in frames]}
 
 
+def validate_observed_path(frames):
+    """Require every recorded session; never recover by moving this anchor."""
+    if not frames:
+        raise ValueError('empty_observed_path')
+    _, _, missing, _ = _observed_session_suffix(frames)
+    if missing:
+        raise ValueError('missing_observed_sessions:' + ','.join(missing))
+    for frame in frames:
+        observed = datetime.fromisoformat(frame['observed_at'])
+        if (observed.utcoffset() is None
+                or observed.astimezone(KST).date().isoformat() != frame['as_of']
+                or observed.astimezone(KST).time() < time(16)):
+            raise ValueError('incomplete_observed_session')
+    return len(frames) - 1
+
+
 def prepare(frozen, observed):
     prior = frozen['research_inputs']
     latest = observed['learning_frames'][0]['payload']
@@ -114,6 +132,7 @@ def prepare(frozen, observed):
     assert previous_context['limits'] == recorded['limits']
     assert previous_context['initial_state']['account_protection']['limit_pct'] == 15
     observed_path = [prior['frames'][-1], latest]
+    validate_observed_path(observed_path)
     assert previous_context['initial_state']['as_of'] == observed_path[0]['as_of']
     assert datetime.fromisoformat(previous_context['observed_at']) < datetime.fromisoformat(latest['observed_at'])
     assert observed_path[0]['as_of'] < latest['as_of']
@@ -351,6 +370,10 @@ def cohort_attribution(request, plan, account_results):
 
 
 def run(request, output_dir, stamp):
+    lane = request['observed_lane']
+    intervals = validate_observed_path(lane['frames'])
+    if not intervals or lane['context']['initial_state']['as_of'] != lane['frames'][0]['as_of']:
+        raise ValueError('invalid_observed_anchor')
     before = digest(request)
     engine = source_version(DAILY_SOURCES)
     context, limits = request['context'], request['limits']
@@ -403,7 +426,7 @@ def run(request, output_dir, stamp):
             'Overlapping paths are not independent observations or probabilities.',
             'Thresholds are frozen before outcome evaluation but reuse development observations.',
             'Daily-open assumed fills and cost stresses do not prove broker execution.',
-            'Observed one-interval lane uses its own prior-day candidate thresholds and preserved original engine metadata; rerun engine differs and live_eligible=false.',
+            'Observed lane uses its own prior-day candidate thresholds and preserved original engine metadata; rerun engine differs and live_eligible=false.',
             'NAV is cash plus unsold close value after actual modelled trading costs; no hypothetical terminal sale.',
             '15% account protection remains path-dependent and can stop entries; no limit or reserve is relaxed.']}
     prereg_path = save_new(output_dir / f'signal-holding-preregistered-{stamp}.json', preregistration)
@@ -455,7 +478,6 @@ def run(request, output_dir, stamp):
         value['activity_veto_diagnostic'] = _activity_preservation(value['qualification_diagnostic'], reference['qualification_diagnostic'])
     cohorts = cohort_attribution(request, plan, results)
     observed = {}
-    lane = request['observed_lane']
     model = preregistration['observed_lane_model']
     for label, policy in lane['candidates'].items():
         metric = metric_with_signals(policy, lane['frames'], limits,
@@ -483,7 +505,7 @@ def run(request, output_dir, stamp):
         'scenario_plan': plan, 'analogue_comparisons': results,
         'cohort_exit_attribution': cohorts,
         'observed_lane': {'start': lane['frames'][0]['as_of'], 'end': lane['frames'][-1]['as_of'],
-            'intervals': 1, 'recorded_engine_versions': request['recorded_engine_versions'],
+            'intervals': intervals, 'recorded_engine_versions': request['recorded_engine_versions'],
             'source_book_hash': digest(lane['context']['initial_state']), 'results': observed}}
     result_path = save_new(output_dir / f'signal-holding-result-{stamp}.json.gz', result)
     summary_path = save_new(output_dir / f'signal-holding-summary-{stamp}.json', {
@@ -503,6 +525,21 @@ def run(request, output_dir, stamp):
     print(json.dumps({'stage': 'complete', 'result': result_path, 'summary': summary_path}), flush=True)
 
 
+def install_offline_guard(output_root):
+    """CLI writes evidence only; importing the pure helpers installs no hook."""
+    output_root = output_root.resolve()
+    def guard(event, arguments):
+        if event.startswith(('socket.', 'sqlite3.connect', 'subprocess.')) or event in {'os.system', 'os.spawn', 'os.exec'}:
+            raise PermissionError('offline comparison forbids network, databases, and processes')
+        if event == 'open':
+            path, mode, flags = arguments
+            writable = isinstance(mode, str) and any(c in mode for c in 'wax+') or bool(
+                flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+            if writable and isinstance(path, (str, bytes, os.PathLike)) and not Path(os.fsdecode(path)).resolve().is_relative_to(output_root):
+                raise PermissionError('offline comparison write outside output directory')
+    sys.addaudithook(guard)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -516,16 +553,7 @@ def main():
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_root = args.output_dir.resolve()
-    def guard(event, arguments):
-        if event.startswith(('socket.', 'sqlite3.connect', 'subprocess.')) or event in {'os.system', 'os.spawn', 'os.exec'}:
-            raise PermissionError('offline comparison forbids network, databases, and processes')
-        if event == 'open':
-            path, mode, flags = arguments
-            writable = isinstance(mode, str) and any(c in mode for c in 'wax+') or bool(
-                flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
-            if writable and isinstance(path, (str, bytes, os.PathLike)) and not Path(os.fsdecode(path)).resolve().is_relative_to(output_root):
-                raise PermissionError('offline comparison write outside output directory')
-    sys.addaudithook(guard)
+    install_offline_guard(output_root)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
     if args.command == 'prepare':
         frozen, frozen_hash = read_json(args.frozen)

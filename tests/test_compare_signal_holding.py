@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from backend.learning_policy import portfolio_metrics, validate_policy
 from scripts.compare_signal_holding import (branch_states, candidates, canonical, cohort_attribution,
                                            controls, coverage, curve_diagnostics, digest, metric_with_signals,
-                                           save_new, scenarios, summarize_rows, terminal_diagnostics)
+                                           run, save_new, scenarios, summarize_rows, terminal_diagnostics,
+                                           validate_observed_path)
 from tests.test_learning_policy import LIMITS, frames, policy
 
 
@@ -22,6 +24,32 @@ def incumbent():
 
 
 class SignalHoldingComparisonTests(unittest.TestCase):
+    def test_observed_intervals_count_actual_sessions_and_do_not_skip_a_gap(self):
+        data = frames(5)
+        self.assertEqual(validate_observed_path(data), 4)
+        self.assertEqual(validate_observed_path(data[2:4]), 1)  # Friday to Monday.
+        with self.assertRaisesRegex(ValueError, 'missing_observed_sessions'):
+            validate_observed_path([data[0], data[2]])
+
+    def test_conflicting_calendars_and_incomplete_sessions_are_rejected(self):
+        data = frames(3)
+        data[1]['session_days'].remove(data[0]['as_of'])
+        with self.assertRaisesRegex(ValueError, 'insufficient_observation_calendar'):
+            validate_observed_path(data)
+        for value in ('2026-07-01T15:59:00+09:00', '2026-07-02T16:05:00+09:00',
+                      '2026-07-01T16:05:00'):
+            data = frames(1)
+            data[0]['observed_at'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'incomplete_observed_session'):
+                validate_observed_path(data)
+
+    def test_prepared_request_with_gap_is_rejected_before_outcomes_or_writes(self):
+        data = frames(3)
+        with patch('scripts.compare_signal_holding.scenarios.scenario_plan') as plan:
+            with self.assertRaisesRegex(ValueError, 'missing_observed_sessions'):
+                run({'observed_lane': {'frames': [data[0], data[2]]}}, Path('unused'), 'unused')
+            plan.assert_not_called()
+
     def test_request_coverage_hash_survives_json_roundtrip(self):
         data = frames(3)
         data[1]['rows'] *= 10
