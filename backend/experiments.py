@@ -977,6 +977,54 @@ class ExperimentService:
             error.run_id = run.get('id') if isinstance(run, dict) else None
             raise error from None
 
+    def _reprocessed_baseline_input(self, baseline, data, normalized, adopted, entry_selection):
+        """Reprocess identical frozen inputs under a new engine, without redating them."""
+        from backend.daily_inputs import freeze_inputs, frozen_data
+        from backend.experiment_analysis import build_snapshot, analysis_version
+        from backend.learning_policy import policy_id
+        try:
+            with self.store.connect() as db:
+                row = db.execute('SELECT payload FROM runs WHERE id=?', (baseline['id'],)).fetchone()
+                indexed = db.execute('SELECT input_key,summary,collection_hash FROM run_index WHERE id=?', (baseline['id'],)).fetchone()
+                frozen = db.execute('SELECT digest,payload FROM learning_frames WHERE day=?', (str(data['as_of']),)).fetchone()
+            full = json.loads(row[0])
+            frame = json.loads(frozen[1])
+            original = full['analysis']['input']
+            version = analysis_version(self.config_path)
+            source = freeze_inputs(data)
+            contract = frame['signal_inputs']
+            current = self.now().astimezone(KST)
+            observed = stamp(original['observed_at']).astimezone(KST)
+            comparison = {**normalized, 'observed_at': original['observed_at']}
+            base_key = hashlib.sha256(encode({**{k: v for k, v in normalized.items() if k != 'observed_at'},
+                                              'analysis_version': version}).encode()).hexdigest()
+            original_key = hashlib.sha256(encode([base_key, policy_id(adopted),
+                baseline['learning_engine_version'], contract['frame']]).encode()).hexdigest()
+            if ({k: v for k, v in full.items() if k != 'analysis'} != baseline
+                    or json.loads(indexed[1]) != baseline or indexed[0] != base_key
+                    or indexed[2] != original_key or baseline['collection_hash'] != original_key
+                    or baseline['status'] != 'ready' or baseline['as_of'] != str(data['as_of'])
+                    or frame['as_of'] != baseline['as_of']
+                    or baseline['version_id'] != version or full['analysis']['version_id'] != version
+                    or baseline['learning_policy'] != adopted or baseline.get('entry_selection') != entry_selection
+                    or original != comparison or build_snapshot(**frozen_data(contract, data)) != original
+                    or hashlib.sha256(encode(original).encode()).hexdigest() != baseline['input_hash']
+                    or full['analysis']['input_hash'] != baseline['input_hash']
+                    or full['analysis'].get('decisions', baseline['signals']) != baseline['signals']
+                    or observed.date().isoformat() != str(data['as_of']) or observed.time() < daytime(16)
+                    or observed > stamp(baseline['created_at']) or stamp(baseline['created_at']) > current
+                    or not observed <= stamp(data['observed_at']) <= current
+                    or stamp(frame['captured_at']) < observed or stamp(frame['captured_at']) > current
+                    or hashlib.sha256(encode({k: v for k, v in frame.items()
+                        if k not in {'observed_at', 'captured_at'}}).encode()).hexdigest() != frozen[0]
+                    or any(source[k] != contract[k] for k in ('version', 'frame', 'hash', 'universe', 'source_hash'))
+                    or [s for s in baseline['signals'] if not s.get('policy_id')] != frame['baseline_signals']):
+                raise ValueError('baseline_source_changed')
+            return deepcopy(original)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise OperationalBlock('버전 전환 분석의 원입력·출처가 일치하지 않아 신규 진입을 보류합니다.',
+                                   'entry_selection') from None
+
     def _analyze(self, *, retry_llm=False, automatic_retry=False):
         from backend.daily_inputs import freeze_entry_selection, validate_entry_selection
         from backend.experiment_analysis import analyze_experiments, analysis_version, build_snapshot
@@ -1075,9 +1123,15 @@ class ExperimentService:
         baseline = self.store.find_run(base_key)
         if baseline and not retry_llm and not (isinstance(baseline.get("llm_status"), dict)
                                                and baseline["llm_status"].get("status") in {"error", "unconfigured"}):
+            reused_input = normalized
+            if (learned_frame and adopted.get('held_before_top_n')
+                    and active and active.get('policy') == adopted
+                    and baseline.get('learning_policy') == adopted
+                    and baseline.get('learning_engine_version') != self.learning.version):
+                reused_input = self._reprocessed_baseline_input(baseline, data, normalized, adopted, entry_selection)
             result = {"decisions": [item for item in baseline["signals"] if not item.get("policy_id")],
                       "input_hash": baseline["input_hash"], "version_id": baseline["version_id"],
-                      "llm_status": baseline.get("llm_status"), "input": normalized}
+                      "llm_status": baseline.get("llm_status"), "input": reused_input}
         else:
             result = (self.analyzer or analyze_experiments)(**data, llm=self._get_llm())
         decisions = result["decisions"] + (signals(adopted, learned_frame,
